@@ -560,15 +560,14 @@ def main():
     )
     
     print(f"\nConfig:")
-    print(f"  Devices: {config.num_devices} TPU cores")
+    print(f"  TPU devices: {config.num_devices} cores")
+    print(f"  CPU workers: 112 vCPUs (data loading + prefetch)")
     print(f"  Global batch size: {config.global_batch_size}")
     print(f"  Batch per device: {config.batch_size_per_device}")
     print(f"  Learning rate: {config.learning_rate}")
     print(f"  TREAD selection rate: {config.tread_selection_rate}")
     print(f"  Epochs: {config.num_epochs}")
     print(f"  Steps per epoch: {config.steps_per_epoch}")
-    print(f"  Data loading: HuggingFace streaming + Prefetch pipeline")
-    print(f"  Note: For TPU v5e 256 (112 cores), adjust num_devices to 112")
     
     # 디바이스 확인
     print("\n" + "="*60)
