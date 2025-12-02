@@ -126,22 +126,18 @@ class Coyo11mDataLoader:
     """Coyo11m 256px latent 데이터로더 (HF + Prefetch + TPU최적화)"""
     
     def __init__(self, batch_size: int, embedding_provider=None, 
-                 use_gcs: bool = False, gcs_bucket: str = "gs://rdy-tpu-data-2025/coyo11m"):
+                 gcs_bucket: str = "gs://rdy-tpu-data-2025/KBlueLeaf/coyo11m-256px-ccrop-latent"):
         self.batch_size = batch_size
         self.embedding_provider = embedding_provider
-        self.use_gcs = use_gcs
         self.gcs_bucket = gcs_bucket
         
-        # HuggingFace repo 또는 GCS에서 파일 목록 로드
-        print("Scanning data files...")
-        if use_gcs:
-            self._load_from_gcs()
-        else:
-            self._load_from_huggingface()
+        # GCS에서만 로드
+        print("Scanning data files from GCS...")
+        self._load_from_gcs()
         
-        # Parquet 메타데이터 로드 (HF에서)
-        print("\nLoading metadata from HuggingFace...")
-        self._load_metadata()
+        # Parquet 메타데이터 로드 (GCS에서)
+        print("\nLoading metadata from GCS...")
+        self._load_metadata_from_gcs()
         
         print(f"Available samples: {len(self.available_keys)}")
     
@@ -168,36 +164,25 @@ class Coyo11mDataLoader:
             # 메타데이터 생성
             self.pt_file_mapping[filename] = pt_file
     
-    def _load_from_huggingface(self):
-        """HuggingFace repo에서 스트리밍 데이터 로드"""
-        from datasets import load_dataset
+    def _load_metadata_from_gcs(self):
+        """GCS에서 메타데이터 로드"""
+        import subprocess
+        import tempfile
         
-        # HF dataset을 스트리밍으로 로드 (전체 다운로드 필요 없음)
-        print("Loading dataset from HuggingFace (streaming)...")
-        self.dataset = load_dataset(
-            "KBlueLeaf/coyo11m-256px-ccrop-latent",
-            streaming=True,
-            split="train"
-        )
-        self.pt_data_cache = {}
-        self.pt_file_mapping = {}
-        self.dataset_iter = iter(self.dataset)
-    
-    def _load_metadata(self):
-        """메타데이터 로드"""
-        from huggingface_hub import hf_hub_download
+        metadata_file = f"{self.gcs_bucket}/coyo11m-meta.parquet"
         
-        metadata_path = hf_hub_download(
-            repo_id="KBlueLeaf/coyo11m-256px-ccrop-latent",
-            filename="coyo11m-meta.parquet",
-            repo_type="dataset",
-            local_dir="/tmp",
-            local_dir_use_symlinks=False
+        with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as tmp:
+            tmp_path = tmp.name
+        
+        # GCS에서 메타데이터 파일 다운로드
+        subprocess.run(
+            ["gcloud", "storage", "cp", metadata_file, tmp_path],
+            check=True
         )
         
-        self.metadata_table = pq.read_table(metadata_path)
+        self.metadata_table = pq.read_table(tmp_path)
         self.available_keys = list(range(len(self.metadata_table)))
-        print(f"Loaded {len(self.available_keys)} metadata entries")
+        print(f"Loaded {len(self.available_keys)} metadata entries from GCS")
     
     def _load_pt_file_gcs(self, gcs_path: str):
         """GCS에서 PT 파일 다운로드 및 로드"""
@@ -603,13 +588,11 @@ def main():
     print("Initializing data loader...")
     print("="*60)
     
-    # GCS 버킷에 데이터를 업로드했으면 use_gcs=True 사용
-    # 아니면 HuggingFace에서 직접 스트리밍으로 로드
+    # GCS 버킷에서 로드
     data_loader = Coyo11mDataLoader(
         batch_size=config.global_batch_size,
         embedding_provider=embedding_provider,
-        use_gcs=False,  # True로 변경하면 GCS에서 로딩
-        gcs_bucket="gs://rdy-tpu-data-2025/coyo11m"
+        gcs_bucket="gs://rdy-tpu-data-2025/coyo11m-256px-ccrop-latent"
     )
     
     # 모델 초기화
