@@ -5,7 +5,6 @@ description = "XUT-Small training with JAX on TPU"
 requires-python = ">=3.9"
 dependencies = [
     "jax>=0.4.0",
-    "jaxlib>=0.4.0",
     "flax>=0.7.0",
     "optax>=0.1.0",
     "torch>=2.0.0",
@@ -15,7 +14,6 @@ dependencies = [
     "pillow>=9.0.0",
     "wandb>=0.15.0",
     "numpy>=1.23.0",
-    "pydantic>=2.0.0",
 ]
 
 [project.optional-dependencies]
@@ -23,10 +21,3 @@ dev = [
     "pytest>=7.0.0",
     "jupyter>=1.0.0",
 ]
-
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
-
-[tool.hatch.version]
-path = "src/__init__.py"
