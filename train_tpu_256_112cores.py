@@ -116,11 +116,11 @@ def main():
     for epoch in range(config.num_epochs):
         epoch_start = time.time()
         
-        # Prefetch 파이프라인
+        # Prefetch 파이프라인 (112 workers)
         prefetch_loader = PrefetchDataLoader(
             data_loader,
             steps_per_epoch=config.steps_per_epoch,
-            prefetch_size=4  # 더 많은 prefetch (112 cores를 활용)
+            num_workers=112  # 112개 worker로 병렬 로딩
         )
         
         losses, epoch_avg_loss = trainer.train_epoch(prefetch_loader, epoch)
