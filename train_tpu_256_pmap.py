@@ -81,17 +81,17 @@ def loss_fn(model, params, x_t, timesteps, noise, text_emb, rng_key):
     return loss
 
 
-def train_step_single(model, state, batch_latents, timesteps, noise, batch_embeddings, lr):
-    """단일 기기에서의 학습 스텝"""
-    def loss_wrapper(params):
-        state.rng, subkey = random.split(state.rng)
-        return loss_fn(model, params, batch_latents, timesteps, noise, batch_embeddings, subkey)
-    
-    loss, grads = jax.value_and_grad(loss_wrapper)(state.params)
-    
-    # Optimizer 업데이트
-    updates, new_opt_state = optimizer.update(grads, state.opt_state, state.params)
-    new_params = optax.apply_updates(state.params, updates)
+def train_step_single(model, state, batch_latents, timesteps, noise, batch_embeddings, optimizer, lr):
+     """단일 기기에서의 학습 스텝"""
+     def loss_wrapper(params):
+         state.rng, subkey = random.split(state.rng)
+         return loss_fn(model, params, batch_latents, timesteps, noise, batch_embeddings, subkey)
+     
+     loss, grads = jax.value_and_grad(loss_wrapper)(state.params)
+     
+     # Optimizer 업데이트
+     updates, new_opt_state = optimizer.update(grads, state.opt_state, state.params)
+     new_params = optax.apply_updates(state.params, updates)
     
     new_state = TrainState(
         params=new_params,
@@ -248,7 +248,7 @@ def main():
             
             # 학습 스텝
             state, loss = train_step_single(
-                model, state, x_t, timesteps, noise, batch_embeddings, lr
+                model, state, x_t, timesteps, noise, batch_embeddings, optimizer, lr
             )
             
             losses.append(float(loss))
