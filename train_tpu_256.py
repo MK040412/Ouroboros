@@ -299,54 +299,90 @@ class Coyo11mDataLoader:
 
 
 # ============================================
-# Prefetch Pipeline (TPU 최적화)
+# Prefetch Pipeline with Multi-Process (TPU 최적화)
 # ============================================
 class PrefetchDataLoader:
-    """Prefetch를 이용한 데이터로딩 파이프라인"""
+    """Multi-worker Prefetch 데이터로딩 파이프라인 (112 workers)"""
     
     def __init__(self, data_loader: Coyo11mDataLoader, 
-                 steps_per_epoch: int, prefetch_size: int = 2):
+                 steps_per_epoch: int, num_workers: int = 112):
         self.data_loader = data_loader
         self.steps_per_epoch = steps_per_epoch
-        self.prefetch_size = prefetch_size
-        self.prefetch_queue = queue.Queue(maxsize=prefetch_size)
+        self.num_workers = num_workers
+        self.prefetch_queue = queue.Queue(maxsize=num_workers * 2)
         self.stop_event = threading.Event()
         
-        # Prefetch 워커 스레드 시작
-        self.worker_thread = threading.Thread(
-            target=self._prefetch_worker, daemon=True
-        )
-        self.worker_thread.start()
+        # Multi-worker executor 시작
+        self.executor = ThreadPoolExecutor(max_workers=num_workers)
+        self.worker_threads = []
+        
+        # Worker 풀 시작
+        for worker_id in range(num_workers):
+            thread = threading.Thread(
+                target=self._prefetch_worker,
+                args=(worker_id,),
+                daemon=True
+            )
+            thread.start()
+            self.worker_threads.append(thread)
     
-    def _prefetch_worker(self):
-        """백그라운드에서 배치를 미리 로드"""
-        rng_key = jax.random.PRNGKey(0)
-        for batch_idx in range(self.steps_per_epoch):
+    def _prefetch_worker(self, worker_id: int):
+        """각 worker가 담당 배치를 미리 로드"""
+        rng_key = jax.random.PRNGKey(worker_id)
+        
+        # 각 worker는 (worker_id, worker_id + num_workers, worker_id + 2*num_workers, ...)
+        # 형태로 배치를 담당
+        batch_idx = worker_id
+        while batch_idx < self.steps_per_epoch:
             if self.stop_event.is_set():
                 break
             try:
                 rng_key, subkey = jax.random.split(rng_key)
                 batch = self.data_loader.get_batch(batch_idx, subkey)
-                self.prefetch_queue.put(batch, timeout=10)
+                self.prefetch_queue.put((batch_idx, batch), timeout=10)
             except Exception as e:
-                print(f"Prefetch error at batch {batch_idx}: {e}")
+                print(f"Prefetch error at batch {batch_idx} (worker {worker_id}): {e}")
                 break
+            
+            batch_idx += self.num_workers
         
         # 종료 신호
         self.prefetch_queue.put(None)
     
     def get_batches(self):
-        """Prefetch된 배치 반환"""
-        while True:
-            batch = self.prefetch_queue.get()
-            if batch is None:  # 종료 신호
+        """Prefetch된 배치 반환 (배치 인덱스 순서로 정렬)"""
+        batches_dict = {}
+        next_batch_idx = 0
+        none_count = 0
+        
+        while next_batch_idx < self.steps_per_epoch:
+            try:
+                item = self.prefetch_queue.get(timeout=30)
+                if item is None:
+                    none_count += 1
+                    if none_count >= self.num_workers:
+                        # 모든 worker 종료
+                        break
+                    continue
+                
+                batch_idx, batch = item
+                batches_dict[batch_idx] = batch
+                
+                # 순차적으로 배치 반환
+                while next_batch_idx in batches_dict:
+                    yield batches_dict.pop(next_batch_idx)
+                    next_batch_idx += 1
+            
+            except queue.Empty:
+                print(f"Prefetch timeout at batch {next_batch_idx}")
                 break
-            yield batch
     
     def stop(self):
         """Prefetch 중지"""
         self.stop_event.set()
-        self.worker_thread.join(timeout=5)
+        self.executor.shutdown(wait=True)
+        for thread in self.worker_threads:
+            thread.join(timeout=5)
 
 
 # ============================================
@@ -617,11 +653,11 @@ def main():
     for epoch in range(config.num_epochs):
         epoch_start = time.time()
         
-        # Prefetch 파이프라인 생성 (배경에서 배치 로딩)
+        # Prefetch 파이프라인 생성 (112 workers로 배경 로딩)
         prefetch_loader = PrefetchDataLoader(
             data_loader, 
             steps_per_epoch=config.steps_per_epoch,
-            prefetch_size=2  # 2개 배치 미리 로드
+            num_workers=112  # 112개 worker로 병렬 로딩
         )
         
         losses, epoch_avg_loss = trainer.train_epoch(prefetch_loader, epoch)
