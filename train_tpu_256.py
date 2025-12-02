@@ -125,64 +125,47 @@ class DiffusionSchedule:
 class Coyo11mDataLoader:
     """Coyo11m 256px latent 데이터로더 (HF + Prefetch + TPU최적화)"""
     
-    def __init__(self, batch_size: int, embedding_provider=None, 
-                 gcs_bucket: str = "gs://rdy-tpu-data-2025/KBlueLeaf/coyo11m-256px-ccrop-latent"):
+    def __init__(self, batch_size: int, embedding_provider=None):
         self.batch_size = batch_size
         self.embedding_provider = embedding_provider
-        self.gcs_bucket = gcs_bucket
         
-        # GCS에서만 로드
-        print("Scanning data files from GCS...")
-        self._load_from_gcs()
+        # HuggingFace Streaming Dataset (자동으로 캐시하고 사용 후 삭제)
+        print("Loading dataset from HuggingFace (streaming mode)...")
+        from datasets import load_dataset
+        self.dataset = load_dataset(
+            "KBlueLeaf/coyo11m-256px-ccrop-latent",
+            streaming=True,
+            split="train"
+        )
+        self.dataset_iter = iter(self.dataset)
         
-        # Parquet 메타데이터 로드 (GCS에서)
-        print("\nLoading metadata from GCS...")
-        self._load_metadata_from_gcs()
+        # Parquet 메타데이터 로드 (HF에서)
+        print("\nLoading metadata from HuggingFace...")
+        self._load_metadata_hf()
         
         print(f"Available samples: {len(self.available_keys)}")
     
-    def _load_from_gcs(self):
-        """GCS 버킷에서 파일 목록 로드"""
-        import subprocess
-        result = subprocess.run(
-            ["gcloud", "storage", "ls", f"{self.gcs_bucket}/latents-3crop/"],
-            capture_output=True, text=True
-        )
-        
-        self.pt_files = []
-        for line in result.stdout.strip().split('\n'):
-            if line.endswith('.pt'):
-                self.pt_files.append(line.strip())
-        
-        print(f"Found {len(self.pt_files)} PT files in GCS")
-        self.pt_data_cache = {}
-        self.pt_file_mapping = {}
-        
-        # GCS에서 필요할 때만 다운로드 (lazy loading)
-        for pt_file in self.pt_files:
-            filename = Path(pt_file).name
-            # 메타데이터 생성
-            self.pt_file_mapping[filename] = pt_file
-    
-    def _load_metadata_from_gcs(self):
-        """GCS에서 메타데이터 로드"""
-        import subprocess
+    def _load_metadata_hf(self):
+        """HuggingFace에서 메타데이터 로드"""
+        from huggingface_hub import hf_hub_download
         import tempfile
-        
-        metadata_file = f"{self.gcs_bucket}/coyo11m-meta.parquet"
         
         with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as tmp:
             tmp_path = tmp.name
         
-        # GCS에서 메타데이터 파일 다운로드
-        subprocess.run(
-            ["gcloud", "storage", "cp", metadata_file, tmp_path],
-            check=True
+        # HF에서 메타데이터 파일 다운로드
+        hf_hub_download(
+            repo_id="KBlueLeaf/coyo11m-256px-ccrop-latent",
+            filename="coyo11m-meta.parquet",
+            repo_type="dataset",
+            local_dir="/tmp",
+            local_dir_use_symlinks=False
         )
         
-        self.metadata_table = pq.read_table(tmp_path)
+        metadata_path = "/tmp/coyo11m-meta.parquet"
+        self.metadata_table = pq.read_table(metadata_path)
         self.available_keys = list(range(len(self.metadata_table)))
-        print(f"Loaded {len(self.available_keys)} metadata entries from GCS")
+        print(f"Loaded {len(self.available_keys)} metadata entries from HuggingFace")
     
     def _load_pt_file_gcs(self, gcs_path: str):
         """GCS에서 PT 파일 다운로드 및 로드"""
@@ -219,68 +202,57 @@ class Coyo11mDataLoader:
         return pt_data
     
     def get_batch(self, batch_idx: int, rng_key):
-        """배치 데이터 반환 (Prefetch 최적화)"""
-        # 배치 샘플 선택
-        total_samples = len(self.available_keys)
-        start_idx = (batch_idx * self.batch_size) % total_samples
-        batch_indices = []
-        for i in range(self.batch_size):
-            batch_indices.append((start_idx + i) % total_samples)
-        
-        latents_list = []
-        captions_list = []
-        
-        for idx in batch_indices:
-            try:
-                # 메타데이터에서 key 가져오기
-                row = self.metadata_table.slice(idx, idx + 1)
-                key = int(row['key'][0].as_py())
-                caption = row['caption_llava'][0].as_py() if 'caption_llava' in row.column_names else ""
-                
-                # PT 파일 확인: 어느 파일에 속하는지
-                file_idx = key // 10  # 각 파일당 10개 샘플 (000000-000009.pt, 000010-000019.pt 등)
-                local_idx = key % 10
-                filename = f"{file_idx:06d}-{file_idx + 9:06d}.pt"
-                
-                # PT 데이터 로드 (캐시 또는 다운로드)
-                if filename not in self.pt_data_cache:
-                    print(f"  Loading {filename}...")
-                    if self.use_gcs:
-                        pt_data = self._load_pt_file_gcs(f"{self.gcs_bucket}/latents-3crop/{filename}")
-                    else:
-                        pt_data = self._load_pt_file_hf(filename)
-                    
-                    self.pt_data_cache[filename] = {
-                        'keys': pt_data['keys'].numpy(),
-                        'latents': pt_data['latents']
-                    }
-                
-                # Latent 추출: (3, 4, 32, 32) → (4, 32, 32)
-                latent = self.pt_data_cache[filename]['latents'][local_idx].cpu().numpy()
-                channels, frames, h, w = latent.shape
-                latent = latent.reshape(channels * frames, h, w)[:4, :, :]
-                latents_list.append(latent)
-                captions_list.append(caption if caption else "")
-                
-            except Exception as e:
-                print(f"  ⚠ Error loading index {idx}: {e}")
-                # 에러 시 zero tensor 사용
-                latents_list.append(np.zeros((4, 32, 32), dtype=np.float32))
-                captions_list.append("")
-        
-        if len(latents_list) == 0:
-            raise ValueError(f"Batch {batch_idx}: No valid samples loaded")
-        
-        # Stack latents: (B, 4, 32, 32)
-        batch_latents = np.stack(latents_list, axis=0)
-        batch_latents = jnp.array(batch_latents, dtype=jnp.float32)
-        
-        # 임베딩 계산 (병렬화)
-        batch_embeddings = self.embedding_provider.batch_encode(
-            captions_list, batch_size=512, normalize=True
-        )  # (B, 640)
-        
-        return batch_latents, batch_embeddings
+         """배치 데이터 반환 (HF Streaming)"""
+         latents_list = []
+         captions_list = []
+         
+         # HF streaming dataset에서 batch_size만큼 샘플 가져오기
+         for _ in range(self.batch_size):
+             try:
+                 sample = next(self.dataset_iter)
+                 latent = sample['latents']  # (3, 4, 32, 32)
+                 caption = sample.get('caption_llava', "")
+                 
+                 # Latent 추출: (3, 4, 32, 32) → (4, 32, 32)
+                 if isinstance(latent, torch.Tensor):
+                     latent = latent.cpu().numpy()
+                 channels, frames, h, w = latent.shape
+                 latent = latent.reshape(channels * frames, h, w)[:4, :, :]
+                 latents_list.append(latent)
+                 captions_list.append(caption if caption else "")
+                 
+             except StopIteration:
+                 # 데이터셋 끝나면 다시 시작
+                 self.dataset_iter = iter(self.dataset)
+                 sample = next(self.dataset_iter)
+                 latent = sample['latents']
+                 caption = sample.get('caption_llava', "")
+                 
+                 if isinstance(latent, torch.Tensor):
+                     latent = latent.cpu().numpy()
+                 channels, frames, h, w = latent.shape
+                 latent = latent.reshape(channels * frames, h, w)[:4, :, :]
+                 latents_list.append(latent)
+                 captions_list.append(caption if caption else "")
+                 
+             except Exception as e:
+                 print(f"  ⚠ Error loading sample: {e}")
+                 latents_list.append(np.zeros((4, 32, 32), dtype=np.float32))
+                 captions_list.append("")
+         
+         if len(latents_list) == 0:
+             raise ValueError(f"Batch {batch_idx}: No valid samples loaded")
+         
+         # Stack latents: (B, 4, 32, 32)
+         batch_latents = np.stack(latents_list, axis=0)
+         batch_latents = jnp.array(batch_latents, dtype=jnp.float32)
+         
+         # 임베딩 계산 (병렬화)
+         batch_embeddings = self.embedding_provider.batch_encode(
+             captions_list, batch_size=512, normalize=True
+         )  # (B, 640)
+         
+         return batch_latents, batch_embeddings
 
 
 # ============================================
@@ -587,11 +559,10 @@ def main():
     print("Initializing data loader...")
     print("="*60)
     
-    # GCS 버킷에서 로드
+    # HuggingFace Streaming (자동 캐시 관리)
     data_loader = Coyo11mDataLoader(
         batch_size=config.global_batch_size,
-        embedding_provider=embedding_provider,
-        gcs_bucket="gs://rdy-tpu-data-2025/coyo11m-256px-ccrop-latent"
+        embedding_provider=embedding_provider
     )
     
     # 모델 초기화
