@@ -31,6 +31,7 @@ def main():
     config.num_devices = 112  # TPU v5e 256
     config.global_batch_size = 7168  # 112 × 64
     config.batch_size_per_device = 64
+    config.context_dim = 768  # Embedding Gemma 300M
     config.num_epochs = 20
     config.steps_per_epoch = 1065  # 7.624M / 7168 ≈ 1065
     

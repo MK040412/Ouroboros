@@ -49,7 +49,7 @@ class TrainingConfig256:
     
     # 모델 (XUT-Small)
     model_dim: int = 896
-    context_dim: int = 640              # Gemma-270M
+    context_dim: int = 768              # Embedding Gemma 300M dimension
     mlp_dim: int = 3072
     heads: int = 14
     depth: int = 4
@@ -62,7 +62,7 @@ class TrainingConfig256:
     T: int = 1000
     
     # Text embedding
-    embedding_model: str = "google/embedding-gecko-text-3"  # 640d context용
+    embedding_model: str = "google/embeddinggemma-300m"  # 768d
     
     # TREAD (Timestep-Random Encoder Architecture Design)
     tread_selection_rate: float = 0.5  # 기존 연구 설정값
