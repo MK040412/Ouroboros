@@ -146,7 +146,7 @@ class Coyo11mDataLoader:
                 pt_data = torch.load(pt_file, map_location="cuda:0")  # GPU 메모리
                 self.pt_data_cache[file_idx] = {
                     'keys': pt_data['keys'].numpy(),
-                    'latents': pt_data['latents']  # (N, 3, 4, 32, 32) - 3 frames, 4 channels, 32x32 VAE latent
+                    'latents': pt_data['latents']  # (N, 3, 4, 32, 32) - shape: (N, channels, frames, h, w)
                 }
                 
                 # Key → 파일 매핑
@@ -183,13 +183,14 @@ class Coyo11mDataLoader:
         for key in batch_keys:
             # PT에서 latent 로드 (캐시됨)
             file_idx, local_idx = self.pt_file_mapping[key]
-            # (3, 4, 32, 32) - 3 frames, 4 channels, 32x32
+            # (3, 4, 32, 32) - shape: (channels, frames, h, w)
             latent = self.pt_data_cache[file_idx]['latents'][local_idx].cpu().numpy()
             
             # Reshape: (3, 4, 32, 32) -> (12, 32, 32)
-            # Merge 3 frames × 4 channels into 12 channels
-            frames, channels, h, w = latent.shape
-            latent = latent.reshape(frames * channels, h, w)
+            # Merge channels × frames into single channel dimension
+            # Following decode_latent_final.py: c * frames = 3 * 4 = 12
+            channels, frames, h, w = latent.shape
+            latent = latent.reshape(channels * frames, h, w)
             
             # Use first 4 channels for VAE latent (as per decode_latent_final.py)
             # (12, 32, 32) -> (4, 32, 32)
