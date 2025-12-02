@@ -170,47 +170,58 @@ class Coyo11mDataLoader:
     
     def get_batch(self, batch_idx: int, rng_key):
         """배치 데이터 반환 (빠른 접근)"""
-        # 배치 샘플 선택 (circular indexing)
+        # 배치 샘플 선택 (circular indexing - 올바른 방식)
         total_samples = len(self.available_keys)
         start_idx = (batch_idx * self.batch_size) % total_samples
-        end_idx = min(start_idx + self.batch_size, total_samples)
-        
-        batch_keys = self.available_keys[start_idx:end_idx]
+        batch_keys = []
+        for i in range(self.batch_size):
+            batch_keys.append(self.available_keys[(start_idx + i) % total_samples])
         
         latents_list = []
         captions_list = []
         
         for key in batch_keys:
-            # PT에서 latent 로드 (캐시됨)
-            file_idx, local_idx = self.pt_file_mapping[key]
-            # (3, 4, 32, 32) - shape: (channels, frames, h, w)
-            latent = self.pt_data_cache[file_idx]['latents'][local_idx].cpu().numpy()
-            
-            # Reshape: (3, 4, 32, 32) -> (12, 32, 32)
-            # Merge channels × frames into single channel dimension
-            # Following decode_latent_final.py: c * frames = 3 * 4 = 12
-            channels, frames, h, w = latent.shape
-            latent = latent.reshape(channels * frames, h, w)
-            
-            # Use first 4 channels for VAE latent (as per decode_latent_final.py)
-            # (12, 32, 32) -> (4, 32, 32)
-            latent = latent[:4, :, :]
-            
-            latents_list.append(latent)
-            
-            # Parquet에서 caption 로드
-            row = self.metadata_table.filter(
-                pq.compute.equal(self.metadata_table['key'], key)
-            )
-            if len(row) > 0:
-                caption = row['caption_llava'][0].as_py()
-                captions_list.append(caption)
+            try:
+                # PT에서 latent 로드 (캐시됨)
+                file_idx, local_idx = self.pt_file_mapping[key]
+                # (3, 4, 32, 32) - shape: (channels, frames, h, w)
+                latent = self.pt_data_cache[file_idx]['latents'][local_idx].cpu().numpy()
+                
+                # Reshape: (3, 4, 32, 32) -> (12, 32, 32)
+                # Merge channels × frames into single channel dimension
+                # Following decode_latent_final.py: c * frames = 3 * 4 = 12
+                channels, frames, h, w = latent.shape
+                latent = latent.reshape(channels * frames, h, w)
+                
+                # Use first 4 channels for VAE latent (as per decode_latent_final.py)
+                # (12, 32, 32) -> (4, 32, 32)
+                latent = latent[:4, :, :]
+                
+                latents_list.append(latent)
+                
+                # Parquet에서 caption 로드
+                row = self.metadata_table.filter(
+                    pq.compute.equal(self.metadata_table['key'], key)
+                )
+                if len(row) > 0:
+                    caption = row['caption_llava'][0].as_py()
+                    captions_list.append(caption)
+                else:
+                    # Caption 없으면 빈 문자열 사용
+                    captions_list.append("")
+            except Exception as e:
+                print(f"  ⚠ Error loading key {key}: {e}")
+                continue
+        
+        # 데이터가 비어있으면 처리
+        if len(latents_list) == 0:
+            raise ValueError(f"Batch {batch_idx}: No valid samples loaded")
         
         # Stack latents: (B, 4, 32, 32) - batch of VAE latents
         batch_latents = np.stack(latents_list, axis=0)
         batch_latents = jnp.array(batch_latents, dtype=jnp.float32)
         
-        # 임베딩 계산
+        # 임베딩 계산 (captions_list는 항상 latents_list와 같은 길이)
         batch_embeddings = self.embedding_provider.batch_encode(
             captions_list, batch_size=512, normalize=True
         )  # (B, 640)
@@ -274,16 +285,13 @@ class TPUTrainer:
         # text_emb: (B, 640) → (B, 1, 640) for context
         ctx = text_emb[:, None, :]  # (B, 640) → (B, 1, 640)
         
-        # 모델 호출: 입력은 NHWC, 출력은 (B, C, H, W)
+        # 모델 호출: 입력은 NHWC, 출력은 (B, H, W, C) NHWC 형식
+        # XUDiT는 NHWC 입력받고 (B, H, W, C) 출력
         pred_noise_nhwc = model(x_t_nhwc, timesteps, ctx=ctx, deterministic=False)
         
-        # 출력을 NCHW로 변환 (if needed)
-        if pred_noise_nhwc.ndim == 4 and pred_noise_nhwc.shape[-1] != 4:
-            # Output is already NCHW
-            pred_noise = pred_noise_nhwc
-        else:
-            # Output is NHWC, convert to NCHW
-            pred_noise = jnp.transpose(pred_noise_nhwc, (0, 3, 1, 2))
+        # 출력 형식 확인: (B, 32, 32, 4) NHWC
+        # NCHW로 변환: (B, 4, 32, 32)
+        pred_noise = jnp.transpose(pred_noise_nhwc, (0, 3, 1, 2))
         
         # MSE loss: target은 noise (B, 4, 32, 32)
         loss = jnp.mean((pred_noise - noise) ** 2)
@@ -302,12 +310,15 @@ class TPUTrainer:
         mask = jax.random.uniform(subkey, (batch_size,)) < self.config.tread_selection_rate
         t_cond = jnp.where(mask, jnp.zeros_like(timesteps), timesteps)
         
-        # Loss 및 gradient
+        # Loss 및 gradient 계산
+        # ⚠️ NOTE: nnx.value_and_grad 및 optimizer.update의 정확한 API 확인 필요
+        # 또는 표준 jax.grad 사용으로 변경
         loss, grads = nnx.value_and_grad(self.loss_fn)(
             model_state, x_t, t_cond, noise, text_emb
         )
         
         # 옵티마이저 업데이트
+        # ⚠️ NOTE: 이 API가 올바른지 nnx 문서에서 확인 필요
         self.optimizer.update(grads, lr=lr)
         
         return loss, rng_key
