@@ -1,0 +1,36 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments
+.venv/
+env/
+venv/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+.marscode/
+*.swp
+*.swo
+
+# Python
+.pytest_cache/
+.mypy_cache/
+.dmypy.json
+
+# Large dataset files
+*.pt
+*.parquet
+decoded_output/
+checkpoints/
+*.pth
+*.safetensors
+captions_*.txt
+
+# Data files
+000000-000009.pt
+coyo11m-meta.parquet
+captions_10.txt
