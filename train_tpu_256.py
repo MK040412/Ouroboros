@@ -21,6 +21,10 @@ import time
 from pathlib import Path
 import glob
 import wandb
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import queue
+import threading
+import tempfile
 
 from src.xut.xut_small import create_xut_small
 from src.embeddings import get_embedding_provider
@@ -32,13 +36,9 @@ from src.embeddings import get_embedding_provider
 @dataclass
 class TrainingConfig256:
     """256² 스테이지 학습 설정"""
-    # 데이터
-    latent_dir: str = "/path/to/coyo11m-256px-ccrop-latent/latents-3crop"
-    metadata_file: str = "/path/to/coyo11m-meta.parquet"
-    
     # 배치 및 데이터
     global_batch_size: int = 2048      # 분할 안 함
-    num_devices: int = 16              # TPU v5e pod size
+    num_devices: int = 16              # TPU v5e pod size (또는 112 for TPU v5e 256)
     batch_size_per_device: int = 128   # 2048 / 16 = 128
     
     # 학습
@@ -120,113 +120,233 @@ class DiffusionSchedule:
 
 
 # ============================================
-# Large Scale Data Loader
+# Large Scale Data Loader with Prefetch
 # ============================================
 class Coyo11mDataLoader:
-    """Coyo11m 256px latent 데이터로더 (최적화)"""
+    """Coyo11m 256px latent 데이터로더 (HF + Prefetch + TPU최적화)"""
     
-    def __init__(self, latent_dir: str, metadata_file: str, 
-                 batch_size: int, embedding_provider=None):
-        self.latent_dir = Path(latent_dir)
+    def __init__(self, batch_size: int, embedding_provider=None, 
+                 use_gcs: bool = False, gcs_bucket: str = "gs://rdy-tpu-data-2025/coyo11m"):
         self.batch_size = batch_size
         self.embedding_provider = embedding_provider
+        self.use_gcs = use_gcs
+        self.gcs_bucket = gcs_bucket
         
-        # PT 파일 목록 수집
-        print("Scanning PT files...")
-        self.pt_files = sorted(glob.glob(str(self.latent_dir / "*.pt")))
-        print(f"Found {len(self.pt_files)} PT files")
+        # HuggingFace repo 또는 GCS에서 파일 목록 로드
+        print("Scanning data files...")
+        if use_gcs:
+            self._load_from_gcs()
+        else:
+            self._load_from_huggingface()
         
-        # 모든 PT 데이터 메모리에 로드 (빠른 I/O)
-        print("Pre-loading all PT files to memory...")
+        # Parquet 메타데이터 로드 (HF에서)
+        print("\nLoading metadata from HuggingFace...")
+        self._load_metadata()
+        
+        print(f"Available samples: {len(self.available_keys)}")
+    
+    def _load_from_gcs(self):
+        """GCS 버킷에서 파일 목록 로드"""
+        import subprocess
+        result = subprocess.run(
+            ["gcloud", "storage", "ls", f"{self.gcs_bucket}/latents-3crop/"],
+            capture_output=True, text=True
+        )
+        
+        self.pt_files = []
+        for line in result.stdout.strip().split('\n'):
+            if line.endswith('.pt'):
+                self.pt_files.append(line.strip())
+        
+        print(f"Found {len(self.pt_files)} PT files in GCS")
         self.pt_data_cache = {}
-        self.pt_file_mapping = {}  # key → (file_idx, local_idx)
+        self.pt_file_mapping = {}
         
-        for file_idx, pt_file in enumerate(self.pt_files):
-            try:
-                pt_data = torch.load(pt_file, map_location="cuda:0")  # GPU 메모리
-                self.pt_data_cache[file_idx] = {
-                    'keys': pt_data['keys'].numpy(),
-                    'latents': pt_data['latents']  # (N, 3, 4, 32, 32) - shape: (N, channels, frames, h, w)
-                }
-                
-                # Key → 파일 매핑
-                for local_idx, key in enumerate(self.pt_data_cache[file_idx]['keys']):
-                    self.pt_file_mapping[int(key)] = (file_idx, local_idx)
-                
-                print(f"  ✓ Loaded {pt_file} ({len(self.pt_data_cache[file_idx]['keys'])} samples)")
-            except Exception as e:
-                print(f"  ✗ Error loading {pt_file}: {e}")
+        # GCS에서 필요할 때만 다운로드 (lazy loading)
+        for pt_file in self.pt_files:
+            filename = Path(pt_file).name
+            # 메타데이터 생성
+            self.pt_file_mapping[filename] = pt_file
+    
+    def _load_from_huggingface(self):
+        """HuggingFace repo에서 스트리밍 데이터 로드"""
+        from datasets import load_dataset
         
-        # Parquet 메타데이터 로드
-        print("\nLoading metadata...")
-        self.metadata_table = pq.read_table(metadata_file)
-        print(f"Loaded metadata for {len(self.metadata_table)} samples")
+        # HF dataset을 스트리밍으로 로드 (전체 다운로드 필요 없음)
+        print("Loading dataset from HuggingFace (streaming)...")
+        self.dataset = load_dataset(
+            "KBlueLeaf/coyo11m-256px-ccrop-latent",
+            streaming=True,
+            split="train"
+        )
+        self.pt_data_cache = {}
+        self.pt_file_mapping = {}
+        self.dataset_iter = iter(self.dataset)
+    
+    def _load_metadata(self):
+        """메타데이터 로드"""
+        from huggingface_hub import hf_hub_download
         
-        # 사용 가능한 keys 필터링
-        available_keys = list(self.pt_file_mapping.keys())
-        self.available_keys = [k for k in available_keys 
-                               if k in self.metadata_table['key'].to_pylist()]
-        print(f"Available samples (PT ∩ Parquet): {len(self.available_keys)}")
+        metadata_path = hf_hub_download(
+            repo_id="KBlueLeaf/coyo11m-256px-ccrop-latent",
+            filename="coyo11m-meta.parquet",
+            repo_type="dataset",
+            local_dir="/tmp",
+            local_dir_use_symlinks=False
+        )
+        
+        self.metadata_table = pq.read_table(metadata_path)
+        self.available_keys = list(range(len(self.metadata_table)))
+        print(f"Loaded {len(self.available_keys)} metadata entries")
+    
+    def _load_pt_file_gcs(self, gcs_path: str):
+        """GCS에서 PT 파일 다운로드 및 로드"""
+        import tempfile
+        import subprocess
+        
+        with tempfile.NamedTemporaryFile(suffix='.pt', delete=False) as tmp:
+            tmp_path = tmp.name
+        
+        try:
+            subprocess.run(
+                ["gcloud", "storage", "cp", gcs_path, tmp_path],
+                check=True, capture_output=True
+            )
+            pt_data = torch.load(tmp_path, map_location="cpu")
+            return pt_data
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+    
+    def _load_pt_file_hf(self, filename: str):
+        """HuggingFace에서 PT 파일 다운로드 및 로드"""
+        from huggingface_hub import hf_hub_download
+        
+        pt_path = hf_hub_download(
+            repo_id="KBlueLeaf/coyo11m-256px-ccrop-latent",
+            filename=f"latents-3crop/{filename}",
+            repo_type="dataset",
+            local_dir="/tmp",
+            local_dir_use_symlinks=False
+        )
+        
+        pt_data = torch.load(pt_path, map_location="cpu")
+        return pt_data
     
     def get_batch(self, batch_idx: int, rng_key):
-        """배치 데이터 반환 (빠른 접근)"""
-        # 배치 샘플 선택 (circular indexing - 올바른 방식)
+        """배치 데이터 반환 (Prefetch 최적화)"""
+        # 배치 샘플 선택
         total_samples = len(self.available_keys)
         start_idx = (batch_idx * self.batch_size) % total_samples
-        batch_keys = []
+        batch_indices = []
         for i in range(self.batch_size):
-            batch_keys.append(self.available_keys[(start_idx + i) % total_samples])
+            batch_indices.append((start_idx + i) % total_samples)
         
         latents_list = []
         captions_list = []
         
-        for key in batch_keys:
+        for idx in batch_indices:
             try:
-                # PT에서 latent 로드 (캐시됨)
-                file_idx, local_idx = self.pt_file_mapping[key]
-                # (3, 4, 32, 32) - shape: (channels, frames, h, w)
-                latent = self.pt_data_cache[file_idx]['latents'][local_idx].cpu().numpy()
+                # 메타데이터에서 key 가져오기
+                row = self.metadata_table.slice(idx, idx + 1)
+                key = int(row['key'][0].as_py())
+                caption = row['caption_llava'][0].as_py() if 'caption_llava' in row.column_names else ""
                 
-                # Reshape: (3, 4, 32, 32) -> (12, 32, 32)
-                # Merge channels × frames into single channel dimension
-                # Following decode_latent_final.py: c * frames = 3 * 4 = 12
+                # PT 파일 확인: 어느 파일에 속하는지
+                file_idx = key // 10  # 각 파일당 10개 샘플 (000000-000009.pt, 000010-000019.pt 등)
+                local_idx = key % 10
+                filename = f"{file_idx:06d}-{file_idx + 9:06d}.pt"
+                
+                # PT 데이터 로드 (캐시 또는 다운로드)
+                if filename not in self.pt_data_cache:
+                    print(f"  Loading {filename}...")
+                    if self.use_gcs:
+                        pt_data = self._load_pt_file_gcs(f"{self.gcs_bucket}/latents-3crop/{filename}")
+                    else:
+                        pt_data = self._load_pt_file_hf(filename)
+                    
+                    self.pt_data_cache[filename] = {
+                        'keys': pt_data['keys'].numpy(),
+                        'latents': pt_data['latents']
+                    }
+                
+                # Latent 추출: (3, 4, 32, 32) → (4, 32, 32)
+                latent = self.pt_data_cache[filename]['latents'][local_idx].cpu().numpy()
                 channels, frames, h, w = latent.shape
-                latent = latent.reshape(channels * frames, h, w)
-                
-                # Use first 4 channels for VAE latent (as per decode_latent_final.py)
-                # (12, 32, 32) -> (4, 32, 32)
-                latent = latent[:4, :, :]
-                
+                latent = latent.reshape(channels * frames, h, w)[:4, :, :]
                 latents_list.append(latent)
+                captions_list.append(caption if caption else "")
                 
-                # Parquet에서 caption 로드
-                row = self.metadata_table.filter(
-                    pq.compute.equal(self.metadata_table['key'], key)
-                )
-                if len(row) > 0:
-                    caption = row['caption_llava'][0].as_py()
-                    captions_list.append(caption)
-                else:
-                    # Caption 없으면 빈 문자열 사용
-                    captions_list.append("")
             except Exception as e:
-                print(f"  ⚠ Error loading key {key}: {e}")
-                continue
+                print(f"  ⚠ Error loading index {idx}: {e}")
+                # 에러 시 zero tensor 사용
+                latents_list.append(np.zeros((4, 32, 32), dtype=np.float32))
+                captions_list.append("")
         
-        # 데이터가 비어있으면 처리
         if len(latents_list) == 0:
             raise ValueError(f"Batch {batch_idx}: No valid samples loaded")
         
-        # Stack latents: (B, 4, 32, 32) - batch of VAE latents
+        # Stack latents: (B, 4, 32, 32)
         batch_latents = np.stack(latents_list, axis=0)
         batch_latents = jnp.array(batch_latents, dtype=jnp.float32)
         
-        # 임베딩 계산 (captions_list는 항상 latents_list와 같은 길이)
+        # 임베딩 계산 (병렬화)
         batch_embeddings = self.embedding_provider.batch_encode(
             captions_list, batch_size=512, normalize=True
         )  # (B, 640)
         
         return batch_latents, batch_embeddings
+
+
+# ============================================
+# Prefetch Pipeline (TPU 최적화)
+# ============================================
+class PrefetchDataLoader:
+    """Prefetch를 이용한 데이터로딩 파이프라인"""
+    
+    def __init__(self, data_loader: Coyo11mDataLoader, 
+                 steps_per_epoch: int, prefetch_size: int = 2):
+        self.data_loader = data_loader
+        self.steps_per_epoch = steps_per_epoch
+        self.prefetch_size = prefetch_size
+        self.prefetch_queue = queue.Queue(maxsize=prefetch_size)
+        self.stop_event = threading.Event()
+        
+        # Prefetch 워커 스레드 시작
+        self.worker_thread = threading.Thread(
+            target=self._prefetch_worker, daemon=True
+        )
+        self.worker_thread.start()
+    
+    def _prefetch_worker(self):
+        """백그라운드에서 배치를 미리 로드"""
+        rng_key = jax.random.PRNGKey(0)
+        for batch_idx in range(self.steps_per_epoch):
+            if self.stop_event.is_set():
+                break
+            try:
+                rng_key, subkey = jax.random.split(rng_key)
+                batch = self.data_loader.get_batch(batch_idx, subkey)
+                self.prefetch_queue.put(batch, timeout=10)
+            except Exception as e:
+                print(f"Prefetch error at batch {batch_idx}: {e}")
+                break
+        
+        # 종료 신호
+        self.prefetch_queue.put(None)
+    
+    def get_batches(self):
+        """Prefetch된 배치 반환"""
+        while True:
+            batch = self.prefetch_queue.get()
+            if batch is None:  # 종료 신호
+                break
+            yield batch
+    
+    def stop(self):
+        """Prefetch 중지"""
+        self.stop_event.set()
+        self.worker_thread.join(timeout=5)
 
 
 # ============================================
@@ -342,15 +462,13 @@ class TPUTrainer:
         except Exception as e:
             print(f"  ✗ Failed to save checkpoint: {e}")
     
-    def train_epoch(self, data_loader: Coyo11mDataLoader, epoch: int):
-        """에포크 학습"""
+    def train_epoch(self, prefetch_loader: 'PrefetchDataLoader', epoch: int):
+        """에포크 학습 (Prefetch 파이프라인 사용)"""
         losses = []
         rng_key = jax.random.PRNGKey(epoch)
+        step = 0
         
-        for step in range(self.config.steps_per_epoch):
-            # 데이터 로드
-            rng_key, subkey = jax.random.split(rng_key)
-            batch_latents, batch_embeddings = data_loader.get_batch(step, subkey)
+        for batch_latents, batch_embeddings in prefetch_loader.get_batches():
             batch_size = batch_latents.shape[0]
             
             # 타임스텝 샘플링 (배치 단위, 각 샘플마다 다른 t)
@@ -379,13 +497,18 @@ class TPUTrainer:
                 "step": step + 1,
             }, step=global_step)
             
-            if (step + 1) % 100 == 0:
+            step += 1
+            
+            if step % 100 == 0:
                 avg_loss = np.mean(losses[-100:])
                 print(f"Epoch {epoch+1}/{self.config.num_epochs} "
-                      f"Step {step+1}/{self.config.steps_per_epoch} "
+                      f"Step {step}/{self.config.steps_per_epoch} "
                       f"Loss: {avg_loss:.6f}")
+            
+            if step >= self.config.steps_per_epoch:
+                break
         
-        epoch_avg_loss = np.mean(losses)
+        epoch_avg_loss = np.mean(losses) if losses else 0.0
         return losses, epoch_avg_loss
 
 
@@ -423,6 +546,8 @@ def main():
     print(f"  TREAD selection rate: {config.tread_selection_rate}")
     print(f"  Epochs: {config.num_epochs}")
     print(f"  Steps per epoch: {config.steps_per_epoch}")
+    print(f"  Data loading: HuggingFace streaming + Prefetch pipeline")
+    print(f"  Note: For TPU v5e 256 (112 cores), adjust num_devices to 112")
     
     # 디바이스 확인
     print("\n" + "="*60)
@@ -437,16 +562,18 @@ def main():
     
     embedding_provider = get_embedding_provider(config.embedding_model)
     
-    # 데이터로더
+    # 데이터로더 (HF 또는 GCS에서 직접 로딩)
     print("\n" + "="*60)
     print("Initializing data loader...")
     print("="*60)
     
+    # GCS 버킷에 데이터를 업로드했으면 use_gcs=True 사용
+    # 아니면 HuggingFace에서 직접 스트리밍으로 로드
     data_loader = Coyo11mDataLoader(
-        config.latent_dir,
-        config.metadata_file,
-        config.global_batch_size,
-        embedding_provider=embedding_provider
+        batch_size=config.global_batch_size,
+        embedding_provider=embedding_provider,
+        use_gcs=False,  # True로 변경하면 GCS에서 로딩
+        gcs_bucket="gs://rdy-tpu-data-2025/coyo11m"
     )
     
     # 모델 초기화
@@ -489,7 +616,17 @@ def main():
     
     for epoch in range(config.num_epochs):
         epoch_start = time.time()
-        losses, epoch_avg_loss = trainer.train_epoch(data_loader, epoch)
+        
+        # Prefetch 파이프라인 생성 (배경에서 배치 로딩)
+        prefetch_loader = PrefetchDataLoader(
+            data_loader, 
+            steps_per_epoch=config.steps_per_epoch,
+            prefetch_size=2  # 2개 배치 미리 로드
+        )
+        
+        losses, epoch_avg_loss = trainer.train_epoch(prefetch_loader, epoch)
+        prefetch_loader.stop()
+        
         epoch_time = time.time() - epoch_start
         
         print(f"\n{'='*60}")
