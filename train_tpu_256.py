@@ -102,11 +102,11 @@ class DiffusionSchedule:
         Forward diffusion: x_t = sqrt(alpha_cumprod_t) * x_0 + sqrt(1 - alpha_cumprod_t) * noise
         
         Args:
-            x_0: (B, 4, 256, 256) - 원본 latent
-            noise: (B, 4, 256, 256) - 노이즈
+            x_0: (B, 4, 32, 32) - 원본 VAE latent
+            noise: (B, 4, 32, 32) - 노이즈
             timesteps: (B,) - 각 샘플의 타임스텝
         Returns:
-            x_t: (B, 4, 256, 256) - noisy latent
+            x_t: (B, 4, 32, 32) - noisy latent
         """
         sqrt_alpha = self.sqrt_alphas_cumprod[timesteps]  # (B,)
         sqrt_one_minus_alpha = self.sqrt_one_minus_alphas_cumprod[timesteps]  # (B,)
@@ -146,7 +146,7 @@ class Coyo11mDataLoader:
                 pt_data = torch.load(pt_file, map_location="cuda:0")  # GPU 메모리
                 self.pt_data_cache[file_idx] = {
                     'keys': pt_data['keys'].numpy(),
-                    'latents': pt_data['latents']  # (N, 4, 256, 256)
+                    'latents': pt_data['latents']  # (N, 3, 4, 32, 32) - 3 frames, 4 channels, 32x32 VAE latent
                 }
                 
                 # Key → 파일 매핑
@@ -183,7 +183,18 @@ class Coyo11mDataLoader:
         for key in batch_keys:
             # PT에서 latent 로드 (캐시됨)
             file_idx, local_idx = self.pt_file_mapping[key]
+            # (3, 4, 32, 32) - 3 frames, 4 channels, 32x32
             latent = self.pt_data_cache[file_idx]['latents'][local_idx].cpu().numpy()
+            
+            # Reshape: (3, 4, 32, 32) -> (12, 32, 32)
+            # Merge 3 frames × 4 channels into 12 channels
+            frames, channels, h, w = latent.shape
+            latent = latent.reshape(frames * channels, h, w)
+            
+            # Use first 4 channels for VAE latent (as per decode_latent_final.py)
+            # (12, 32, 32) -> (4, 32, 32)
+            latent = latent[:4, :, :]
+            
             latents_list.append(latent)
             
             # Parquet에서 caption 로드
@@ -194,7 +205,7 @@ class Coyo11mDataLoader:
                 caption = row['caption_llava'][0].as_py()
                 captions_list.append(caption)
         
-        # Stack latents: (B, 4, 256, 256) NCHW
+        # Stack latents: (B, 4, 32, 32) - batch of VAE latents
         batch_latents = np.stack(latents_list, axis=0)
         batch_latents = jnp.array(batch_latents, dtype=jnp.float32)
         
@@ -252,7 +263,7 @@ class TPUTrainer:
     def loss_fn(model, x_t, timesteps, noise, text_emb):
         """노이즈 예측 손실 (epsilon/noise prediction)"""
         # 입력 형식 변환 (NCHW → NHWC)
-        # x_t: (B, 4, 256, 256) NCHW → (B, 256, 256, 4) NHWC
+        # x_t: (B, 4, 32, 32) NCHW → (B, 32, 32, 4) NHWC
         x_t_nhwc = jnp.transpose(x_t, (0, 2, 3, 1))
         
         # timesteps: (B,) 또는 (B, 1)
@@ -262,13 +273,18 @@ class TPUTrainer:
         # text_emb: (B, 640) → (B, 1, 640) for context
         ctx = text_emb[:, None, :]  # (B, 640) → (B, 1, 640)
         
-        # 모델 호출: 출력은 (B, C, H, W)
+        # 모델 호출: 입력은 NHWC, 출력은 (B, C, H, W)
         pred_noise_nhwc = model(x_t_nhwc, timesteps, ctx=ctx, deterministic=False)
         
-        # 출력을 NCHW로 변환
-        pred_noise = jnp.transpose(pred_noise_nhwc, (0, 3, 1, 2)) if pred_noise_nhwc.ndim == 4 else pred_noise_nhwc
+        # 출력을 NCHW로 변환 (if needed)
+        if pred_noise_nhwc.ndim == 4 and pred_noise_nhwc.shape[-1] != 4:
+            # Output is already NCHW
+            pred_noise = pred_noise_nhwc
+        else:
+            # Output is NHWC, convert to NCHW
+            pred_noise = jnp.transpose(pred_noise_nhwc, (0, 3, 1, 2))
         
-        # MSE loss: target은 noise
+        # MSE loss: target은 noise (B, 4, 32, 32)
         loss = jnp.mean((pred_noise - noise) ** 2)
         return loss
     
