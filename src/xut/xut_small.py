@@ -11,7 +11,7 @@ def create_xut_small(
     patch_size: int = 2,
     input_dim: int = 4,
     dim: int = 896,
-    ctx_dim: int = 640,
+    ctx_dim: int = 768,
     ctx_size: int = 256,
     heads: int = 14,
     dim_head: int = 64,
@@ -29,7 +29,7 @@ def create_xut_small(
         patch_size: Patch embedding size
         input_dim: VAE latent channels (4)
         dim: Model dimension (896)
-        ctx_dim: Context embedding dimension (640 from Gemma-270M)
+        ctx_dim: Context embedding dimension (768 from Embedding Gemma 300M)
         ctx_size: Context sequence length
         heads: Number of attention heads (14)
         dim_head: Head dimension (64)

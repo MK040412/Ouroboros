@@ -40,14 +40,24 @@ class EmbeddingProvider:
             embeddings: (N, embedding_dim) numpy array
         """
         if isinstance(self.model, object) and hasattr(self.model, 'encode'):
-            # sentence-transformers
-            embeddings = self.model.encode(
-                texts,
-                batch_size=batch_size,
-                normalize_embeddings=normalize,
-                show_progress_bar=show_progress_bar,
-                convert_to_numpy=True
-            )
+            # sentence-transformers or embedding models
+            # Check if it's an embedding gemma model (has encode_query/encode_document)
+            if hasattr(self.model, 'encode_query'):
+                # Embedding Gemma style
+                embeddings = self.model.encode_document(
+                    texts,
+                    batch_size=batch_size,
+                    convert_to_numpy=True
+                )
+            else:
+                # Standard sentence-transformers
+                embeddings = self.model.encode(
+                    texts,
+                    batch_size=batch_size,
+                    normalize_embeddings=normalize,
+                    show_progress_bar=show_progress_bar,
+                    convert_to_numpy=True
+                )
             return embeddings.astype(np.float32)
         else:
             # transformers fallback
