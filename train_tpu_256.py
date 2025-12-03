@@ -79,7 +79,7 @@ class TrainingConfig256:
     cache_dir: str = None  # 자동으로 /tmp 사용
     num_data_workers: int = 112  # CPU vCPU 수
     prefetch_ahead: int = 3  # 미리 다운로드할 PT 파일 개수
-    max_cache_files: int = 3  # 최대 동시 캐시 PT 파일 (100GB VM에서 ~300MB 사용)
+    max_cache_files: int = 3  # 최대 동시 캐시 PT 파일 (100GB VM에서 about 7GB 사용)
     
     # TPU 설정
     use_pjit: bool = True
