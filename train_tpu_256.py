@@ -507,11 +507,24 @@ class TPUTrainer:
 # ============================================
 def main():
     import sys
+    import logging
+    
+    # 파일 + 콘솔 로깅 (core dump 시 추적 가능)
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format='[%(asctime)s] %(levelname)s: %(message)s',
+        handlers=[
+            logging.FileHandler('/tmp/train_debug.log'),
+            logging.StreamHandler(sys.stdout)
+        ]
+    )
+    logger = logging.getLogger(__name__)
     
     print("="*60)
     print("TPU v5e 16 Pod Training (256² XUT-Small)")
     print("="*60)
     sys.stdout.flush()
+    logger.info("Main function started")
     
     # 멀티프로세스 초기화 (TPU Pod용) - optional
     process_index = 0
@@ -520,33 +533,55 @@ def main():
     # Distributed 환경 감지
     import os
     print(f"\n[Step 1] Environment Check")
+    logger.info("[Step 1] Environment Check starting...")
     sys.stdout.flush()
     
-    use_distributed = os.environ.get("JAX_COORDINATOR_ADDRESS") is not None or os.environ.get("GCLOUD_RUN_ENVIRONMENT") is not None
-    
-    print(f"  JAX_COORDINATOR_ADDRESS: {os.environ.get('JAX_COORDINATOR_ADDRESS', 'Not set')}")
-    print(f"  SLURM_PROCID: {os.environ.get('SLURM_PROCID', 'Not set')}")
-    print(f"  use_distributed: {use_distributed}")
-    print(f"  Device count: {len(jax.devices())}")
-    sys.stdout.flush()
+    try:
+        use_distributed = os.environ.get("JAX_COORDINATOR_ADDRESS") is not None or os.environ.get("GCLOUD_RUN_ENVIRONMENT") is not None
+        
+        print(f"  JAX_COORDINATOR_ADDRESS: {os.environ.get('JAX_COORDINATOR_ADDRESS', 'Not set')}")
+        print(f"  SLURM_PROCID: {os.environ.get('SLURM_PROCID', 'Not set')}")
+        print(f"  use_distributed: {use_distributed}")
+        
+        dev_count = len(jax.devices())
+        print(f"  Device count: {dev_count}")
+        logger.info(f"Device count: {dev_count}")
+        sys.stdout.flush()
+    except Exception as e:
+        logger.error(f"[Step 1] Error: {e}", exc_info=True)
+        print(f"  ERROR: {e}")
+        sys.stdout.flush()
+        raise
     
     if use_distributed:
-        print(f"\n[Step 2] Initializing JAX distributed (timeout=300s)...")
+        print(f"\n[Step 2] JAX distributed detected in environment")
+        print(f"  ⚠ WARNING: JAX_COORDINATOR_ADDRESS or GCLOUD_RUN_ENVIRONMENT is set")
+        print(f"  Attempting distributed initialization (30 second timeout)...")
         sys.stdout.flush()
+        logger.warning("Attempting JAX distributed init...")
+        
         try:
-            jax.distributed.initialize()
+            # Set shorter timeout to prevent hanging
+            import os
+            os.environ['JAX_COORDINATION_SERVICE_TIMEOUT'] = '30'
+            
+            jax.distributed.initialize(timeout=30)
             process_index = jax.process_index()
             process_count = jax.process_count()
             local_device_count = jax.local_device_count()
             print(f"  ✓ Distributed Setup Success")
             print(f"    Process: {process_index}/{process_count}")
             print(f"    Local devices: {local_device_count}")
+            logger.info(f"Distributed init success: {process_index}/{process_count}")
         except Exception as e:
-            print(f"  ✗ Distributed init failed: {e}")
+            print(f"  ✗ Distributed init failed after 30s: {e}")
             print(f"  Falling back to single-host mode")
+            logger.error(f"Distributed init failed: {e}", exc_info=True)
+            use_distributed = False
         sys.stdout.flush()
     else:
-        print(f"\n[Step 2] Single-Host Mode (no JAX distributed needed)")
+        print(f"\n[Step 2] Single-Host Mode (no JAX distributed)")
+        logger.info("Using single-host mode")
     
     print(f"\n[Step 3] Creating TrainingConfig256...")
     sys.stdout.flush()
