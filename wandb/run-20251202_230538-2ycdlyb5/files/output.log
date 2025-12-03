@@ -1,0 +1,67 @@
+
+Config:
+  Devices: 16 TPU cores
+  Global batch size: 2048
+  Batch per device: 128
+  Learning rate: 0.5
+  TREAD selection rate: 0.5
+  Epochs: 20
+  Steps per epoch: 3750
+  Data loading: HuggingFace streaming + Prefetch pipeline
+  Note: For TPU v5e 256 (112 cores), adjust num_devices to 112
+
+============================================================
+Traceback (most recent call last):
+  File "/home/mkkang0412/Ouroboros/.venv/lib/python3.10/site-packages/jax/_src/xla_bridge.py", line 742, in backends
+    backend = _init_backend(platform)
+  File "/home/mkkang0412/Ouroboros/.venv/lib/python3.10/site-packages/jax/_src/xla_bridge.py", line 828, in _init_backend
+    backend = registration.factory()
+  File "/home/mkkang0412/Ouroboros/.venv/lib/python3.10/site-packages/jax/_src/xla_bridge.py", line 161, in tpu_client_timer_callback
+    client = make_tpu_client(
+  File "/home/mkkang0412/Ouroboros/.venv/lib/python3.10/site-packages/jax/_src/xla_bridge.py", line 142, in make_tpu_client
+    _jax.initialize_pjrt_plugin('tpu')
+jaxlib._jax.XlaRuntimeError: ABORTED: The TPU is already in use by process with pid 36392. Not attempting to load libtpu.so in this process.
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/home/mkkang0412/Ouroboros/train_tpu_256.py", line 704, in <module>
+    main()
+  File "/home/mkkang0412/Ouroboros/train_tpu_256.py", line 590, in main
+    devices = jax.devices()
+  File "/home/mkkang0412/Ouroboros/.venv/lib/python3.10/site-packages/jax/_src/xla_bridge.py", line 942, in devices
+    return get_backend(backend).devices()
+  File "/home/mkkang0412/Ouroboros/.venv/lib/python3.10/site-packages/jax/_src/xla_bridge.py", line 876, in get_backend
+    return _get_backend_uncached(platform)
+  File "/home/mkkang0412/Ouroboros/.venv/lib/python3.10/site-packages/jax/_src/xla_bridge.py", line 855, in _get_backend_uncached
+    bs = backends()
+  File "/home/mkkang0412/Ouroboros/.venv/lib/python3.10/site-packages/jax/_src/xla_bridge.py", line 758, in backends
+    raise RuntimeError(err_msg)
+RuntimeError: Unable to initialize backend 'tpu': ABORTED: The TPU is already in use by process with pid 36392. Not attempting to load libtpu.so in this process. (set JAX_PLATFORMS='' to automatically choose an available backend)
+Traceback (most recent call last):
+  File "/home/mkkang0412/Ouroboros/.venv/lib/python3.10/site-packages/jax/_src/xla_bridge.py", line 742, in backends
+    backend = _init_backend(platform)
+  File "/home/mkkang0412/Ouroboros/.venv/lib/python3.10/site-packages/jax/_src/xla_bridge.py", line 828, in _init_backend
+    backend = registration.factory()
+  File "/home/mkkang0412/Ouroboros/.venv/lib/python3.10/site-packages/jax/_src/xla_bridge.py", line 161, in tpu_client_timer_callback
+    client = make_tpu_client(
+  File "/home/mkkang0412/Ouroboros/.venv/lib/python3.10/site-packages/jax/_src/xla_bridge.py", line 142, in make_tpu_client
+    _jax.initialize_pjrt_plugin('tpu')
+jaxlib._jax.XlaRuntimeError: ABORTED: The TPU is already in use by process with pid 36392. Not attempting to load libtpu.so in this process.
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/home/mkkang0412/Ouroboros/train_tpu_256.py", line 704, in <module>
+    main()
+  File "/home/mkkang0412/Ouroboros/train_tpu_256.py", line 590, in main
+    devices = jax.devices()
+  File "/home/mkkang0412/Ouroboros/.venv/lib/python3.10/site-packages/jax/_src/xla_bridge.py", line 942, in devices
+    return get_backend(backend).devices()
+  File "/home/mkkang0412/Ouroboros/.venv/lib/python3.10/site-packages/jax/_src/xla_bridge.py", line 876, in get_backend
+    return _get_backend_uncached(platform)
+  File "/home/mkkang0412/Ouroboros/.venv/lib/python3.10/site-packages/jax/_src/xla_bridge.py", line 855, in _get_backend_uncached
+    bs = backends()
+  File "/home/mkkang0412/Ouroboros/.venv/lib/python3.10/site-packages/jax/_src/xla_bridge.py", line 758, in backends
+    raise RuntimeError(err_msg)
+RuntimeError: Unable to initialize backend 'tpu': ABORTED: The TPU is already in use by process with pid 36392. Not attempting to load libtpu.so in this process. (set JAX_PLATFORMS='' to automatically choose an available backend)
