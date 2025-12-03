@@ -29,6 +29,11 @@ import tempfile
 
 from src.xut.xut_small import create_xut_small
 from src.embeddings import get_embedding_provider
+from src.data.gcs_dataloader import (
+    GCSDataLoaderSession, 
+    GCSFileHandler, 
+    ParquetCache
+)
 
 
 # ============================================
@@ -67,6 +72,13 @@ class TrainingConfig256:
     
     # TREAD (Timestep-Random Encoder Architecture Design)
     tread_selection_rate: float = 0.5  # 기존 연구 설정값
+    
+    # GCS 설정
+    gcs_bucket: str = "gs://rdy-tpu-data-2025/coyo11m-256px-ccrop-latent/"
+    parquet_file: str = None  # 자동으로 GCS에서 찾음
+    cache_dir: str = None  # 자동으로 /tmp 사용
+    num_data_workers: int = 112  # CPU vCPU 수
+    prefetch_ahead: int = 3  # 미리 다운로드할 PT 파일 개수
     
     # TPU 설정
     use_pjit: bool = True
@@ -583,33 +595,31 @@ def main():
         print(f"✗ Failed to load embedding provider: {e}")
         return
     
-    # PT 파일 목록 찾기
+    # GCS 데이터 설정
     print("\n" + "="*60)
-    print("[Data Files Setup]")
+    print("[GCS Data Setup]")
     print("="*60)
     
-    print("Scanning for PT files...")
-    pt_files = sorted(glob.glob("*.pt"))
-    parquet_file = "coyo11m-meta.parquet"
+    print(f"GCS Bucket: {config.gcs_bucket}")
+    print(f"CPU Workers: {config.num_data_workers} vCPUs")
+    print(f"Prefetch ahead: {config.prefetch_ahead} PT files")
     
-    if not pt_files:
-        print("✗ No PT files found!")
+    try:
+        # GCS 데이터로더 세션 초기화
+        gcs_session = GCSDataLoaderSession(
+            batch_size=config.global_batch_size,
+            parquet_path=config.parquet_file or f"{config.gcs_bucket}coyo11m-meta.parquet",
+            embedding_provider=embedding_provider,
+            gcs_bucket=config.gcs_bucket,
+            cache_dir=config.cache_dir,
+            num_workers=config.num_data_workers,
+            prefetch_ahead=config.prefetch_ahead
+        )
+        print(f"✓ GCS session initialized")
+        print(f"  PT files found: {len(gcs_session.pt_files)}")
+    except Exception as e:
+        print(f"✗ Failed to initialize GCS session: {e}")
         return
-    
-    print(f"✓ Found {len(pt_files)} PT files:")
-    for i, pt_file in enumerate(pt_files):
-        if os.path.exists(pt_file):
-            size_gb = os.path.getsize(pt_file) / (1024**3)
-            print(f"  [{i+1}] {pt_file} ({size_gb:.2f}GB)")
-        else:
-            print(f"  [{i+1}] {pt_file} (NOT FOUND)")
-    
-    if not os.path.exists(parquet_file):
-        print(f"✗ Parquet file not found: {parquet_file}")
-        return
-    else:
-        size_gb = os.path.getsize(parquet_file) / (1024**3)
-        print(f"✓ Parquet file: {parquet_file} ({size_gb:.2f}GB)")
     
     # 모델 초기화
     print("\n" + "="*60)
@@ -651,7 +661,7 @@ def main():
     print("[Training Starting]")
     print("="*70)
     print(f"Total epochs: {config.num_epochs}")
-    print(f"PT files per epoch: {len(pt_files)}")
+    print(f"PT files per epoch: {len(gcs_session.pt_files)}")
     print(f"Steps per PT file: {config.steps_per_epoch}")
     print(f"Global batch size: {config.global_batch_size}")
     
@@ -666,37 +676,30 @@ def main():
         epoch_start = time.time()
         epoch_losses = []
         
-        # 이 epoch에서 모든 PT 파일 순회
-        for pt_idx, pt_file in enumerate(pt_files):
-            print(f"\n  [{epoch+1}/{config.num_epochs}] PT {pt_idx+1}/{len(pt_files)}: {pt_file}")
-            
-            # 데이터로더 초기화 (새로운 PT 파일)
-            data_loader = Coyo11mDataLoader(
-                batch_size=config.global_batch_size,
-                pt_file=pt_file,
-                parquet_file=parquet_file,
-                embedding_provider=embedding_provider
+        # GCS 에포크 로더 생성 (자동 prefetch + 병렬 다운로드)
+        try:
+            gcs_prefetch_loader = gcs_session.get_epoch_loader(
+                epoch=epoch,
+                steps_per_epoch=config.steps_per_epoch
             )
-            
-            # 이 PT 파일로 한 번 학습
-            pt_start = time.time()
-            
-            # Prefetch 파이프라인 생성 (112 workers로 배경 로딩)
-            prefetch_loader = PrefetchDataLoader(
-                data_loader, 
-                steps_per_epoch=config.steps_per_epoch,
-                num_workers=112
-            )
-            
-            losses, pt_avg_loss = trainer.train_epoch(prefetch_loader, epoch)
-            prefetch_loader.stop()
+        except Exception as e:
+            print(f"✗ Failed to create epoch loader: {e}")
+            break
+        
+        # 학습 루프
+        pt_files_processed = 0
+        total_batches_processed = 0
+        
+        try:
+            losses, epoch_avg_loss = trainer.train_epoch(gcs_prefetch_loader, epoch)
             epoch_losses.extend(losses)
+            total_batches_processed += len(losses)
             
-            pt_time = time.time() - pt_start
-            print(f"    ✓ PT {pt_file} done in {pt_time/60:.1f}m - Loss: {pt_avg_loss:.6f}")
-            
-            # 메모리 해제 (다음 PT 파일 로드 전)
-            del data_loader, prefetch_loader
+            # PT 파일 개수 계산 (대략적)
+            if losses:
+                pt_files_processed = len(gcs_session.pt_files)
+        finally:
+            gcs_prefetch_loader.stop()
             gc.collect()
         
         epoch_time = time.time() - epoch_start
@@ -704,19 +707,22 @@ def main():
         
         print(f"\n{'='*70}")
         print(f"✓ EPOCH {epoch+1} completed in {epoch_time/3600:.1f}h")
+        print(f"  Batches processed: {total_batches_processed}")
         print(f"  Average loss: {epoch_avg_loss:.6f}")
-        print(f"  Min loss: {np.min(epoch_losses):.6f}")
-        print(f"  Max loss: {np.max(epoch_losses):.6f}")
+        if epoch_losses:
+            print(f"  Min loss: {np.min(epoch_losses):.6f}")
+            print(f"  Max loss: {np.max(epoch_losses):.6f}")
         print(f"{'='*70}")
         
         # 에포크 레벨 wandb 로깅 (Process 0만)
         if process_index == 0:
             wandb.log({
                 "epoch_avg_loss": epoch_avg_loss,
-                "epoch_min_loss": np.min(epoch_losses),
-                "epoch_max_loss": np.max(epoch_losses),
+                "epoch_min_loss": np.min(epoch_losses) if epoch_losses else 0.0,
+                "epoch_max_loss": np.max(epoch_losses) if epoch_losses else 0.0,
                 "epoch_time_hours": epoch_time / 3600,
-                "num_pt_files": len(pt_files),
+                "num_pt_files": len(gcs_session.pt_files),
+                "batches_processed": total_batches_processed,
                 "epoch": epoch + 1,
             }, step=epoch)
         
@@ -730,7 +736,9 @@ def main():
     print("✓ Training completed!")
     print("="*60)
     print(f"Total training time: {total_time/3600:.1f}h")
-    print(f"Expected time: ~174h (per table)")
+    
+    # GCS 세션 종료
+    gcs_session.shutdown()
     
     # 최종 통계 (Process 0만)
     if process_index == 0:
