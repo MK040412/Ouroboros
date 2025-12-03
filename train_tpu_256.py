@@ -5,6 +5,7 @@ Dataset: KBlueLeaf/coyo11m-256px-ccrop-latent
 """
 
 import os
+import gc
 import jax
 import jax.numpy as jnp
 from jax.experimental import mesh_utils
@@ -120,139 +121,82 @@ class DiffusionSchedule:
 
 
 # ============================================
-# Large Scale Data Loader with Prefetch
+# Large Scale Data Loader with PT Files
 # ============================================
 class Coyo11mDataLoader:
-    """Coyo11m 256px latent 데이터로더 (HF + Prefetch + TPU최적화)"""
+    """PT 파일과 Parquet 메타데이터를 사용한 데이터로더"""
     
-    def __init__(self, batch_size: int, embedding_provider=None):
+    def __init__(self, batch_size: int, pt_file: str, parquet_file: str, embedding_provider=None, num_samples: int = None):
         self.batch_size = batch_size
         self.embedding_provider = embedding_provider
+        self.pt_file = pt_file
+        self.parquet_file = parquet_file
         
-        # HuggingFace Streaming Dataset (자동으로 캐시하고 사용 후 삭제)
-        print("Loading dataset from HuggingFace (streaming mode)...")
-        from datasets import load_dataset
-        self.dataset = load_dataset(
-            "KBlueLeaf/coyo11m-256px-ccrop-latent",
-            streaming=True,
-            split="train"
-        )
-        self.dataset_iter = iter(self.dataset)
+        # PT 파일에서 latent 로드
+        print(f"Loading latents from {pt_file}...")
+        pt_data = torch.load(pt_file, map_location="cpu")
+        self.pt_keys = pt_data['keys'].numpy()
+        self.latents_torch = pt_data['latents']
         
-        # Parquet 메타데이터 로드 (HF에서)
-        print("\nLoading metadata from HuggingFace...")
-        self._load_metadata_hf()
+        # Parquet에서 키 확인
+        print(f"Loading metadata from {parquet_file}...")
+        table = pq.read_table(parquet_file, columns=['key'])
+        parquet_keys = set(table['key'].to_pylist())
         
-        print(f"Available samples: {len(self.available_keys)}")
+        # 교집합 찾기 (PT와 Parquet 모두에 있는 샘플)
+        self.available_indices = []
+        self.captions = []
+        
+        limit = num_samples if num_samples else len(self.pt_keys)
+        for idx, key in enumerate(self.pt_keys[:limit]):
+            if key in parquet_keys:
+                self.available_indices.append(idx)
+        
+        print(f"Found {len(self.available_indices)} samples with both latent and caption")
+        
+        if len(self.available_indices) == 0:
+            raise ValueError("No matching samples found between PT and Parquet!")
+        
+        # Caption 로드 (메모리 효율 위해 필요한 것만)
+        self._load_captions()
     
-    def _load_metadata_hf(self):
-        """HuggingFace에서 메타데이터 로드"""
-        from huggingface_hub import hf_hub_download
-        import tempfile
+    def _load_captions(self):
+        """필요한 샘플들의 caption만 로드 (배치 쿼리로 최적화)"""
+        print("Loading captions...")
+        available_keys = [int(self.pt_keys[idx]) for idx in self.available_indices]
         
-        with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as tmp:
-            tmp_path = tmp.name
+        # 전체 Parquet 메타데이터 로드 (한 번만)
+        full_table = pq.read_table(self.parquet_file, columns=['key', 'caption_llava'])
+        key_to_caption = {row['key'].as_py(): row['caption_llava'].as_py() 
+                          for row in full_table.to_batches()}
         
-        # HF에서 메타데이터 파일 다운로드
-        hf_hub_download(
-            repo_id="KBlueLeaf/coyo11m-256px-ccrop-latent",
-            filename="coyo11m-meta.parquet",
-            repo_type="dataset",
-            local_dir="/tmp",
-            local_dir_use_symlinks=False
-        )
+        for key in available_keys:
+            caption = key_to_caption.get(key, "")
+            self.captions.append(caption)
         
-        metadata_path = "/tmp/coyo11m-meta.parquet"
-        self.metadata_table = pq.read_table(metadata_path)
-        self.available_keys = list(range(len(self.metadata_table)))
-        print(f"Loaded {len(self.available_keys)} metadata entries from HuggingFace")
-    
-    def _load_pt_file_gcs(self, gcs_path: str):
-        """GCS에서 PT 파일 다운로드 및 로드"""
-        import tempfile
-        import subprocess
-        
-        with tempfile.NamedTemporaryFile(suffix='.pt', delete=False) as tmp:
-            tmp_path = tmp.name
-        
-        try:
-            subprocess.run(
-                ["gcloud", "storage", "cp", gcs_path, tmp_path],
-                check=True, capture_output=True
-            )
-            pt_data = torch.load(tmp_path, map_location="cpu")
-            return pt_data
-        finally:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-    
-    def _load_pt_file_hf(self, filename: str):
-        """HuggingFace에서 PT 파일 다운로드 및 로드"""
-        from huggingface_hub import hf_hub_download
-        
-        pt_path = hf_hub_download(
-            repo_id="KBlueLeaf/coyo11m-256px-ccrop-latent",
-            filename=f"latents-3crop/{filename}",
-            repo_type="dataset",
-            local_dir="/tmp",
-            local_dir_use_symlinks=False
-        )
-        
-        pt_data = torch.load(pt_path, map_location="cpu")
-        return pt_data
+        print(f"✓ Loaded {len(self.captions)} captions")
     
     def get_batch(self, batch_idx: int, rng_key):
-         """배치 데이터 반환 (HF Streaming)"""
-         latents_list = []
-         captions_list = []
-         
-         # HF streaming dataset에서 batch_size만큼 샘플 가져오기
-         for _ in range(self.batch_size):
-             try:
-                 sample = next(self.dataset_iter)
-                 latent = sample['latents']  # (3, 4, 32, 32)
-                 caption = sample.get('caption_llava', "")
-                 
-                 # Latent 추출: (3, 4, 32, 32) → (4, 32, 32)
-                 if isinstance(latent, torch.Tensor):
-                     latent = latent.cpu().numpy()
-                 channels, frames, h, w = latent.shape
-                 latent = latent.reshape(channels * frames, h, w)[:4, :, :]
-                 latents_list.append(latent)
-                 captions_list.append(caption if caption else "")
-                 
-             except StopIteration:
-                 # 데이터셋 끝나면 다시 시작
-                 self.dataset_iter = iter(self.dataset)
-                 sample = next(self.dataset_iter)
-                 latent = sample['latents']
-                 caption = sample.get('caption_llava', "")
-                 
-                 if isinstance(latent, torch.Tensor):
-                     latent = latent.cpu().numpy()
-                 channels, frames, h, w = latent.shape
-                 latent = latent.reshape(channels * frames, h, w)[:4, :, :]
-                 latents_list.append(latent)
-                 captions_list.append(caption if caption else "")
-                 
-             except Exception as e:
-                 print(f"  ⚠ Error loading sample: {e}")
-                 latents_list.append(np.zeros((4, 32, 32), dtype=np.float32))
-                 captions_list.append("")
-         
-         if len(latents_list) == 0:
-             raise ValueError(f"Batch {batch_idx}: No valid samples loaded")
-         
-         # Stack latents: (B, 4, 32, 32)
-         batch_latents = np.stack(latents_list, axis=0)
-         batch_latents = jnp.array(batch_latents, dtype=jnp.float32)
-         
-         # 임베딩 계산 (병렬화)
-         batch_embeddings = self.embedding_provider.batch_encode(
-             captions_list, batch_size=512, normalize=True
-         )  # (B, 640)
-         
-         return batch_latents, batch_embeddings
+        """배치 데이터 반환 (랜덤 샘플링)"""
+        # 랜덤 인덱스 선택
+        indices = jax.random.randint(rng_key, (self.batch_size,), 0, len(self.available_indices))
+        indices_np = np.array(indices)  # JAX array to numpy
+        selected_indices = [self.available_indices[i] for i in indices_np]
+        
+        # Latent 추출: (B, 4, 32, 32) NCHW → (B, 32, 32, 4) NHWC
+        latents_subset = self.latents_torch[selected_indices]  # (B, 4, 32, 32)
+        latents_np = latents_subset.float().numpy().astype(np.float32)
+        batch_latents = jnp.array(np.transpose(latents_np, (0, 2, 3, 1)))  # (B, 32, 32, 4)
+        
+        # Caption 추출
+        batch_captions = [self.captions[i] for i in indices_np]
+        
+        # 임베딩 계산
+        batch_embeddings = self.embedding_provider.batch_encode(
+            batch_captions, batch_size=512, normalize=True
+        )
+        
+        return batch_latents, batch_embeddings
 
 
 # ============================================
@@ -554,16 +498,19 @@ def main():
     
     embedding_provider = get_embedding_provider(config.embedding_model)
     
-    # 데이터로더 (HF 또는 GCS에서 직접 로딩)
+    # PT 파일 목록 찾기
     print("\n" + "="*60)
-    print("Initializing data loader...")
+    print("Finding PT files...")
     print("="*60)
     
-    # HuggingFace Streaming (자동 캐시 관리)
-    data_loader = Coyo11mDataLoader(
-        batch_size=config.global_batch_size,
-        embedding_provider=embedding_provider
-    )
+    pt_files = sorted(glob.glob("*.pt"))
+    parquet_file = "coyo11m-meta.parquet"
+    
+    if not pt_files:
+        print("No PT files found!")
+        return
+    
+    print(f"Found {len(pt_files)} PT files: {pt_files}")
     
     # 모델 초기화
     print("\n" + "="*60)
@@ -603,34 +550,65 @@ def main():
     
     total_start = time.time()
     
+    # Epoch별로 모든 PT 파일 순회 (1 epoch = 모든 PT 파일 한 바퀴)
     for epoch in range(config.num_epochs):
+        print(f"\n{'='*70}")
+        print(f"EPOCH {epoch+1}/{config.num_epochs}")
+        print(f"{'='*70}")
+        
         epoch_start = time.time()
+        epoch_losses = []
         
-        # Prefetch 파이프라인 생성 (112 workers로 배경 로딩)
-        prefetch_loader = PrefetchDataLoader(
-            data_loader, 
-            steps_per_epoch=config.steps_per_epoch,
-            num_workers=112  # 112개 worker로 병렬 로딩
-        )
-        
-        losses, epoch_avg_loss = trainer.train_epoch(prefetch_loader, epoch)
-        prefetch_loader.stop()
+        # 이 epoch에서 모든 PT 파일 순회
+        for pt_idx, pt_file in enumerate(pt_files):
+            print(f"\n  [{epoch+1}/{config.num_epochs}] PT {pt_idx+1}/{len(pt_files)}: {pt_file}")
+            
+            # 데이터로더 초기화 (새로운 PT 파일)
+            data_loader = Coyo11mDataLoader(
+                batch_size=config.global_batch_size,
+                pt_file=pt_file,
+                parquet_file=parquet_file,
+                embedding_provider=embedding_provider
+            )
+            
+            # 이 PT 파일로 한 번 학습
+            pt_start = time.time()
+            
+            # Prefetch 파이프라인 생성 (112 workers로 배경 로딩)
+            prefetch_loader = PrefetchDataLoader(
+                data_loader, 
+                steps_per_epoch=config.steps_per_epoch,
+                num_workers=112
+            )
+            
+            losses, pt_avg_loss = trainer.train_epoch(prefetch_loader, epoch)
+            prefetch_loader.stop()
+            epoch_losses.extend(losses)
+            
+            pt_time = time.time() - pt_start
+            print(f"    ✓ PT {pt_file} done in {pt_time/60:.1f}m - Loss: {pt_avg_loss:.6f}")
+            
+            # 메모리 해제 (다음 PT 파일 로드 전)
+            del data_loader, prefetch_loader
+            gc.collect()
         
         epoch_time = time.time() - epoch_start
+        epoch_avg_loss = np.mean(epoch_losses) if epoch_losses else 0.0
         
-        print(f"\n{'='*60}")
-        print(f"✓ Epoch {epoch+1} completed in {epoch_time/3600:.1f}h")
+        print(f"\n{'='*70}")
+        print(f"✓ EPOCH {epoch+1} completed in {epoch_time/3600:.1f}h")
         print(f"  Average loss: {epoch_avg_loss:.6f}")
-        print(f"  Min loss: {np.min(losses):.6f}")
-        print(f"  Max loss: {np.max(losses):.6f}")
-        print(f"{'='*60}")
+        print(f"  Min loss: {np.min(epoch_losses):.6f}")
+        print(f"  Max loss: {np.max(epoch_losses):.6f}")
+        print(f"{'='*70}")
         
         # 에포크 레벨 wandb 로깅
         wandb.log({
             "epoch_avg_loss": epoch_avg_loss,
-            "epoch_min_loss": np.min(losses),
-            "epoch_max_loss": np.max(losses),
+            "epoch_min_loss": np.min(epoch_losses),
+            "epoch_max_loss": np.max(epoch_losses),
             "epoch_time_hours": epoch_time / 3600,
+            "num_pt_files": len(pt_files),
             "epoch": epoch + 1,
         }, step=epoch)
         
