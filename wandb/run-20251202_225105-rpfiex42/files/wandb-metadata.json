@@ -1,0 +1,17 @@
+{
+  "os": "Linux-6.5.0-1013-gcp-x86_64-with-glibc2.35",
+  "python": "CPython 3.10.12",
+  "startedAt": "2025-12-02T22:51:05.107174Z",
+  "program": "/home/mkkang0412/Ouroboros/train_tpu_256_112cores.py",
+  "codePath": "train_tpu_256_112cores.py",
+  "codePathLocal": "train_tpu_256_112cores.py",
+  "git": {
+    "remote": "https://github.com/MK040412/Ouroboros.git",
+    "commit": "0f9ea4b8e98a4bf1141c665f694d1bbb4f22ce61"
+  },
+  "email": "mkkang0412@gmail.com",
+  "root": "/home/mkkang0412/Ouroboros",
+  "host": "t1v-n-8dff5040-w-0",
+  "executable": "/home/mkkang0412/Ouroboros/.venv/bin/python",
+  "writerId": "3ei5zi4bcqootg7yzgrmjevcsieiif8s"
+}

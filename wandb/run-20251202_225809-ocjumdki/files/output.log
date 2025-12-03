@@ -1,0 +1,11 @@
+
+Config (112 cores optimized):
+  Devices: 112 TPU cores (v5e 256)
+  Global batch size: 7168
+  Batch per device: 64
+  Steps per epoch: 1065
+  Data loading: HuggingFace streaming + Prefetch
+
+============================================================
+/home/mkkang0412/Ouroboros/.venv/lib/python3.10/site-packages/jax/_src/xla_bridge.py:150: UserWarning: TPU backend initialization is taking more than 60.0 seconds. Did you run your code on all TPU hosts? See https://docs.jax.dev/en/latest/multi_process.html for more information.
+  warnings.warn(

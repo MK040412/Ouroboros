@@ -1,0 +1,13 @@
+{"time":"2025-12-02T23:38:59.546133578Z","level":"INFO","msg":"stream: starting","core version":"0.23.0"}
+{"time":"2025-12-02T23:38:59.796638384Z","level":"INFO","msg":"stream: created new stream","id":"4xwu2nkg"}
+{"time":"2025-12-02T23:38:59.796698894Z","level":"INFO","msg":"handler: started","stream_id":"4xwu2nkg"}
+{"time":"2025-12-02T23:38:59.796864234Z","level":"INFO","msg":"stream: started","id":"4xwu2nkg"}
+{"time":"2025-12-02T23:38:59.796937234Z","level":"INFO","msg":"writer: started","stream_id":"4xwu2nkg"}
+{"time":"2025-12-02T23:38:59.796944754Z","level":"INFO","msg":"sender: started","stream_id":"4xwu2nkg"}
+{"time":"2025-12-02T23:39:15.064520631Z","level":"ERROR","msg":"monitor: error sampling metrics: no metrics available"}
+{"time":"2025-12-02T23:39:30.037093525Z","level":"ERROR","msg":"monitor: error sampling metrics: no metrics available"}
+{"time":"2025-12-02T23:39:45.037182829Z","level":"ERROR","msg":"monitor: error sampling metrics: no metrics available"}
+{"time":"2025-12-02T23:40:00.037827072Z","level":"ERROR","msg":"monitor: error sampling metrics: no metrics available"}
+{"time":"2025-12-02T23:40:15.037227845Z","level":"ERROR","msg":"monitor: error sampling metrics: no metrics available"}
+{"time":"2025-12-02T23:40:30.037443928Z","level":"ERROR","msg":"monitor: error sampling metrics: no metrics available"}
+{"time":"2025-12-02T23:40:45.037543502Z","level":"ERROR","msg":"monitor: error sampling metrics: no metrics available"}

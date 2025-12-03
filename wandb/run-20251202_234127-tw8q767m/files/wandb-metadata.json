@@ -1,0 +1,34 @@
+{
+  "os": "Linux-6.5.0-1013-gcp-x86_64-with-glibc2.35",
+  "python": "CPython 3.10.12",
+  "startedAt": "2025-12-02T23:41:27.075385Z",
+  "program": "/home/mkkang0412/Ouroboros/train_tpu_256.py",
+  "codePath": "train_tpu_256.py",
+  "codePathLocal": "train_tpu_256.py",
+  "git": {
+    "remote": "https://github.com/MK040412/Ouroboros.git",
+    "commit": "8a367ce531ccdbcddc37e79e023348773165705c"
+  },
+  "email": "mkkang0412@gmail.com",
+  "root": "/home/mkkang0412/Ouroboros",
+  "host": "t1v-n-8dff5040-w-0",
+  "executable": "/home/mkkang0412/Ouroboros/.venv/bin/python",
+  "cpu_count": 56,
+  "cpu_count_logical": 112,
+  "disk": {
+    "/": {
+      "total": "103865303040",
+      "used": "67578212352"
+    }
+  },
+  "memory": {
+    "total": "202573803520"
+  },
+  "tpu": {
+    "name": "v5e",
+    "hbmGib": 16,
+    "devicesPerChip": 1,
+    "count": 4
+  },
+  "writerId": "4kesr4kfd83lvluc9r87xu87v9j6eu7o"
+}
