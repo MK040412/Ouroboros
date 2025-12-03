@@ -79,6 +79,7 @@ class TrainingConfig256:
     cache_dir: str = None  # 자동으로 /tmp 사용
     num_data_workers: int = 112  # CPU vCPU 수
     prefetch_ahead: int = 3  # 미리 다운로드할 PT 파일 개수
+    max_cache_files: int = 3  # 최대 동시 캐시 PT 파일 (100GB VM에서 ~300MB 사용)
     
     # TPU 설정
     use_pjit: bool = True
@@ -613,7 +614,8 @@ def main():
             gcs_bucket=config.gcs_bucket,
             cache_dir=config.cache_dir,
             num_workers=config.num_data_workers,
-            prefetch_ahead=config.prefetch_ahead
+            prefetch_ahead=config.prefetch_ahead,
+            max_cache_files=config.max_cache_files
         )
         print(f"✓ GCS session initialized")
         print(f"  PT files found: {len(gcs_session.pt_files)}")

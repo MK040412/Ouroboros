@@ -161,7 +161,31 @@ class TrainingConfig256:
     cache_dir: str = None  # Auto-set to /tmp
     num_data_workers: int = 112  # CPU vCPU count
     prefetch_ahead: int = 3  # PT files to prefetch ahead
+    max_cache_files: int = 3  # Max concurrent PT files in disk cache
+                               # Disk usage = max_cache_files × 100MB
+                               # e.g., 3 → 300MB, 1 → 100MB, 5 → 500MB
 ```
+
+### Disk Space Optimization
+
+For 100GB VM with 300GB dataset:
+
+```python
+# Conservative (less downloads, more disk usage)
+max_cache_files=5  # 500MB disk (faster, more parallel downloads)
+
+# Balanced (default)
+max_cache_files=3  # 300MB disk (good balance)
+
+# Aggressive (more downloads, less disk usage)
+max_cache_files=1  # 100MB disk (minimal disk, slower)
+```
+
+**How it works:**
+1. PT files are downloaded on-demand
+2. When cache reaches `max_cache_files`, oldest file is deleted
+3. Next file is downloaded in background (112 workers)
+4. Training continues seamlessly
 
 ---
 
@@ -178,14 +202,25 @@ class TrainingConfig256:
 | Batch Generation | ~100-200 ms per batch |
 | **Total Overhead** | **< 5% of training time** |
 
-### Memory Usage
+### Memory/Disk Usage
 
+#### RAM
 | Component | Size |
 |-----------|------|
 | Parquet Cache (RAM) | ~2-3 GB |
-| PT File (one at a time) | ~100 MB |
+| PT File (in memory) | ~100 MB |
 | Prefetch Queue | ~50-100 MB |
-| **Total** | **~3-4 GB** |
+| **Total RAM** | **~3-4 GB** |
+
+#### Disk (Local Cache)
+| Component | Size |
+|-----------|------|
+| Max concurrent PT files | `max_cache_files` × 100 MB |
+| Default (3 files) | ~300 MB |
+| Conservative (1 file) | ~100 MB |
+| Aggressive (5 files) | ~500 MB |
+
+**Note**: Old PT files are automatically deleted to maintain `max_cache_files` limit
 
 ---
 
