@@ -457,23 +457,40 @@ def main():
     print("TPU v5e 16 Pod Training (256² XUT-Small)")
     print("="*60)
     
+    # 멀티프로세스 초기화 (TPU Pod용)
+    try:
+        jax.distributed.initialize()
+        process_index = jax.process_index()
+        process_count = jax.process_count()
+        local_device_count = jax.local_device_count()
+        print(f"\n[Distributed Setup]")
+        print(f"  Process: {process_index}/{process_count}")
+        print(f"  Local devices: {local_device_count}")
+    except Exception as e:
+        print(f"[Single Process] No multi-host setup detected")
+        process_index = 0
+        process_count = 1
+    
     config = TrainingConfig256()
     
-    # Wandb 초기화
-    wandb.init(
-        project=config.wandb_project,
-        entity=config.wandb_entity,
-        config={
-            "global_batch_size": config.global_batch_size,
-            "learning_rate": config.learning_rate,
-            "num_epochs": config.num_epochs,
-            "tread_selection_rate": config.tread_selection_rate,
-            "model_dim": config.model_dim,
-            "depth": config.depth,
-            "warmup_steps": config.warmup_steps,
-        },
-        name=f"xut-small-256-tpu-pod-16"
-    )
+    # Wandb 초기화 (Process 0만)
+    if process_index == 0:
+        wandb.init(
+            project=config.wandb_project,
+            entity=config.wandb_entity,
+            config={
+                "global_batch_size": config.global_batch_size,
+                "learning_rate": config.learning_rate,
+                "num_epochs": config.num_epochs,
+                "tread_selection_rate": config.tread_selection_rate,
+                "model_dim": config.model_dim,
+                "depth": config.depth,
+                "warmup_steps": config.warmup_steps,
+                "process_count": process_count,
+                "num_workers": 112,
+            },
+            name=f"xut-small-256-tpu-pod-16"
+        )
     
     print(f"\nConfig:")
     print(f"  TPU devices: {config.num_devices} cores")
@@ -602,19 +619,21 @@ def main():
         print(f"  Max loss: {np.max(epoch_losses):.6f}")
         print(f"{'='*70}")
         
-        # 에포크 레벨 wandb 로깅
-        wandb.log({
-            "epoch_avg_loss": epoch_avg_loss,
-            "epoch_min_loss": np.min(epoch_losses),
-            "epoch_max_loss": np.max(epoch_losses),
-            "epoch_time_hours": epoch_time / 3600,
-            "num_pt_files": len(pt_files),
-            "epoch": epoch + 1,
-        }, step=epoch)
+        # 에포크 레벨 wandb 로깅 (Process 0만)
+        if process_index == 0:
+            wandb.log({
+                "epoch_avg_loss": epoch_avg_loss,
+                "epoch_min_loss": np.min(epoch_losses),
+                "epoch_max_loss": np.max(epoch_losses),
+                "epoch_time_hours": epoch_time / 3600,
+                "num_pt_files": len(pt_files),
+                "epoch": epoch + 1,
+            }, step=epoch)
         
         # 매 에포크 끝에 체크포인트 저장
         trainer.save_checkpoint(epoch, config.steps_per_epoch, epoch_avg_loss)
-        wandb.log({"checkpoint_saved": epoch + 1})
+        if process_index == 0:
+            wandb.log({"checkpoint_saved": epoch + 1})
     
     total_time = time.time() - total_start
     print("\n" + "="*60)
@@ -623,12 +642,13 @@ def main():
     print(f"Total training time: {total_time/3600:.1f}h")
     print(f"Expected time: ~174h (per table)")
     
-    # 최종 통계
-    wandb.log({
-        "total_training_time_hours": total_time / 3600,
-        "completed": True,
-    })
-    wandb.finish()
+    # 최종 통계 (Process 0만)
+    if process_index == 0:
+        wandb.log({
+            "total_training_time_hours": total_time / 3600,
+            "completed": True,
+        })
+        wandb.finish()
 
 
 if __name__ == "__main__":
