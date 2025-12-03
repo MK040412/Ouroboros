@@ -9,7 +9,7 @@ import gc
 import jax
 import jax.numpy as jnp
 from jax.experimental import mesh_utils
-from jax.sharding import Mesh, PartitionSpec as P
+from jax.sharding import Mesh, PartitionSpec as P, NamedSharding
 import flax.linen as nn
 from flax import nnx
 import optax
@@ -118,6 +118,30 @@ class DiffusionSchedule:
         
         x_t = sqrt_alpha * x_0 + sqrt_one_minus_alpha * noise
         return x_t
+
+
+# ============================================
+# Sharding Strategy (TPU Pod 16)
+# ============================================
+@dataclass
+class ShardingRules:
+    """TPU Pod 16 분산 전략"""
+    data_axis: str = "data"      # 데이터 병렬화 축
+    model_axis: str = "model"    # 모델 병렬화 축 (8칩)
+    
+    def get_mesh(self):
+        """TPU Pod 16 메시 생성: (2, 8) = 2-way data parallel, 8-way model parallel"""
+        devices = mesh_utils.create_device_mesh((2, 8))  # 2 x 8 = 16 TPU
+        return Mesh(devices, (self.data_axis, self.model_axis))
+    
+    def named_sharding(self, partition_spec, mesh):
+        """PartitionSpec을 NamedSharding으로 변환"""
+        return NamedSharding(mesh, partition_spec)
+
+
+def get_sharding_rules():
+    """Sharding 규칙 반환"""
+    return ShardingRules()
 
 
 # ============================================
@@ -297,7 +321,7 @@ def create_sharding_mesh(num_devices: int):
 
 
 class TPUTrainer:
-    """TPU 분산 학습기"""
+    """TPU 분산 학습기 (Sharding 적용)"""
     
     def __init__(self, model, optimizer, schedule, config: TrainingConfig256):
         self.model = model
@@ -305,8 +329,15 @@ class TPUTrainer:
         self.schedule = schedule
         self.config = config
         
-        # Mesh 생성
-        self.mesh = create_sharding_mesh(config.num_devices)
+        # Sharding 설정
+        self.sharding_rules = get_sharding_rules()
+        self.mesh = self.sharding_rules.get_mesh()
+        
+        print(f"\n[Sharding Setup]")
+        print(f"  Mesh shape: {self.mesh.shape}")
+        print(f"  Axes: {self.mesh.axis_names}")
+        print(f"  Data parallelism: 2-way (2 groups)")
+        print(f"  Model parallelism: 8-way (8 devices per group)")
         
         # Learning rate schedule
         self.lr_schedule = self._create_lr_schedule()
@@ -354,29 +385,29 @@ class TPUTrainer:
         loss = jnp.mean((pred_noise - noise) ** 2)
         return loss
     
-    def train_step(self, model_state, x_t, timesteps, noise, text_emb, step, rng_key):
-        """한 스텝 학습 (pjit으로 sharded)"""
+    @nnx.jit
+    def train_step(self, x_t, timesteps, noise, text_emb, step, rng_key):
+        """한 스텝 학습 (Sharded + JIT 컴파일)
+        
+        배치는 'data' 축으로 분산
+        모델 파라미터는 'model' 축으로 분산
+        """
         # Learning rate 계산
         lr = self.lr_schedule(step)
         
         # TREAD: Timestep-Random Encoder Architecture Design
-        # selection_rate 확률로 timestep 조건을 무효화 (context-only mode)
-        # 예: tread_selection_rate=0.5 → 50% 확률로 timestep 무효화
         batch_size = timesteps.shape[0]
         rng_key, subkey = jax.random.split(rng_key)
         mask = jax.random.uniform(subkey, (batch_size,)) < self.config.tread_selection_rate
         t_cond = jnp.where(mask, jnp.zeros_like(timesteps), timesteps)
         
-        # Loss 및 gradient 계산
-        # ⚠️ NOTE: nnx.value_and_grad 및 optimizer.update의 정확한 API 확인 필요
-        # 또는 표준 jax.grad 사용으로 변경
+        # Loss 및 gradient 계산 (Sharded execution)
         loss, grads = nnx.value_and_grad(self.loss_fn)(
-            model_state, x_t, t_cond, noise, text_emb
+            self.model, x_t, t_cond, noise, text_emb
         )
         
         # 옵티마이저 업데이트
-        # ⚠️ NOTE: 이 API가 올바른지 nnx 문서에서 확인 필요
-        self.optimizer.update(grads, lr=lr)
+        self.optimizer.update(grads)
         
         return loss, rng_key
     
@@ -400,15 +431,24 @@ class TPUTrainer:
             print(f"  ✗ Failed to save checkpoint: {e}")
     
     def train_epoch(self, prefetch_loader: 'PrefetchDataLoader', epoch: int):
-        """에포크 학습 (Prefetch 파이프라인 사용)"""
+        """에포크 학습 (Sharded prefetch 파이프라인)"""
         losses = []
         rng_key = jax.random.PRNGKey(epoch)
         step = 0
         
+        # Sharding spec: 배치는 'data' 축, 나머지는 replica
+        batch_sharding = self.sharding_rules.named_sharding(
+            P(self.sharding_rules.data_axis, None, None, None),  # (B, 32, 32, 4)
+            self.mesh
+        )
+        
         for batch_latents, batch_embeddings in prefetch_loader.get_batches():
             batch_size = batch_latents.shape[0]
             
-            # 타임스텝 샘플링 (배치 단위, 각 샘플마다 다른 t)
+            # 배치를 분산 메모리에 배치
+            batch_latents = jax.device_put(batch_latents, batch_sharding)
+            
+            # 타임스텝 샘플링
             rng_key, subkey = jax.random.split(rng_key)
             timesteps = jax.random.randint(subkey, (batch_size,), 0, self.config.T)
             
@@ -419,9 +459,9 @@ class TPUTrainer:
             # Forward diffusion
             x_t = self.schedule.forward_diffusion(batch_latents, noise, timesteps)
             
-            # 학습 스텝
+            # 학습 스텝 (Sharded execution)
             global_step = epoch * self.config.steps_per_epoch + step
-            loss, rng_key = self.train_step(self.model, x_t, timesteps, noise, batch_embeddings, 
+            loss, rng_key = self.train_step(x_t, timesteps, noise, batch_embeddings, 
                                             global_step, rng_key)
             
             losses.append(float(loss))
@@ -440,7 +480,7 @@ class TPUTrainer:
                 avg_loss = np.mean(losses[-100:])
                 print(f"Epoch {epoch+1}/{self.config.num_epochs} "
                       f"Step {step}/{self.config.steps_per_epoch} "
-                      f"Loss: {avg_loss:.6f}")
+                      f"Loss: {avg_loss:.6f} [Sharded]")
             
             if step >= self.config.steps_per_epoch:
                 break
@@ -457,19 +497,34 @@ def main():
     print("TPU v5e 16 Pod Training (256² XUT-Small)")
     print("="*60)
     
-    # 멀티프로세스 초기화 (TPU Pod용)
-    try:
-        jax.distributed.initialize()
-        process_index = jax.process_index()
-        process_count = jax.process_count()
-        local_device_count = jax.local_device_count()
-        print(f"\n[Distributed Setup]")
-        print(f"  Process: {process_index}/{process_count}")
-        print(f"  Local devices: {local_device_count}")
-    except Exception as e:
-        print(f"[Single Process] No multi-host setup detected")
-        process_index = 0
-        process_count = 1
+    # 멀티프로세스 초기화 (TPU Pod용) - optional
+    process_index = 0
+    process_count = 1
+    
+    # Distributed 환경 감지
+    import os
+    use_distributed = os.environ.get("JAX_COORDINATOR_ADDRESS") is not None or os.environ.get("GCLOUD_RUN_ENVIRONMENT") is not None
+    
+    print(f"\n[Environment Check]")
+    print(f"  JAX_COORDINATOR_ADDRESS: {os.environ.get('JAX_COORDINATOR_ADDRESS', 'Not set')}")
+    print(f"  SLURM_PROCID: {os.environ.get('SLURM_PROCID', 'Not set')}")
+    print(f"  use_distributed: {use_distributed}")
+    
+    if use_distributed:
+        print("[Distributed Mode] Initializing JAX distributed...")
+        try:
+            jax.distributed.initialize()
+            process_index = jax.process_index()
+            process_count = jax.process_count()
+            local_device_count = jax.local_device_count()
+            print(f"  ✓ Distributed Setup Success")
+            print(f"    Process: {process_index}/{process_count}")
+            print(f"    Local devices: {local_device_count}")
+        except Exception as e:
+            print(f"  ✗ Distributed init failed: {e}")
+            print(f"  Falling back to single-host mode")
+    else:
+        print("[Single-Host Mode] Using default JAX setup")
     
     config = TrainingConfig256()
     
@@ -504,30 +559,57 @@ def main():
     
     # 디바이스 확인
     print("\n" + "="*60)
+    print("[Device Detection]")
+    print("="*60)
     devices = jax.devices()
-    print(f"Available devices: {len(devices)}")
-    print(f"Device type: {devices[0].device_kind}")
+    print(f"Total devices: {len(devices)}")
+    print(f"Devices: {devices}")
+    if devices:
+        print(f"Device type: {devices[0].device_kind}")
+    else:
+        print("⚠ Warning: No devices detected!")
     
     # Text embedding provider
     print("\n" + "="*60)
-    print("Loading text embedding model (Google Embedding Gecko)...")
+    print("[Text Embedding Model Setup]")
     print("="*60)
+    print("Loading text embedding model...")
+    print(f"  Model: {config.embedding_model}")
     
-    embedding_provider = get_embedding_provider(config.embedding_model)
+    try:
+        embedding_provider = get_embedding_provider(config.embedding_model)
+        print("✓ Text embedding provider loaded")
+    except Exception as e:
+        print(f"✗ Failed to load embedding provider: {e}")
+        return
     
     # PT 파일 목록 찾기
     print("\n" + "="*60)
-    print("Finding PT files...")
+    print("[Data Files Setup]")
     print("="*60)
     
+    print("Scanning for PT files...")
     pt_files = sorted(glob.glob("*.pt"))
     parquet_file = "coyo11m-meta.parquet"
     
     if not pt_files:
-        print("No PT files found!")
+        print("✗ No PT files found!")
         return
     
-    print(f"Found {len(pt_files)} PT files: {pt_files}")
+    print(f"✓ Found {len(pt_files)} PT files:")
+    for i, pt_file in enumerate(pt_files):
+        if os.path.exists(pt_file):
+            size_gb = os.path.getsize(pt_file) / (1024**3)
+            print(f"  [{i+1}] {pt_file} ({size_gb:.2f}GB)")
+        else:
+            print(f"  [{i+1}] {pt_file} (NOT FOUND)")
+    
+    if not os.path.exists(parquet_file):
+        print(f"✗ Parquet file not found: {parquet_file}")
+        return
+    else:
+        size_gb = os.path.getsize(parquet_file) / (1024**3)
+        print(f"✓ Parquet file: {parquet_file} ({size_gb:.2f}GB)")
     
     # 모델 초기화
     print("\n" + "="*60)
@@ -564,6 +646,14 @@ def main():
     print("="*60)
     
     trainer = TPUTrainer(model, optimizer, schedule, config)
+    
+    print("\n" + "="*70)
+    print("[Training Starting]")
+    print("="*70)
+    print(f"Total epochs: {config.num_epochs}")
+    print(f"PT files per epoch: {len(pt_files)}")
+    print(f"Steps per PT file: {config.steps_per_epoch}")
+    print(f"Global batch size: {config.global_batch_size}")
     
     total_start = time.time()
     
