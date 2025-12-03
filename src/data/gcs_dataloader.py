@@ -163,7 +163,10 @@ class ParquetCache:
 # GCS 기반 데이터로더
 # ============================================
 class GCSCoyo11mDataLoader:
-    """GCS의 PT 파일과 Parquet 메타데이터를 사용한 데이터로더"""
+    """GCS의 PT 파일과 Parquet 메타데이터를 사용한 데이터로더
+    
+    PT 파일을 동적으로 로드/언로드하여 디스크 공간 최적화
+    """
     
     def __init__(
         self,
@@ -172,12 +175,14 @@ class GCSCoyo11mDataLoader:
         embedding_provider=None,
         gcs_bucket: str = "gs://rdy-tpu-data-2025/coyo11m-256px-ccrop-latent/",
         cache_dir: Optional[str] = None,
-        num_samples: Optional[int] = None
+        num_samples: Optional[int] = None,
+        max_cache_files: int = 3  # 최대 3개 PT 파일까지만 메모리 유지
     ):
         self.batch_size = batch_size
         self.embedding_provider = embedding_provider
         self.parquet_cache = parquet_cache
         self.gcs_handler = GCSFileHandler(gcs_bucket)
+        self.max_cache_files = max_cache_files
         
         # 로컬 캐시 디렉토리
         if cache_dir is None:
@@ -190,10 +195,30 @@ class GCSCoyo11mDataLoader:
         self.pt_keys = None
         self.latents_torch = None
         
+        # 캐시 추적
+        self.loaded_files = {}  # filename -> load_time
         self.num_samples = num_samples
+        
+        logger.info(f"Cache dir: {self.cache_dir} (max {max_cache_files} files at once)")
+    
+    def _cleanup_old_files(self):
+        """오래된 PT 파일 삭제하여 디스크 공간 확보 (max_cache_files 유지)"""
+        if len(self.loaded_files) >= self.max_cache_files:
+            # 가장 오래 로드된 파일 삭제
+            oldest_file = min(self.loaded_files.items(), key=lambda x: x[1])[0]
+            old_path = self.cache_dir / oldest_file
+            
+            if old_path.exists():
+                try:
+                    file_size_mb = old_path.stat().st_size / (1024**2)
+                    old_path.unlink()
+                    del self.loaded_files[oldest_file]
+                    logger.info(f"  🗑️ Cleaned cache: removed {oldest_file} ({file_size_mb:.1f}MB)")
+                except Exception as e:
+                    logger.warning(f"Failed to delete {oldest_file}: {e}")
     
     def load_pt_file(self, gcs_pt_path: str) -> bool:
-        """GCS에서 PT 파일 로드"""
+        """GCS에서 PT 파일 로드 (자동 캐시 관리)"""
         try:
             # 파일명 추출
             pt_filename = gcs_pt_path.split("/")[-1]
@@ -205,6 +230,9 @@ class GCSCoyo11mDataLoader:
                 if not self.gcs_handler.download_file(gcs_pt_path, str(local_pt_path)):
                     return False
             
+            # 캐시 정리 (최대 N개 파일만 유지)
+            self._cleanup_old_files()
+            
             # PT 파일 로드
             logger.info(f"Loading PT file: {pt_filename}")
             pt_data = torch.load(str(local_pt_path), map_location="cpu")
@@ -213,10 +241,15 @@ class GCSCoyo11mDataLoader:
             self.latents_torch = pt_data['latents']
             self.current_pt_file = pt_filename
             
+            # 로드 시간 기록
+            import time
+            self.loaded_files[pt_filename] = time.time()
+            
             # 사용 가능한 샘플 찾기 (PT와 Parquet 모두에 있는 것)
             self._find_available_indices()
             
-            logger.info(f"✓ Loaded {pt_filename} with {len(self.available_indices)} available samples")
+            file_size_mb = local_pt_path.stat().st_size / (1024**2)
+            logger.info(f"✓ Loaded {pt_filename} ({file_size_mb:.1f}MB) with {len(self.available_indices)} samples")
             return True
         except Exception as e:
             logger.error(f"Error loading PT file {gcs_pt_path}: {e}")
@@ -454,7 +487,10 @@ class GCSPrefetchDataLoader:
 # 세션 기반 데이터로더 (epoch마다 PT 파일 순회)
 # ============================================
 class GCSDataLoaderSession:
-    """GCS 데이터를 이용한 세션 기반 로더"""
+    """GCS 데이터를 이용한 세션 기반 로더
+    
+    디스크 공간 최적화를 위해 자동으로 오래된 PT 파일 삭제
+    """
     
     def __init__(
         self,
@@ -464,7 +500,8 @@ class GCSDataLoaderSession:
         gcs_bucket: str = "gs://rdy-tpu-data-2025/coyo11m-256px-ccrop-latent/",
         cache_dir: Optional[str] = None,
         num_workers: int = 112,
-        prefetch_ahead: int = 2  # 몇 개의 PT 파일을 미리 다운로드할지
+        prefetch_ahead: int = 2,  # 몇 개의 PT 파일을 미리 다운로드할지
+        max_cache_files: int = 3  # 최대 몇 개의 PT 파일을 동시에 보관할지 (디스크 절약)
     ):
         self.batch_size = batch_size
         self.embedding_provider = embedding_provider
@@ -472,6 +509,7 @@ class GCSDataLoaderSession:
         self.cache_dir = cache_dir
         self.num_workers = num_workers
         self.prefetch_ahead = prefetch_ahead
+        self.max_cache_files = max_cache_files
         
         # Parquet 메타데이터 캐싱
         logger.info("Loading parquet metadata cache...")
@@ -486,7 +524,10 @@ class GCSDataLoaderSession:
         if not self.pt_files:
             raise ValueError("No PT files found in GCS bucket")
         
-        logger.info(f"✓ Session initialized with {len(self.pt_files)} PT files")
+        logger.info(f"✓ Session initialized")
+        logger.info(f"  Total PT files: {len(self.pt_files)}")
+        logger.info(f"  Max cache files: {max_cache_files} (disk space optimized)")
+        logger.info(f"  Expected disk usage: ~{max_cache_files * 100}MB")
         
         # 첫 배치의 PT 파일들을 미리 다운로드
         self._prefetch_initial_files()
@@ -510,13 +551,14 @@ class GCSDataLoaderSession:
             files_to_prefetch = self.pt_files[next_prefetch_start:next_prefetch_end]
             self.cache_manager.prefetch_pt_files(files_to_prefetch, self.gcs_handler)
         
-        # 데이터로더 생성
+        # 데이터로더 생성 (캐시 파일 개수 제한)
         data_loader = GCSCoyo11mDataLoader(
             batch_size=self.batch_size,
             parquet_cache=self.parquet_cache,
             embedding_provider=self.embedding_provider,
             gcs_bucket=self.gcs_bucket,
-            cache_dir=self.cache_dir
+            cache_dir=self.cache_dir,
+            max_cache_files=self.max_cache_files  # 디스크 공간 절약
         )
         
         # Prefetch 로더 생성
