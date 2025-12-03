@@ -3,36 +3,51 @@ from typing import Optional, Type
 import jax
 import jax.numpy as jnp
 from jax import lax
-from flax import linen as nn
+from flax import nnx
 
-class Identity(nn.Module):
-    @nn.compact
+class Identity(nnx.Module):
     def __call__(self, x):
         return x
 
-class PatchEmbed(nn.Module):
-    patch_size: int = 4
-    in_channels: int = 3
-    embed_dim: int = 512
-    norm_layer: Optional[Type[nn.Module]] = None
-    flatten: bool = True
-    use_bias: bool = True
-
-    def setup(self):
-        self.proj = nn.Conv(
-            features=self.embed_dim,
-            kernel_size=(self.patch_size, self.patch_size),
-            strides=(self.patch_size, self.patch_size),
-            use_bias=self.use_bias,
+class PatchEmbed(nnx.Module):
+    def __init__(
+        self,
+        patch_size: int = 4,
+        in_channels: int = 3,
+        embed_dim: int = 512,
+        *,
+        norm_layer: Optional[Type[nnx.Module]] = None,
+        flatten: bool = True,
+        use_bias: bool = True,
+        rngs: nnx.rnglib.Rngs,
+    ):
+        self.patch_size = patch_size
+        self.in_channels = in_channels
+        self.embed_dim = embed_dim
+        self.flatten = flatten
+        self.proj = nnx.Conv(
+            in_features=in_channels,
+            out_features=embed_dim,
+            kernel_size=(patch_size, patch_size),
+            strides=(patch_size, patch_size),
+            padding='VALID',
+            use_bias=use_bias,
+            rngs=rngs,
         )
-        self.norm = Identity() if self.norm_layer is None else self.norm_layer()
+        self.norm = Identity() if norm_layer is None else norm_layer(embed_dim, rngs=rngs)
 
     def __call__(self, x: jnp.ndarray, pos_map: jnp.ndarray | None = None):
-        """
-        NOTE! x: (B, H, W, C)
-        """
-        b, h, w, _ = x.shape
-        x = self.proj(x) # (B, H/P, W/P, embed_dim)
+        # Accept both NHWC (preferred) and NCHW.
+        if x.shape[-1] == self.in_channels:
+            # Already NHWC
+            b, h, w, _ = x.shape
+        elif x.shape[1] == self.in_channels:
+            # NCHW -> convert to NHWC
+            b, _, h, w = x.shape
+            x = jnp.transpose(x, (0, 2, 3, 1))
+        else:
+            raise ValueError(f"Expected channels={self.in_channels} on last or second axis, got shape {x.shape}")
+        x = self.proj(x)                    # (B, H/P, W/P, D)
         new_h, new_w = x.shape[1:3]
 
         if pos_map is not None:
@@ -42,21 +57,36 @@ class PatchEmbed(nn.Module):
             pos_map = pos_map.reshape(b, new_h * new_w, -1)
 
         if self.flatten:
-            x = x.reshape(b, new_h * new_w, -1)  # (B, N, D)
+            x = x.reshape(b, new_h * new_w, -1)
+            x = self.norm(x)
+        else:
+            x = self.norm(x)
+            x = jnp.transpose(x, (0, 3, 1, 2))  # NCHW
 
-        x = self.norm(x)
         return x, pos_map
 
-class UnPatch(nn.Module):
-    patch_size: int = 4
-    input_dim: int = 512
-    out_channels: int = 3
-    proj: bool = True
 
-    def setup(self):
+class UnPatch(nnx.Module):
+    def __init__(
+        self,
+        patch_size: int = 4,
+        input_dim: int = 512,
+        out_channels: int = 3,
+        *,
+        proj: bool = True,
+        rngs: nnx.rnglib.Rngs,
+    ):
+        self.patch_size = patch_size
+        self.input_dim = input_dim
+        self.out_channels = out_channels
         self.linear = (
-            nn.Dense(self.patch_size**2 * self.out_channels)
-            if self.proj else nn.Identity()
+            Identity()
+            if not proj
+            else nnx.Linear(
+                self.input_dim,
+                self.patch_size**2 * self.out_channels,
+                rngs=rngs
+            )
         )
 
     def __call__(
@@ -66,14 +96,11 @@ class UnPatch(nn.Module):
         axis2: int | None = None,
         loss_mask: jnp.ndarray | None = None,
     ):
-        """
-        NOTE! x: (B, H, W, C)
-        """
         b, n, _ = x.shape
         p = q = self.patch_size
 
         if axis1 is None and axis2 is None:
-            w = h = int(jnp.sqrt(n))
+            w = h = int(jnp.sqrt(n).item())
             assert h * w == n
         else:
             h = axis1 // p if axis1 else n // (axis2 // p)
@@ -90,20 +117,3 @@ class UnPatch(nn.Module):
         x = x.transpose(0, 5, 1, 3, 2, 4)
         x = x.reshape(b, self.out_channels, h * p, w * q)
         return x
-
-if __name__ == "__main__":
-    key = jax.random.PRNGKey(42)
-    x = jax.random.normal(key, (2, 32, 32, 3))
-    pos_map = jax.random.normal(key, (2, 32, 32, 2))
-
-    pe = PatchEmbed(patch_size=4, in_channels=3, embed_dim=16)
-    vars_pe = pe.init(key, x, pos_map)
-    x_patched, pos_patched = pe.apply(vars_pe, x, pos_map)
-    print(x_patched.shape)
-    assert x_patched.shape == (2, 64, 16)
-
-    up = UnPatch(patch_size=4, input_dim=16, out_channels=3)
-    vars_up = up.init(key, x_patched)
-    x_recon = up.apply(vars_up, x_patched)
-    print(x_recon.shape)
-    assert x_recon.shape == (2, 3, 32, 32)

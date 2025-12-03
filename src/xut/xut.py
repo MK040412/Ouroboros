@@ -1,16 +1,14 @@
 from typing import Optional, Sequence, Tuple, List
-from functools import partial
 
 import jax
 import jax.numpy as jnp
-from flax import linen as nn
+from flax import nnx
+from flax.nnx import RMSNorm
 
-from .modules.norm import RMSNorm
 from .modules.transformer import TransformerBlock
 from .modules.patch import PatchEmbed, UnPatch
 from .modules.axial_rope import make_axial_pos
 from .modules.time_emb import TimestepEmbedding
-from .modules.norm import RMSNorm #, DyT
 
 def _isiterable(x) -> bool:
     try:
@@ -19,17 +17,24 @@ def _isiterable(x) -> bool:
         return False
     return True
 
-class _SharedAdaLNHead(nn.Module):
-    dim: int
+class _SharedAdaLNHead(nnx.Module):
+    def __init__(self, dim: int, *, rngs: nnx.rnglib.Rngs):
+        self.dim = dim
+        self.norm = nnx.LayerNorm(num_features=dim, rngs=rngs)
+        self.fc1 = nnx.Linear(dim, dim * 4, rngs=rngs)
+        self.fc2 = nnx.Linear(
+            dim * 4,
+            dim * 3,
+            kernel_init=nnx.initializers.zeros_init(),
+            bias_init=nnx.initializers.zeros_init(),
+            rngs=rngs,
+        )
 
-    @nn.compact
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        y = nn.LayerNorm()(x)
-        y = nn.Dense(self.dim * 4)(y)
+        y = self.norm(x)
+        y = self.fc1(y)
         y = jax.nn.mish(y)
-        y = nn.Dense(self.dim * 3,
-                     kernel_init=nn.initializers.zeros,
-                     bias_init=nn.initializers.zeros)(y)
+        y = self.fc2(y)
         return y  # (B, dim*3)
 
 def _chunk3(v: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
@@ -38,37 +43,41 @@ def _chunk3(v: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     d = d3 // 3
     return v[..., :d], v[..., d:2*d], v[..., 2*d:]
 
-class TBackBone(nn.Module):
-    dim: int = 1024
-    ctx_dim: Optional[int] = 1024
-    heads: int = 16
-    dim_head: int = 64
-    mlp_dim: int = 3072
-    pos_dim: int = 2
-    depth: int = 8
-    use_adaln: bool = False
-    use_shared_adaln: bool = False
-    use_dyt: bool = False
-    grad_ckpt: bool = False  # remat
-
-    def setup(self):
+class TBackBone(nnx.Module):
+    def __init__(
+        self,
+        dim: int = 1024,
+        ctx_dim: Optional[int] = 1024,
+        heads: int = 16,
+        dim_head: int = 64,
+        mlp_dim: int = 3072,
+        pos_dim: int = 2,
+        depth: int = 8,
+        use_adaln: bool = False,
+        use_shared_adaln: bool = False,
+        use_dyt: bool = False,
+        grad_ckpt: bool = False,  # remat (not used)
+        *,
+        rngs: nnx.rnglib.Rngs,
+    ):
         norm_layer = RMSNorm
-        block = partial(
-            TransformerBlock,
-            dim=self.dim,
-            ctx_dim=self.ctx_dim,
-            heads=self.heads,
-            dim_head=self.dim_head,
-            mlp_dim=self.mlp_dim,
-            pos_dim=self.pos_dim,
-            use_adaln=self.use_adaln,
-            use_shared_adaln=self.use_shared_adaln,
-            norm_layer=norm_layer,
-        )
-        if self.grad_ckpt:
-            self.blocks = [nn.remat(block()) for _ in range(self.depth)]
-        else:
-            self.blocks = [block() for _ in range(self.depth)]
+        self.use_adaln = use_adaln
+        self.use_shared_adaln = use_shared_adaln
+        self.blocks = tuple([
+            TransformerBlock(
+                dim=dim,
+                ctx_dim=ctx_dim,
+                heads=heads,
+                dim_head=dim_head,
+                mlp_dim=mlp_dim,
+                pos_dim=pos_dim,
+                use_adaln=use_adaln,
+                use_shared_adaln=use_shared_adaln,
+                norm_layer=norm_layer,
+                rngs=rngs,
+            )
+            for _ in range(depth)
+        ])
 
     def __call__(
         self,
@@ -95,65 +104,77 @@ class TBackBone(nn.Module):
             )
         return x
 
-class XUTBackBone(nn.Module):
-    dim: int = 1024
-    ctx_dim: Optional[int] = None
-    heads: int = 16
-    dim_head: int = 64
-    mlp_dim: int = 3072
-    pos_dim: int = 2
-    depth: int = 8
-    enc_blocks: int | Sequence[int] = 1
-    dec_blocks: int | Sequence[int] = 2
-    dec_ctx: bool = False
-    use_adaln: bool = False
-    use_shared_adaln: bool = False
-    use_dyt: bool = False
-    grad_ckpt: bool = False
-
-    def setup(self):
+class XUTBackBone(nnx.Module):
+    def __init__(
+        self,
+        dim: int = 1024,
+        ctx_dim: Optional[int] = None,
+        heads: int = 16,
+        dim_head: int = 64,
+        mlp_dim: int = 3072,
+        pos_dim: int = 2,
+        depth: int = 8,
+        enc_blocks: int | Sequence[int] = 1,
+        dec_blocks: int | Sequence[int] = 2,
+        dec_ctx: bool = False,
+        use_adaln: bool = False,
+        use_shared_adaln: bool = False,
+        use_dyt: bool = False,
+        grad_ckpt: bool = False,
+        *,
+        rngs: nnx.rnglib.Rngs,
+    ):
         norm_layer = RMSNorm
+        self.dim = dim
+        self.ctx_dim = ctx_dim
+        self.heads = heads
+        self.dim_head = dim_head
+        self.mlp_dim = mlp_dim
+        self.pos_dim = pos_dim
+        self.depth = depth
+        self.dec_ctx = dec_ctx
+        self.use_adaln = use_adaln
+        self.use_shared_adaln = use_shared_adaln
 
-        if _isiterable(self.enc_blocks):
-            enc_list = list(self.enc_blocks)
-            assert len(enc_list) == self.depth
+        if _isiterable(enc_blocks):
+            enc_list = list(enc_blocks)
+            assert len(enc_list) == depth
         else:
-            enc_list = [int(self.enc_blocks)] * self.depth
+            enc_list = [int(enc_blocks)] * depth
 
-        if _isiterable(self.dec_blocks):
-            dec_list = list(self.dec_blocks)
-            assert len(dec_list) == self.depth
+        if _isiterable(dec_blocks):
+            dec_list = list(dec_blocks)
+            assert len(dec_list) == depth
         else:
-            dec_list = [int(self.dec_blocks)] * self.depth
+            dec_list = [int(dec_blocks)] * depth
 
-        mk_block = lambda ctx_dim, ctx_from_self=False: TransformerBlock(
-            dim=self.dim,
-            ctx_dim=ctx_dim,
-            heads=self.heads,
-            dim_head=self.dim_head,
-            mlp_dim=self.mlp_dim,
-            pos_dim=self.pos_dim,
-            use_adaln=self.use_adaln,
-            use_shared_adaln=self.use_shared_adaln,
-            ctx_from_self=ctx_from_self,
-            norm_layer=norm_layer,
-        )
+        def mk_block(ctx_dim_inner, ctx_from_self: bool = False):
+            return TransformerBlock(
+                dim=dim,
+                ctx_dim=ctx_dim_inner,
+                heads=heads,
+                dim_head=dim_head,
+                mlp_dim=mlp_dim,
+                pos_dim=pos_dim,
+                use_adaln=use_adaln,
+                use_shared_adaln=use_shared_adaln,
+                ctx_from_self=ctx_from_self,
+                norm_layer=norm_layer,
+                rngs=rngs,
+            )
 
         self.enc_stacks = tuple([
-            tuple([
-                mk_block(self.ctx_dim)
-                for _ in range(enc_list[i])
-            ])
-            for i in range(self.depth)
+            tuple(mk_block(ctx_dim) for _ in range(enc_list[i]))
+            for i in range(depth)
         ])
 
         self.dec_stacks = tuple([
-            tuple([
-                mk_block(self.dim, ctx_from_self=True) if bid == 0
-                else mk_block(self.ctx_dim if self.dec_ctx else None)
+            tuple(
+                mk_block(dim, ctx_from_self=True) if bid == 0
+                else mk_block(ctx_dim if dec_ctx else None)
                 for bid in range(dec_list[i])
-            ])
-            for i in range(self.depth)
+            )
+            for i in range(depth)
         ])
 
     def __call__(
@@ -210,29 +231,54 @@ class XUTBackBone(nn.Module):
             return x, enc_out
         return x
 
-class XUDiT(nn.Module):
-    patch_size: int = 2
-    input_dim: int = 4
-    dim: int = 1024
-    ctx_dim: Optional[int] = 1024
-    ctx_size: int = 256
-    heads: int = 16
-    dim_head: int = 64
-    mlp_dim: int = 3072
-    depth: int = 8
-    enc_blocks: int | Sequence[int] = 1
-    dec_blocks: int | Sequence[int] = 2
-    dec_ctx: bool = False
-    class_cond: int = 0
-    shared_adaln: bool = True
-    concat_ctx: bool = True
-    use_dyt: bool = False
-    double_t: bool = False
-    addon_info_embs_dim: Optional[int] = None
-    tread_config: Optional[dict] = None   # {"dropout_ratio": float, "prev_trns_depth": int, "post_trns_depth": int}
-    grad_ckpt: bool = False
+class XUDiT(nnx.Module):
+    def __init__(
+        self,
+        patch_size: int = 2,
+        input_dim: int = 4,
+        dim: int = 1024,
+        ctx_dim: Optional[int] = 1024,
+        ctx_size: int = 256,
+        heads: int = 16,
+        dim_head: int = 64,
+        mlp_dim: int = 3072,
+        depth: int = 8,
+        enc_blocks: int | Sequence[int] = 1,
+        dec_blocks: int | Sequence[int] = 2,
+        dec_ctx: bool = False,
+        class_cond: int = 0,
+        shared_adaln: bool = True,
+        concat_ctx: bool = True,
+        use_dyt: bool = False,
+        double_t: bool = False,
+        addon_info_embs_dim: Optional[int] = None,
+        tread_config: Optional[dict] = None,
+        grad_ckpt: bool = False,
+        *,
+        rngs: nnx.rnglib.Rngs,
+    ):
+        self.rngs = rngs
+        self.patch_size = patch_size
+        self.input_dim = input_dim
+        self.dim = dim
+        self.ctx_dim = ctx_dim
+        self.ctx_size = ctx_size
+        self.heads = heads
+        self.dim_head = dim_head
+        self.mlp_dim = mlp_dim
+        self.depth = depth
+        self.enc_blocks = enc_blocks
+        self.dec_blocks = dec_blocks
+        self.dec_ctx = dec_ctx
+        self.class_cond = class_cond
+        self.shared_adaln = shared_adaln
+        self.concat_ctx = concat_ctx
+        self.use_dyt = use_dyt
+        self.double_t = double_t
+        self.addon_info_embs_dim = addon_info_embs_dim
+        self.tread_config = tread_config
+        self.grad_ckpt = grad_ckpt
 
-    def setup(self):
         self.backbone = XUTBackBone(
             dim=self.dim,
             ctx_dim=(None if self.concat_ctx else self.ctx_dim),
@@ -248,9 +294,9 @@ class XUDiT(nn.Module):
             use_shared_adaln=self.shared_adaln,
             use_dyt=self.use_dyt,
             grad_ckpt=self.grad_ckpt,
+            rngs=rngs,
         )
 
-        # TREAD
         self.use_tread = self.tread_config is not None
         if self.use_tread:
             dr = float(self.tread_config["dropout_ratio"])
@@ -269,6 +315,7 @@ class XUDiT(nn.Module):
                 use_shared_adaln=self.shared_adaln,
                 use_dyt=self.use_dyt,
                 grad_ckpt=self.grad_ckpt,
+                rngs=rngs,
             )
             self.post_tread_trns = TBackBone(
                 dim=self.dim,
@@ -282,40 +329,51 @@ class XUDiT(nn.Module):
                 use_shared_adaln=self.shared_adaln,
                 use_dyt=self.use_dyt,
                 grad_ckpt=self.grad_ckpt,
+                rngs=rngs,
             )
 
         self.patch_size_ = self.patch_size
-        self.in_patch = PatchEmbed(patch_size=self.patch_size,
-                                   in_channels=self.input_dim,
-                                   embed_dim=self.dim)
-        self.out_patch = UnPatch(patch_size=self.patch_size,
-                                 input_dim=self.dim,
-                                 out_channels=self.input_dim)
+        self.in_patch = PatchEmbed(
+            patch_size=self.patch_size,
+            in_channels=self.input_dim,
+            embed_dim=self.dim,
+            rngs=rngs,
+        )
+        self.out_patch = UnPatch(
+            patch_size=self.patch_size,
+            input_dim=self.dim,
+            out_channels=self.input_dim,
+            rngs=rngs,
+        )
 
-        self.time_emb = TimestepEmbedding(self.dim)
+        self.time_emb = TimestepEmbedding(self.dim, rngs=rngs)
         if self.double_t:
-            self.r_emb = TimestepEmbedding(self.dim)
+            self.r_emb = TimestepEmbedding(self.dim, rngs=rngs)
 
         if self.shared_adaln:
-            self.shared_adaln_attn = _SharedAdaLNHead(self.dim)
-            self.shared_adaln_xattn = _SharedAdaLNHead(self.dim)
-            self.shared_adaln_ffw = _SharedAdaLNHead(self.dim)
+            self.shared_adaln_attn = _SharedAdaLNHead(self.dim, rngs=rngs)
+            self.shared_adaln_xattn = _SharedAdaLNHead(self.dim, rngs=rngs)
+            self.shared_adaln_ffw = _SharedAdaLNHead(self.dim, rngs=rngs)
 
         if self.class_cond > 0:
-            self.class_token = nn.Embed(num_embeddings=self.class_cond, features=self.dim)
+            self.class_token = nnx.Embed(num_embeddings=self.class_cond, features=self.dim, rngs=rngs)
         else:
             self.class_token = None
 
         if self.concat_ctx and (self.ctx_dim is not None):
-            self.ctx_proj = nn.Dense(self.dim)
+            self.ctx_proj = nnx.Linear(self.ctx_dim, self.dim, rngs=rngs)
         else:
             self.ctx_proj = None
 
         if self.addon_info_embs_dim is not None:
-            self.addon_info_embs_proj_1 = nn.Dense(self.dim)
-            self.addon_info_embs_proj_2 = nn.Dense(self.dim,
-                                                   kernel_init=nn.initializers.zeros,
-                                                   bias_init=nn.initializers.zeros)
+            self.addon_info_embs_proj_1 = nnx.Linear(self.addon_info_embs_dim, self.dim, rngs=rngs)
+            self.addon_info_embs_proj_2 = nnx.Linear(
+                self.dim,
+                self.dim,
+                kernel_init=nnx.initializers.zeros_init(),
+                bias_init=nnx.initializers.zeros_init(),
+                rngs=rngs,
+            )
 
     def _make_shared_adaln_state(self, t_emb: jnp.ndarray):
         attn = self.shared_adaln_attn(t_emb)
@@ -332,6 +390,7 @@ class XUDiT(nn.Module):
         addon_info: Optional[jnp.ndarray] = None, # (B, D_addon) or (B,)
         tread_rate: Optional[float] = None,
         return_enc_out: bool = False,
+        ctx_mask: Optional[jnp.ndarray] = None,   # (B, T_ctx) optional attention mask for context
         deterministic: bool = True,
     ):
         """
@@ -387,14 +446,14 @@ class XUDiT(nn.Module):
         # TREAD (pre)
         if self.use_tread:
             x_seq = self.prev_tread_trns(
-                x_seq, ctx=ctx, pos_map=pos_map_resized, y=t_emb,
+                x_seq, ctx=ctx, pos_map=pos_map_resized, y=t_emb, ctx_mask=ctx_mask,
                 shared_adaln=shared_adaln_state, deterministic=deterministic
             )
             do_tread = (not deterministic) or (tread_rate is not None)
             if do_tread:
                 rate = (tread_rate if tread_rate is not None else self.dropout_ratio)
                 keep_len = length - int(length * rate)
-                key = self.make_rng("dropout")
+                key = self.rngs.dropout()
                 perm = jax.vmap(lambda k: jax.random.permutation(k, length))(jax.random.split(key, B))
                 sel_mask = perm < keep_len
                 if self.ctx_proj is not None:
@@ -417,7 +476,7 @@ class XUDiT(nn.Module):
         out = self.backbone(
             x_seq, ctx=ctx, pos_map=pos_map_resized, y=t_emb,
             shared_adaln=shared_adaln_state, return_enc_out=return_enc_out,
-            deterministic=deterministic
+            deterministic=deterministic, ctx_mask=ctx_mask
         )
         if return_enc_out:
             out, enc_out = out
@@ -436,7 +495,7 @@ class XUDiT(nn.Module):
                 pos_map_resized = raw_pos
 
             out = self.post_tread_trns(
-                out, ctx=ctx, pos_map=pos_map_resized, y=t_emb,
+                out, ctx=ctx, pos_map=pos_map_resized, y=t_emb, ctx_mask=ctx_mask,
                 shared_adaln=shared_adaln_state, deterministic=deterministic
             )
 
