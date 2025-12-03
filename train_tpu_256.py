@@ -506,9 +506,12 @@ class TPUTrainer:
 # Main
 # ============================================
 def main():
+    import sys
+    
     print("="*60)
     print("TPU v5e 16 Pod Training (256² XUT-Small)")
     print("="*60)
+    sys.stdout.flush()
     
     # 멀티프로세스 초기화 (TPU Pod용) - optional
     process_index = 0
@@ -516,15 +519,20 @@ def main():
     
     # Distributed 환경 감지
     import os
+    print(f"\n[Step 1] Environment Check")
+    sys.stdout.flush()
+    
     use_distributed = os.environ.get("JAX_COORDINATOR_ADDRESS") is not None or os.environ.get("GCLOUD_RUN_ENVIRONMENT") is not None
     
-    print(f"\n[Environment Check]")
     print(f"  JAX_COORDINATOR_ADDRESS: {os.environ.get('JAX_COORDINATOR_ADDRESS', 'Not set')}")
     print(f"  SLURM_PROCID: {os.environ.get('SLURM_PROCID', 'Not set')}")
     print(f"  use_distributed: {use_distributed}")
+    print(f"  Device count: {len(jax.devices())}")
+    sys.stdout.flush()
     
     if use_distributed:
-        print("[Distributed Mode] Initializing JAX distributed...")
+        print(f"\n[Step 2] Initializing JAX distributed (timeout=300s)...")
+        sys.stdout.flush()
         try:
             jax.distributed.initialize()
             process_index = jax.process_index()
@@ -536,31 +544,45 @@ def main():
         except Exception as e:
             print(f"  ✗ Distributed init failed: {e}")
             print(f"  Falling back to single-host mode")
+        sys.stdout.flush()
     else:
-        print("[Single-Host Mode] Using default JAX setup")
+        print(f"\n[Step 2] Single-Host Mode (no JAX distributed needed)")
     
+    print(f"\n[Step 3] Creating TrainingConfig256...")
+    sys.stdout.flush()
     config = TrainingConfig256()
+    print(f"  ✓ Config created")
+    
+    print(f"\n[Step 4] Initializing Wandb (Process {process_index} only)...")
+    sys.stdout.flush()
     
     # Wandb 초기화 (Process 0만)
     if process_index == 0:
-        wandb.init(
-            project=config.wandb_project,
-            entity=config.wandb_entity,
-            config={
-                "global_batch_size": config.global_batch_size,
-                "learning_rate": config.learning_rate,
-                "num_epochs": config.num_epochs,
-                "tread_selection_rate": config.tread_selection_rate,
-                "model_dim": config.model_dim,
-                "depth": config.depth,
-                "warmup_steps": config.warmup_steps,
-                "process_count": process_count,
-                "num_workers": 112,
-            },
-            name=f"xut-small-256-tpu-pod-16"
-        )
+        try:
+            wandb.init(
+                project=config.wandb_project,
+                entity=config.wandb_entity,
+                config={
+                    "global_batch_size": config.global_batch_size,
+                    "learning_rate": config.learning_rate,
+                    "num_epochs": config.num_epochs,
+                    "tread_selection_rate": config.tread_selection_rate,
+                    "model_dim": config.model_dim,
+                    "depth": config.depth,
+                    "warmup_steps": config.warmup_steps,
+                    "process_count": process_count,
+                    "num_workers": 112,
+                },
+                name=f"xut-small-256-tpu-pod-16"
+            )
+            print(f"  ✓ Wandb initialized")
+        except Exception as e:
+            print(f"  ⚠ Wandb init failed (non-critical): {e}")
+    else:
+        print(f"  (Skipped - not process 0)")
+    sys.stdout.flush()
     
-    print(f"\nConfig:")
+    print(f"\n[Step 5] Configuration Summary:")
     print(f"  TPU devices: {config.num_devices} cores")
     print(f"  CPU workers: 112 vCPUs (data loading + prefetch)")
     print(f"  Global batch size: {config.global_batch_size}")
@@ -569,43 +591,58 @@ def main():
     print(f"  TREAD selection rate: {config.tread_selection_rate}")
     print(f"  Epochs: {config.num_epochs}")
     print(f"  Steps per epoch: {config.steps_per_epoch}")
+    sys.stdout.flush()
     
     # 디바이스 확인
     print("\n" + "="*60)
-    print("[Device Detection]")
+    print("[Step 6] Device Detection")
     print("="*60)
+    sys.stdout.flush()
+    
     devices = jax.devices()
-    print(f"Total devices: {len(devices)}")
-    print(f"Devices: {devices}")
+    print(f"  Total devices: {len(devices)}")
+    print(f"  Devices: {devices}")
     if devices:
-        print(f"Device type: {devices[0].device_kind}")
+        print(f"  Device type: {devices[0].device_kind}")
     else:
-        print("⚠ Warning: No devices detected!")
+        print("  ⚠ Warning: No devices detected!")
+    sys.stdout.flush()
     
     # Text embedding provider
     print("\n" + "="*60)
-    print("[Text Embedding Model Setup]")
+    print("[Step 7] Text Embedding Model Setup")
     print("="*60)
-    print("Loading text embedding model...")
-    print(f"  Model: {config.embedding_model}")
+    print(f"  Loading: {config.embedding_model}")
+    sys.stdout.flush()
     
     try:
+        print(f"  Initializing embedding provider...")
+        sys.stdout.flush()
         embedding_provider = get_embedding_provider(config.embedding_model)
-        print("✓ Text embedding provider loaded")
+        print(f"  ✓ Text embedding provider loaded")
+        sys.stdout.flush()
     except Exception as e:
-        print(f"✗ Failed to load embedding provider: {e}")
+        print(f"  ✗ Failed to load embedding provider: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.stdout.flush()
         return
     
     # GCS 데이터 설정
     print("\n" + "="*60)
-    print("[GCS Data Setup]")
+    print("[Step 8] GCS Data Setup")
     print("="*60)
     
-    print(f"GCS Bucket: {config.gcs_bucket}")
-    print(f"CPU Workers: {config.num_data_workers} vCPUs")
-    print(f"Prefetch ahead: {config.prefetch_ahead} PT files")
+    print(f"  GCS Bucket: {config.gcs_bucket}")
+    print(f"  CPU Workers: {config.num_data_workers} vCPUs")
+    print(f"  Prefetch ahead: {config.prefetch_ahead} PT files")
+    print(f"  Max cache files: {config.max_cache_files} (disk optimization)")
+    sys.stdout.flush()
     
     try:
+        print(f"\n  [8a] Initializing GCSDataLoaderSession...")
+        sys.stdout.flush()
+        
         # GCS 데이터로더 세션 초기화
         gcs_session = GCSDataLoaderSession(
             batch_size=config.global_batch_size,
@@ -617,78 +654,128 @@ def main():
             prefetch_ahead=config.prefetch_ahead,
             max_cache_files=config.max_cache_files
         )
-        print(f"✓ GCS session initialized")
-        print(f"  PT files found: {len(gcs_session.pt_files)}")
+        print(f"  ✓ GCS session initialized")
+        print(f"    PT files found: {len(gcs_session.pt_files)}")
+        if gcs_session.pt_files:
+            print(f"    First PT file: {gcs_session.pt_files[0]}")
+            print(f"    Last PT file: {gcs_session.pt_files[-1]}")
+        sys.stdout.flush()
     except Exception as e:
-        print(f"✗ Failed to initialize GCS session: {e}")
+        print(f"  ✗ Failed to initialize GCS session: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.stdout.flush()
         return
     
     # 모델 초기화
     print("\n" + "="*60)
-    print("Initializing XUT-Small model...")
+    print("[Step 9] Model Initialization")
     print("="*60)
     
-    model = create_xut_small()
-    print("✓ XUT-Small initialized")
-    print(f"  Dimension: 896")
-    print(f"  Context dim: 640")
-    print(f"  Depth: 4")
-    print(f"  Parameters: ~237M (XUT part) + ~270M (Gemma)")
+    try:
+        print(f"  Creating XUT-Small model...")
+        sys.stdout.flush()
+        model = create_xut_small()
+        print(f"  ✓ XUT-Small initialized")
+        print(f"    Dimension: 896")
+        print(f"    Context dim: 640")
+        print(f"    Depth: 4")
+        print(f"    Parameters: ~237M (XUT part) + ~270M (Gemma)")
+        sys.stdout.flush()
+    except Exception as e:
+        print(f"  ✗ Failed to create model: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.stdout.flush()
+        return
     
     # 옵티마이저 (AdamW with weight decay)
     # Note: learning_rate는 train_step에서 동적으로 설정됨
-    optimizer = nnx.Optimizer(
-        model,
-        optax.chain(
-            optax.clip_by_global_norm(1.0),
-            optax.adamw(weight_decay=1e-4)
+    print(f"\n[Step 10] Creating Optimizer...")
+    sys.stdout.flush()
+    
+    try:
+        optimizer = nnx.Optimizer(
+            model,
+            optax.chain(
+                optax.clip_by_global_norm(1.0),
+                optax.adamw(weight_decay=1e-4)
+            )
         )
-    )
+        print(f"  ✓ Optimizer created (AdamW + gradient clipping)")
+        sys.stdout.flush()
+    except Exception as e:
+        print(f"  ✗ Failed to create optimizer: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.stdout.flush()
+        return
     
     # 스케줄
+    print(f"\n[Step 11] Creating Diffusion Schedule...")
+    sys.stdout.flush()
+    
     schedule = DiffusionSchedule(
         beta_min=config.beta_min,
         beta_max=config.beta_max,
         T=config.T
     )
+    print(f"  ✓ Diffusion schedule created (T={config.T})")
+    sys.stdout.flush()
     
     # 학습기
     print("\n" + "="*60)
-    print("Starting training...")
+    print("[Step 12] Initializing TPUTrainer...")
     print("="*60)
+    sys.stdout.flush()
     
     trainer = TPUTrainer(model, optimizer, schedule, config)
+    print(f"  ✓ TPUTrainer initialized")
+    sys.stdout.flush()
     
     print("\n" + "="*70)
-    print("[Training Starting]")
+    print("[Step 13] Training Starting")
     print("="*70)
-    print(f"Total epochs: {config.num_epochs}")
-    print(f"PT files per epoch: {len(gcs_session.pt_files)}")
-    print(f"Steps per PT file: {config.steps_per_epoch}")
-    print(f"Global batch size: {config.global_batch_size}")
+    print(f"  Total epochs: {config.num_epochs}")
+    print(f"  PT files per epoch: {len(gcs_session.pt_files)}")
+    print(f"  Steps per PT file: {config.steps_per_epoch}")
+    print(f"  Global batch size: {config.global_batch_size}")
+    sys.stdout.flush()
     
     total_start = time.time()
     
     # Epoch별로 모든 PT 파일 순회 (1 epoch = 모든 PT 파일 한 바퀴)
     for epoch in range(config.num_epochs):
         print(f"\n{'='*70}")
-        print(f"EPOCH {epoch+1}/{config.num_epochs}")
+        print(f"[Epoch {epoch+1}/{config.num_epochs}]")
         print(f"{'='*70}")
+        sys.stdout.flush()
         
         epoch_start = time.time()
         epoch_losses = []
         
         # GCS 에포크 로더 생성 (자동 prefetch + 병렬 다운로드)
+        print(f"  [E{epoch+1}a] Creating epoch loader...")
+        sys.stdout.flush()
+        
         try:
             gcs_prefetch_loader = gcs_session.get_epoch_loader(
                 epoch=epoch,
                 steps_per_epoch=config.steps_per_epoch
             )
+            print(f"  [E{epoch+1}b] ✓ Epoch loader ready")
+            sys.stdout.flush()
         except Exception as e:
-            print(f"✗ Failed to create epoch loader: {e}")
+            print(f"  [E{epoch+1}b] ✗ Failed to create epoch loader: {e}")
+            import traceback
+            traceback.print_exc()
+            sys.stdout.flush()
             break
         
         # 학습 루프
+        print(f"  [E{epoch+1}c] Starting training (pls wait, batches processing)...")
+        sys.stdout.flush()
+        
         pt_files_processed = 0
         total_batches_processed = 0
         
@@ -700,9 +787,18 @@ def main():
             # PT 파일 개수 계산 (대략적)
             if losses:
                 pt_files_processed = len(gcs_session.pt_files)
+        except Exception as e:
+            print(f"  ✗ Training error: {e}")
+            import traceback
+            traceback.print_exc()
+            sys.stdout.flush()
         finally:
+            print(f"  [E{epoch+1}d] Stopping prefetch loader...")
+            sys.stdout.flush()
             gcs_prefetch_loader.stop()
             gc.collect()
+            print(f"  [E{epoch+1}e] ✓ Cleanup done")
+            sys.stdout.flush()
         
         epoch_time = time.time() - epoch_start
         epoch_avg_loss = np.mean(epoch_losses) if epoch_losses else 0.0
