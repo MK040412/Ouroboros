@@ -346,12 +346,13 @@ def create_sharding_mesh(num_devices: int):
 
 class TPUTrainer:
     """TPU 분산 학습기 (Sharding 적용)"""
-    
-    def __init__(self, model, optimizer, schedule, config: TrainingConfig256):
+
+    def __init__(self, model, optimizer, schedule, config: TrainingConfig256, wandb_enabled: bool = False):
         self.model = model
         self.optimizer = optimizer
         self.schedule = schedule
         self.config = config
+        self.wandb_enabled = wandb_enabled
         
         # Sharding 설정
         self.sharding_rules = get_sharding_rules()
@@ -489,14 +490,15 @@ class TPUTrainer:
                                             global_step, rng_key)
             
             losses.append(float(loss))
-            
+
             # Wandb 로깅
-            wandb.log({
-                "loss": float(loss),
-                "learning_rate": self.lr_schedule(global_step),
-                "epoch": epoch + 1,
-                "step": step + 1,
-            }, step=global_step)
+            if self.wandb_enabled:
+                wandb.log({
+                    "loss": float(loss),
+                    "learning_rate": self.lr_schedule(global_step),
+                    "epoch": epoch + 1,
+                    "step": step + 1,
+                }, step=global_step)
             
             step += 1
             
@@ -628,6 +630,7 @@ def main():
     sys.stdout.flush()
     
     # Wandb 초기화 (Process 0만)
+    wandb_enabled = False
     if process_index == 0:
         try:
             wandb.init(
@@ -646,6 +649,7 @@ def main():
                 },
                 name=f"xut-small-256-tpu-pod-16"
             )
+            wandb_enabled = True
             print(f"  ✓ Wandb initialized")
         except Exception as e:
             print(f"  ⚠ Wandb init failed (non-critical): {e}")
@@ -808,7 +812,7 @@ def main():
     print("="*60)
     sys.stdout.flush()
     
-    trainer = TPUTrainer(model, optimizer, schedule, config)
+    trainer = TPUTrainer(model, optimizer, schedule, config, wandb_enabled=wandb_enabled)
     print(f"  ✓ TPUTrainer initialized")
     sys.stdout.flush()
     
@@ -892,7 +896,7 @@ def main():
         print(f"{'='*70}")
         
         # 에포크 레벨 wandb 로깅 (Process 0만)
-        if process_index == 0:
+        if process_index == 0 and wandb_enabled:
             wandb.log({
                 "epoch_avg_loss": epoch_avg_loss,
                 "epoch_min_loss": np.min(epoch_losses) if epoch_losses else 0.0,
@@ -902,10 +906,10 @@ def main():
                 "batches_processed": total_batches_processed,
                 "epoch": epoch + 1,
             }, step=epoch)
-        
+
         # 매 에포크 끝에 체크포인트 저장
         trainer.save_checkpoint(epoch, config.steps_per_epoch, epoch_avg_loss)
-        if process_index == 0:
+        if process_index == 0 and wandb_enabled:
             wandb.log({"checkpoint_saved": epoch + 1})
     
     total_time = time.time() - total_start
@@ -918,7 +922,7 @@ def main():
     gcs_session.shutdown()
     
     # 최종 통계 (Process 0만)
-    if process_index == 0:
+    if process_index == 0 and wandb_enabled:
         wandb.log({
             "total_training_time_hours": total_time / 3600,
             "completed": True,

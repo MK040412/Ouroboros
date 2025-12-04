@@ -24,6 +24,7 @@ import numpy as np
 import jax.numpy as jnp
 import torch
 import pyarrow.parquet as pq
+from google.cloud import storage
 
 
 @dataclass
@@ -33,12 +34,26 @@ class ParquetCache:
 
 
 class GCSFileHandler:
-    """GCS 파일 다운로드 핸들러"""
+    """GCS 파일 다운로드 핸들러 (google-cloud-storage 사용)"""
 
     def __init__(self, gcs_bucket: str, cache_dir: Optional[str] = None):
-        self.gcs_bucket = gcs_bucket.rstrip('/')
+        self.gcs_bucket_url = gcs_bucket.rstrip('/')
         self.cache_dir = cache_dir or tempfile.mkdtemp(prefix="gcs_cache_")
         Path(self.cache_dir).mkdir(parents=True, exist_ok=True)
+
+        # Parse bucket name and prefix from gs:// URL
+        # e.g., gs://rdy-tpu-data-2025/coyo11m-256px-ccrop-latent/
+        if gcs_bucket.startswith("gs://"):
+            parts = gcs_bucket[5:].rstrip('/').split('/', 1)
+            self.bucket_name = parts[0]
+            self.prefix = parts[1] + '/' if len(parts) > 1 else ''
+        else:
+            self.bucket_name = gcs_bucket
+            self.prefix = ''
+
+        # Initialize GCS client
+        self.client = storage.Client()
+        self.bucket = self.client.bucket(self.bucket_name)
 
     def download_file(self, gcs_path: str, local_path: Optional[str] = None) -> str:
         """GCS에서 파일 다운로드"""
@@ -49,25 +64,33 @@ class GCSFileHandler:
         if os.path.exists(local_path):
             return local_path
 
-        # gsutil 사용
-        full_gcs_path = gcs_path if gcs_path.startswith("gs://") else f"{self.gcs_bucket}/{gcs_path}"
-        os.system(f"gsutil -q cp {full_gcs_path} {local_path}")
+        # Parse blob name from gcs_path
+        if gcs_path.startswith("gs://"):
+            # gs://bucket/path/to/file -> path/to/file
+            blob_name = gcs_path[5:].split('/', 1)[1] if '/' in gcs_path[5:] else ''
+        else:
+            blob_name = gcs_path
+
+        try:
+            blob = self.bucket.blob(blob_name)
+            blob.download_to_filename(local_path)
+        except Exception as e:
+            print(f"Warning: GCS download failed for {gcs_path}: {e}")
 
         return local_path
 
     def list_pt_files(self) -> List[str]:
         """GCS에서 PT 파일 목록 조회"""
-        import subprocess
-        result = subprocess.run(
-            ["gsutil", "ls", f"{self.gcs_bucket}/*.pt"],
-            capture_output=True, text=True
-        )
-        if result.returncode != 0:
-            print(f"Warning: gsutil ls failed: {result.stderr}")
+        try:
+            blobs = self.client.list_blobs(self.bucket_name, prefix=self.prefix)
+            pt_files = []
+            for blob in blobs:
+                if blob.name.endswith('.pt'):
+                    pt_files.append(f"gs://{self.bucket_name}/{blob.name}")
+            return sorted(pt_files)
+        except Exception as e:
+            print(f"Warning: GCS list failed: {e}")
             return []
-
-        files = [line.strip() for line in result.stdout.strip().split('\n') if line.strip()]
-        return sorted(files)
 
 
 class PTFileLoader:
@@ -242,9 +265,9 @@ class GCSDataLoaderSession:
             os.remove(oldest)
             print(f"  Removed cached file: {os.path.basename(oldest)}")
 
-        # 다운로드
+        # 다운로드 (google-cloud-storage 사용)
         print(f"  Downloading {filename}...")
-        os.system(f"gsutil -q cp {gcs_path} {local_path}")
+        local_path = self.gcs_handler.download_file(gcs_path, local_path)
         return local_path
 
     def _load_pt_data(self, pt_path: str) -> dict:
