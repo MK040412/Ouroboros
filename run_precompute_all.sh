@@ -30,12 +30,13 @@ fi
 # 로컬 프로세스만 정리
 pkill -9 -f precompute_embeddings_tpu 2>/dev/null || true
 
-# Precompute 관련 파일 커밋 및 푸시
-echo -e "\n[Step 1] Committing precompute files..."
+# 모든 변경사항 커밋 및 푸시 (run_tpu_distributed.sh 방식)
+echo -e "\n[Step 1] Syncing code changes..."
 cd ~/ouroboros
-git add precompute_embeddings*.py run_precompute_all.sh 2>/dev/null || true
+COMMIT_MSG="chore: sync $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+git add -A
 if ! git diff --cached --quiet 2>/dev/null; then
-    git commit -m "Update precompute embeddings scripts" || true
+    git commit -m "$COMMIT_MSG" || true
     git push origin main || true
     echo "  Changes pushed"
 else
