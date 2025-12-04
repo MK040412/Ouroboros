@@ -422,6 +422,10 @@ class TPUTrainer:
         mask = jax.random.uniform(subkey, (batch_size,)) < self.config.tread_selection_rate
         t_cond = jnp.where(mask, jnp.zeros_like(timesteps), timesteps)
 
+        # text_emb: (batch, dim) → (batch, 1, dim) for sequence concatenation
+        # 모델은 ctx가 3D (batch, seq_len, dim) 형태를 기대함
+        text_emb_3d = text_emb[:, None, :]
+
         # JIT된 내부 함수로 gradient 계산 및 업데이트
         # nnx.jit은 nnx.Module과 optimizer를 인자로 받아야 함
         @nnx.jit
@@ -434,7 +438,7 @@ class TPUTrainer:
             optimizer.update(grads)
             return loss
 
-        loss = _train_step_jit(self.model, self.optimizer, x_t, t_cond, noise, text_emb)
+        loss = _train_step_jit(self.model, self.optimizer, x_t, t_cond, noise, text_emb_3d)
         return loss, rng_key
     
     def save_checkpoint(self, epoch: int, step: int, loss: float):
