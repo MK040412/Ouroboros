@@ -482,8 +482,9 @@ class EpochDataLoader:
                         print(f"  Warning: batch_idx {batch_idx} not in latent_buffer")
                         continue
 
-                # 최종 배치 큐에 추가
-                self.batch_queue.put((latents, embeddings), timeout=30)
+                # 최종 배치 큐에 추가 (첫 배치는 JAX 컴파일 시간 고려해서 timeout 길게)
+                put_timeout = 600 if completed == 0 else 60
+                self.batch_queue.put((latents, embeddings), timeout=put_timeout)
                 completed += 1
 
                 if completed == 1:
