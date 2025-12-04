@@ -246,6 +246,10 @@ class PTFilePrefetchManager:
 
     def start(self, start_idx: int = 0):
         """프리페치 시작"""
+        import sys
+        print(f"  [Prefetch] Starting from idx={start_idx}, {len(self.pt_files)} PT files available")
+        sys.stdout.flush()
+
         self.current_idx = start_idx
         self.next_deliver_idx = start_idx
         self.scheduler_thread = threading.Thread(
@@ -253,10 +257,21 @@ class PTFilePrefetchManager:
             daemon=True
         )
         self.scheduler_thread.start()
+        print(f"  [Prefetch] Scheduler thread started")
+        sys.stdout.flush()
 
     def _scheduler_loop(self):
         """프리페치 스케줄링 루프"""
+        import sys
+        print(f"  [Prefetch] Scheduler loop running...")
+        sys.stdout.flush()
+        loop_count = 0
+
         while not self.stop_event.is_set():
+            loop_count += 1
+            if loop_count == 1:
+                print(f"  [Prefetch] First loop iteration...")
+                sys.stdout.flush()
             with self.lock:
                 # 1. 완료된 다운로드 체크 및 ready_queue로 전달
                 while self.next_deliver_idx in self.completed:
@@ -303,6 +318,7 @@ class PTFilePrefetchManager:
 
     def _download_pt_file(self, idx: int) -> str:
         """단일 PT 파일 다운로드"""
+        import sys
         pt_path = self.pt_files[idx % len(self.pt_files)]
         filename = os.path.basename(pt_path)
         local_path = os.path.join(self.gcs_handler.cache_dir, filename)
@@ -312,11 +328,17 @@ class PTFilePrefetchManager:
 
         # 이미 존재하면 스킵
         if os.path.exists(local_path) and os.path.getsize(local_path) > 1024:
+            print(f"  [Prefetch] {filename} already cached")
+            sys.stdout.flush()
             return local_path
 
         # GCS에서 다운로드
-        print(f"  [Prefetch] Downloading {filename}...")
-        return self.gcs_handler.download_file(pt_path, local_path)
+        print(f"  [Prefetch] Downloading {filename} from GCS...")
+        sys.stdout.flush()
+        result = self.gcs_handler.download_file(pt_path, local_path)
+        print(f"  [Prefetch] Downloaded {filename}")
+        sys.stdout.flush()
+        return result
 
     def _get_protected_files(self) -> set:
         """현재 사용 중인 파일 목록 (삭제 보호)"""
@@ -660,18 +682,28 @@ class EpochDataLoader:
 
     def _start_pipeline(self):
         """파이프라인 시작"""
+        import sys
         if self.started:
             return
         self.started = True
 
+        print(f"  [Pipeline] Starting 3-layer async pipeline...")
+        sys.stdout.flush()
+
         # Layer 1: 프리페치 시작
+        print(f"  [Pipeline] Layer 1: Starting prefetch manager...")
+        sys.stdout.flush()
         self.prefetch_manager.start(start_idx=0)
 
         # Layer 2: 로딩 스레드 시작
+        print(f"  [Pipeline] Layer 2: Starting load thread...")
+        sys.stdout.flush()
         self.load_thread = threading.Thread(target=self._load_loop, daemon=True)
         self.load_thread.start()
 
         # Layer 3: 샘플링 스레드 시작
+        print(f"  [Pipeline] Layer 3: Starting sample thread...")
+        sys.stdout.flush()
         self.sample_thread = threading.Thread(target=self._sample_loop, daemon=True)
         self.sample_thread.start()
 
@@ -680,8 +712,15 @@ class EpochDataLoader:
             self.combine_thread = threading.Thread(target=self._combine_batches, daemon=True)
             self.combine_thread.start()
 
+        print(f"  [Pipeline] All threads started, waiting for first batch...")
+        sys.stdout.flush()
+
     def _load_loop(self):
         """PT 파일 로딩 루프 (Layer 2)"""
+        import sys
+        print(f"  [LoadLoop] Started, need {(self.steps_per_epoch // 50) + 2} PT files")
+        sys.stdout.flush()
+
         pt_files_needed = (self.steps_per_epoch // 50) + 2  # 필요한 PT 파일 수 추정
         files_submitted = 0
         files_completed = 0
@@ -693,12 +732,18 @@ class EpochDataLoader:
             # 1. 새 로딩 작업 시작
             while len(pending_loads) < self.num_load_workers and files_submitted < pt_files_needed:
                 try:
+                    print(f"  [LoadLoop] Waiting for prefetch (submitted={files_submitted})...")
+                    sys.stdout.flush()
                     idx, pt_path, local_path = self.prefetch_manager.get_next(timeout=5.0)
+                    print(f"  [LoadLoop] Got {os.path.basename(local_path)}, submitting load...")
+                    sys.stdout.flush()
                     # 모듈 레벨 함수 사용 (pickle 가능)
                     future = self.load_executor.submit(_load_pt_file_worker, local_path)
                     pending_loads[idx] = (future, local_path)
                     files_submitted += 1
                 except queue.Empty:
+                    print(f"  [LoadLoop] Prefetch queue empty, waiting...")
+                    sys.stdout.flush()
                     break  # 프리페치 큐가 비었으면 대기
 
             # 2. 완료된 로딩 수집 및 큐에 전달
