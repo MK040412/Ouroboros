@@ -157,62 +157,144 @@ class GCSFileHandler:
         self.client = storage.Client()
         self.bucket = self.client.bucket(self.bucket_name)
 
+        # 파일별 다운로드 락 (동시 다운로드 방지)
+        self._download_locks: Dict[str, threading.Lock] = {}
+        self._locks_lock = threading.Lock()
+
     def _cleanup_old_cache_dirs(self):
-        """이전 임시 캐시 디렉토리 정리 (gcs_cache_로 시작하는 랜덤 디렉토리들)"""
+        """이전 임시 캐시 디렉토리 및 고아 임시 파일 정리"""
         try:
             import shutil
+
+            # 1. 랜덤 캐시 디렉토리 정리
             for item in Path("/tmp").iterdir():
                 # gcs_cache_로 시작하지만 gcs_cache_worker_가 아닌 디렉토리 삭제
                 if item.is_dir() and item.name.startswith("gcs_cache_"):
                     if not item.name.startswith("gcs_cache_worker_"):
                         print(f"  Cleaning old cache dir: {item}")
                         shutil.rmtree(item, ignore_errors=True)
+
+            # 2. 현재 캐시 디렉토리의 고아 .tmp 파일 정리
+            cache_path = Path(self.cache_dir)
+            if cache_path.exists():
+                for tmp_file in cache_path.glob("*.tmp*"):
+                    try:
+                        # 10분 이상 된 임시 파일만 삭제
+                        if time.time() - tmp_file.stat().st_mtime > 600:
+                            print(f"  Cleaning orphan temp file: {tmp_file.name}")
+                            tmp_file.unlink()
+                    except Exception:
+                        pass
+
         except Exception as e:
             print(f"  Warning: Could not clean old caches: {e}")
 
-    def download_file(self, gcs_path: str, local_path: Optional[str] = None) -> str:
-        """GCS에서 파일 다운로드"""
+    def _get_file_lock(self, filename: str) -> threading.Lock:
+        """파일별 락 반환 (없으면 생성)"""
+        with self._locks_lock:
+            if filename not in self._download_locks:
+                self._download_locks[filename] = threading.Lock()
+            return self._download_locks[filename]
+
+    def download_file(self, gcs_path: str, local_path: Optional[str] = None,
+                      min_file_size: int = 1024 * 1024,  # 1MB 최소 크기 (PT 파일은 GB 단위)
+                      max_retries: int = 3) -> str:
+        """GCS에서 파일 다운로드 (스레드 세이프, 재시도 지원)"""
+        import sys
+
         if local_path is None:
             filename = os.path.basename(gcs_path)
             local_path = os.path.join(self.cache_dir, filename)
 
-        # 기존 파일이 있으면 크기 확인 (손상된 파일 감지)
-        if os.path.exists(local_path):
-            file_size = os.path.getsize(local_path)
-            if file_size > 1024:  # 1KB 이상이면 유효한 파일로 간주
-                return local_path
+        filename = os.path.basename(local_path)
+        file_lock = self._get_file_lock(filename)
+
+        # 파일별 락으로 동시 다운로드 방지
+        with file_lock:
+            # 기존 파일이 있으면 크기 확인 (손상된 파일 감지)
+            if os.path.exists(local_path):
+                file_size = os.path.getsize(local_path)
+                if file_size >= min_file_size:
+                    return local_path
+                else:
+                    # 손상된 파일 삭제
+                    print(f"  Removing corrupted file: {local_path} (size={file_size}, min={min_file_size})")
+                    sys.stdout.flush()
+                    try:
+                        os.remove(local_path)
+                    except OSError:
+                        pass
+
+            # Parse blob name from gcs_path
+            if gcs_path.startswith("gs://"):
+                blob_name = gcs_path[5:].split('/', 1)[1] if '/' in gcs_path[5:] else ''
             else:
-                # 손상된 파일 삭제
-                print(f"  Removing corrupted file: {local_path} (size={file_size})")
-                os.remove(local_path)
+                blob_name = gcs_path
 
-        # Parse blob name from gcs_path
-        if gcs_path.startswith("gs://"):
-            # gs://bucket/path/to/file -> path/to/file
-            blob_name = gcs_path[5:].split('/', 1)[1] if '/' in gcs_path[5:] else ''
-        else:
-            blob_name = gcs_path
+            # 스레드별 고유 임시 파일 (PID + thread ID)
+            thread_id = threading.current_thread().ident
+            temp_path = f"{local_path}.tmp.{os.getpid()}_{thread_id}"
 
-        # 임시 파일로 다운로드 후 이동 (원자적 작업)
-        temp_path = local_path + ".tmp"
-        try:
-            blob = self.bucket.blob(blob_name)
-            blob.download_to_filename(temp_path)
+            last_error = None
+            for attempt in range(max_retries):
+                try:
+                    # 이전 임시 파일 정리
+                    if os.path.exists(temp_path):
+                        os.remove(temp_path)
 
-            # 다운로드 성공 확인
-            if os.path.exists(temp_path) and os.path.getsize(temp_path) > 1024:
-                os.rename(temp_path, local_path)
-            else:
-                raise Exception(f"Downloaded file too small or missing: {temp_path}")
+                    # GCS에서 다운로드
+                    blob = self.bucket.blob(blob_name)
 
-        except Exception as e:
-            print(f"Warning: GCS download failed for {gcs_path}: {e}")
-            # 실패 시 임시 파일 삭제
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
-            raise  # 에러 전파하여 호출자가 처리하도록
+                    # blob 존재 확인
+                    if not blob.exists():
+                        raise Exception(f"Blob does not exist: {blob_name}")
 
-        return local_path
+                    # 예상 파일 크기 확인
+                    blob.reload()
+                    expected_size = blob.size
+                    if expected_size and expected_size < min_file_size:
+                        print(f"  Warning: Blob {filename} is smaller than expected ({expected_size} bytes)")
+                        sys.stdout.flush()
+
+                    # 다운로드
+                    blob.download_to_filename(temp_path)
+
+                    # 다운로드 성공 확인
+                    if not os.path.exists(temp_path):
+                        raise Exception(f"Temp file not created: {temp_path}")
+
+                    actual_size = os.path.getsize(temp_path)
+
+                    # 예상 크기와 비교 (있으면)
+                    if expected_size and actual_size != expected_size:
+                        raise Exception(f"Size mismatch: expected {expected_size}, got {actual_size}")
+
+                    # 최소 크기 확인
+                    if actual_size < min_file_size:
+                        raise Exception(f"Downloaded file too small: {actual_size} < {min_file_size}")
+
+                    # 원자적 이동
+                    os.rename(temp_path, local_path)
+                    return local_path
+
+                except Exception as e:
+                    last_error = e
+                    print(f"  Download attempt {attempt + 1}/{max_retries} failed for {filename}: {e}")
+                    sys.stdout.flush()
+
+                    # 임시 파일 정리
+                    if os.path.exists(temp_path):
+                        try:
+                            os.remove(temp_path)
+                        except OSError:
+                            pass
+
+                    # 마지막 시도가 아니면 잠시 대기 후 재시도
+                    if attempt < max_retries - 1:
+                        time.sleep(2 ** attempt)  # exponential backoff: 1s, 2s, 4s
+
+            # 모든 재시도 실패
+            raise Exception(f"GCS download failed after {max_retries} attempts for {gcs_path}: {last_error}")
 
     def list_pt_files(self) -> List[str]:
         """GCS에서 PT 파일 목록 조회"""
@@ -369,6 +451,10 @@ class PTFilePrefetchManager:
     def _download_pt_file(self, idx: int) -> str:
         """단일 PT 파일 다운로드"""
         import sys
+
+        # PT 파일 최소 크기: 1MB (실제로는 GB 단위이지만 보수적으로)
+        MIN_PT_FILE_SIZE = 1024 * 1024
+
         pt_path = self.pt_files[idx % len(self.pt_files)]
         filename = os.path.basename(pt_path)
         local_path = os.path.join(self.gcs_handler.cache_dir, filename)
@@ -376,17 +462,23 @@ class PTFilePrefetchManager:
         # 캐시 용량 관리 (다운로드 전)
         self._manage_cache_size()
 
-        # 이미 존재하면 스킵
-        if os.path.exists(local_path) and os.path.getsize(local_path) > 1024:
-            print(f"  [Prefetch] {filename} already cached")
-            sys.stdout.flush()
-            return local_path
+        # 이미 존재하고 충분한 크기면 스킵
+        if os.path.exists(local_path):
+            file_size = os.path.getsize(local_path)
+            if file_size >= MIN_PT_FILE_SIZE:
+                print(f"  [Prefetch] {filename} already cached ({file_size // (1024*1024)}MB)")
+                sys.stdout.flush()
+                return local_path
+            else:
+                print(f"  [Prefetch] {filename} corrupted (only {file_size} bytes), re-downloading...")
+                sys.stdout.flush()
 
-        # GCS에서 다운로드
+        # GCS에서 다운로드 (download_file이 이제 락과 재시도 처리)
         print(f"  [Prefetch] Downloading {filename} from GCS...")
         sys.stdout.flush()
-        result = self.gcs_handler.download_file(pt_path, local_path)
-        print(f"  [Prefetch] Downloaded {filename}")
+        result = self.gcs_handler.download_file(pt_path, local_path, min_file_size=MIN_PT_FILE_SIZE)
+        final_size = os.path.getsize(result)
+        print(f"  [Prefetch] Downloaded {filename} ({final_size // (1024*1024)}MB)")
         sys.stdout.flush()
         return result
 
