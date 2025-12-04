@@ -56,7 +56,7 @@ class TrainingConfig256:
     
     # 학습
     num_epochs: int = 20
-    steps_per_epoch: int = 7500         # 7.624M / 1024 (batch size 줄어서 2배)
+    steps_per_epoch: Optional[int] = None  # None이면 데이터셋에서 자동 계산
     learning_rate: float = 0.5          # muP base_dim=1
     warmup_steps: int = 1000
     
@@ -890,9 +890,17 @@ def main():
         )
         print(f"  ✓ GCS session initialized")
         print(f"    PT files found: {len(gcs_session.pt_files)}")
+        print(f"    Total samples: {gcs_session.total_samples:,}")
         if gcs_session.pt_files:
             print(f"    First PT file: {gcs_session.pt_files[0]}")
             print(f"    Last PT file: {gcs_session.pt_files[-1]}")
+
+        # steps_per_epoch 자동 계산 (None이면)
+        if config.steps_per_epoch is None:
+            config.steps_per_epoch = gcs_session.calculate_steps_per_epoch(config.global_batch_size)
+        else:
+            print(f"  Using manual steps_per_epoch: {config.steps_per_epoch}")
+
         sys.stdout.flush()
     except Exception as e:
         print(f"  ✗ Failed to initialize GCS session: {e}")
@@ -988,7 +996,7 @@ def main():
     print("="*70)
     print(f"  Total epochs: {config.num_epochs}")
     print(f"  PT files per epoch: {len(gcs_session.pt_files)}")
-    print(f"  Steps per PT file: {config.steps_per_epoch}")
+    print(f"  Steps per epoch: {config.steps_per_epoch:,} ({gcs_session.total_samples:,} samples / {config.global_batch_size} batch)")
     print(f"  Global batch size: {config.global_batch_size}")
     sys.stdout.flush()
     
