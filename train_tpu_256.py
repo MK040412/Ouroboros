@@ -778,10 +778,10 @@ def main():
             model,
             optax.chain(
                 optax.clip_by_global_norm(1.0),
-                optax.adamw(learning_rate=config.lr, weight_decay=1e-4)
+                optax.adamw(learning_rate=config.learning_rate, weight_decay=1e-4)
             )
         )
-        print(f"  ✓ Optimizer created (AdamW + gradient clipping, lr={config.lr})")
+        print(f"  ✓ Optimizer created (AdamW + gradient clipping, lr={config.learning_rate})")
         sys.stdout.flush()
     except Exception as e:
         print(f"  ✗ Failed to create optimizer: {e}")
