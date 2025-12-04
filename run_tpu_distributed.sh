@@ -139,6 +139,12 @@ export JAX_LOCAL_DEVICE_COUNT=${CHIPS_PER_WORKER}
 export TPU_CHIPS_PER_HOST_BOUNDS="2,2,1"
 export TPU_HOST_BOUNDS="2,2,1"
 
+# HuggingFace 토큰 설정 (embeddinggemma-300m 접근용)
+# 로컬 환경에서 HF_TOKEN 환경변수 설정 필요
+# export HF_TOKEN="your_token_here" 를 ~/.bashrc 에 추가
+export HF_TOKEN="\${HF_TOKEN:-}"
+export HUGGING_FACE_HUB_TOKEN="\${HF_TOKEN:-}"
+
 DEST_DIR=~/ouroboros
 REMOTE_URL="$REMOTE_URL"
 
@@ -167,6 +173,10 @@ pip3 install --user -q flax optax chex Pillow PyYAML wandb pyarrow torch transfo
 
 # PYTHONPATH 설정
 export PYTHONPATH="\$DEST_DIR/src:\$PYTHONPATH"
+
+# TPU lockfile 정리 (이전 프로세스 잔여물)
+sudo rm -f /tmp/libtpu_lockfile 2>/dev/null || true
+pkill -9 -f train_tpu_256.py 2>/dev/null || true
 
 echo "[Worker $WORKER_ID] Starting training..."
 echo "[Worker $WORKER_ID] JAX_COORDINATOR_ADDRESS=\$JAX_COORDINATOR_ADDRESS"
