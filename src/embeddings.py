@@ -445,29 +445,122 @@ class DummyEmbeddingProvider:
         return embeddings
 
 
-def get_embedding_provider(model_name: str = "google/embeddinggemma-300m",
-                           use_precomputed: bool = False,
-                           embedding_dim: int = 768,
+class GemmaEmbeddingProvider:
+    """Gemma-3 270M embedding provider using gemma library (TPU/CPU)
+
+    precompute_embeddings_tpu.py의 GemmaEmbeddingModel을 기반으로 함
+    transformers 대신 gemma 라이브러리 네이티브 사용
+    """
+
+    def __init__(self, max_length: int = 128):
+        self.max_length = max_length
+        self.embedding_dim = 640  # Gemma-3 270M hidden dimension
+        self.model = None
+        self.tokenizer = None
+        self.params = None
+        self._initialized = False
+
+    def _initialize(self):
+        """Lazy loading of model"""
+        if self._initialized:
+            return
+
+        try:
+            from gemma import gm
+
+            print("Loading Gemma-3 270M via gemma library...")
+            self.model = gm.nn.Gemma3_270M()
+            self.params = gm.ckpts.load_params(gm.ckpts.CheckpointPath.GEMMA3_270M_PT)
+            self.tokenizer = gm.text.Gemma3Tokenizer()
+            self._initialized = True
+            print(f"  ✓ Model loaded (embedding_dim={self.embedding_dim})")
+        except Exception as e:
+            print(f"  ✗ Failed to load Gemma model: {e}")
+            self._initialized = False
+
+    def batch_encode(self, texts: List[str], batch_size: int = 256,
+                     normalize: bool = True) -> np.ndarray:
+        """Encode texts to embeddings using Gemma-3 270M"""
+        self._initialize()
+
+        if not self._initialized or self.model is None:
+            # Fallback: random embeddings
+            print("Warning: Using random embeddings (Gemma model not available)")
+            embeddings = np.random.randn(len(texts), self.embedding_dim).astype(np.float32)
+            if normalize:
+                norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+                embeddings = embeddings / np.maximum(norms, 1e-8)
+            return embeddings
+
+        # Tokenize all texts
+        all_tokens = []
+        for text in texts:
+            tokens = self.tokenizer.encode(text, add_bos=True)
+            if len(tokens) > self.max_length:
+                tokens = tokens[:self.max_length]
+            else:
+                tokens = tokens + [0] * (self.max_length - len(tokens))
+            all_tokens.append(tokens)
+
+        tokens_array = np.array(all_tokens, dtype=np.int32)
+
+        # Forward pass
+        out = self.model.apply(
+            {'params': self.params},
+            tokens=tokens_array,
+            return_last_only=False,
+            return_hidden_states=True,
+        )
+        last_hidden = out.hidden_states[-1]
+
+        # Mean pooling
+        mask = (tokens_array != 0).astype(np.float32)
+        mask_expanded = mask[:, :, None]
+        sum_embeddings = np.sum(np.array(last_hidden) * mask_expanded, axis=1)
+        sum_mask = np.clip(mask.sum(axis=1, keepdims=True), a_min=1e-9, a_max=None)
+        embeddings = sum_embeddings / sum_mask
+
+        # L2 normalize
+        if normalize:
+            norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+            embeddings = embeddings / np.maximum(norms, 1e-8)
+
+        return embeddings.astype(np.float32)
+
+
+def get_embedding_provider(model_name: str = "gemma-3-270m",
+                           use_precomputed: bool = True,
+                           embedding_dim: int = 640,
                            num_workers: int = None) -> Any:
     """임베딩 프로바이더 팩토리
 
     Args:
-        model_name: HuggingFace 모델 이름
-        use_precomputed: (무시됨 - 항상 실시간 계산)
+        model_name: 모델 이름 (gemma-3-270m 또는 HuggingFace 모델)
+        use_precomputed: True면 None 반환 (precomputed embeddings 사용)
         embedding_dim: 임베딩 차원
         num_workers: CPU 워커 수 (기본: 자동)
 
     Returns:
-        EmbeddingProvider 인스턴스
+        EmbeddingProvider 인스턴스 또는 None (precomputed mode)
     """
-    # CPU 코어 수 확인
-    cpu_count = os.cpu_count() or 1
+    # Precomputed mode: embedding_provider 불필요
+    if use_precomputed:
+        print("Using precomputed embeddings (no embedding_provider needed)")
+        return None
 
+    # Gemma library provider (gemma-3-270m)
+    if "gemma" in model_name.lower():
+        print(f"Creating GemmaEmbeddingProvider:")
+        print(f"  Model: {model_name}")
+        print(f"  Embedding dim: 640 (Gemma-3 270M)")
+        return GemmaEmbeddingProvider(max_length=128)
+
+    # Legacy: transformers-based (fallback for other models)
+    cpu_count = os.cpu_count() or 1
     if num_workers is None:
-        # 112 vCPU인 경우 56개 워커 사용 (하이퍼스레딩 고려)
         num_workers = min(56, max(1, cpu_count // 2))
 
-    print(f"Creating CachedEmbeddingProvider:")
+    print(f"Creating CachedEmbeddingProvider (transformers):")
     print(f"  Model: {model_name}")
     print(f"  Embedding dim: {embedding_dim}")
     print(f"  CPU cores available: {cpu_count}")
