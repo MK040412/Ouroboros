@@ -768,10 +768,13 @@ class EpochDataLoader:
     def _load_loop(self):
         """PT 파일 로딩 루프 (Layer 2)"""
         import sys
-        print(f"  [LoadLoop] Started, need {(self.steps_per_epoch // 50) + 2} PT files")
-        sys.stdout.flush()
 
-        pt_files_needed = (self.steps_per_epoch // 50) + 2  # 필요한 PT 파일 수 추정
+        # 실제 PT 파일 개수 사용 (순환하지 않음)
+        pt_files_available = len(self.session.pt_files)
+        pt_files_needed = pt_files_available
+
+        print(f"  [LoadLoop] Started, will load {pt_files_needed} PT files")
+        sys.stdout.flush()
         files_submitted = 0
         files_completed = 0
 

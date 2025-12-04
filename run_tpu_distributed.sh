@@ -81,7 +81,9 @@ run_local() {
   fi
 
   log "Starting training..."
-  python3.11 train_tpu_256.py 2>&1 | tee "/tmp/train_worker_${WORKER_ID}.log"
+  # Python 출력 버퍼링 비활성화
+  export PYTHONUNBUFFERED=1
+  python3.11 -u train_tpu_256.py 2>&1 | tee "/tmp/train_worker_${WORKER_ID}.log"
 }
 
 # =============================================================================
@@ -210,7 +212,17 @@ echo "[Worker $WORKER_ID] Starting training..."
 echo "[Worker $WORKER_ID] JAX_COORDINATOR_ADDRESS=\$JAX_COORDINATOR_ADDRESS"
 echo "[Worker $WORKER_ID] JAX_PROCESS_INDEX=\$JAX_PROCESS_INDEX"
 
-python3.11 train_tpu_256.py 2>&1 | tee /tmp/train_worker_${WORKER_ID}.log
+# Python 출력 버퍼링 비활성화 (즉시 로그 출력)
+export PYTHONUNBUFFERED=1
+
+# nohup으로 SSH 끊어져도 프로세스 유지, -u로 unbuffered 출력
+nohup python3.11 -u train_tpu_256.py > /tmp/train_worker_${WORKER_ID}.log 2>&1 &
+TRAIN_PID=\$!
+echo "[Worker $WORKER_ID] Training started with PID \$TRAIN_PID"
+
+# 프로세스가 종료될 때까지 대기 (로그는 파일로 저장됨)
+wait \$TRAIN_PID
+echo "[Worker $WORKER_ID] Training finished"
 EOF
 
     # 현재 worker인 경우 SSH 없이 직접 실행, 아니면 SSH로 실행

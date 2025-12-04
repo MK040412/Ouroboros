@@ -1024,13 +1024,20 @@ def main():
             sys.stdout.flush()
             break
         
-        # 학습 루프
-        print(f"  [E{epoch+1}c] Starting training (pls wait, batches processing)...")
+        # 학습 루프 시작 전 모든 worker 동기화
+        print(f"  [E{epoch+1}c] Waiting for all workers to be ready...")
         sys.stdout.flush()
-        
+
+        # JAX barrier: 모든 worker가 이 지점에 도달할 때까지 대기
+        from jax.experimental.multihost_utils import sync_global_devices
+        sync_global_devices(f"epoch_{epoch}_start")
+
+        print(f"  [E{epoch+1}c] All workers ready, starting training...")
+        sys.stdout.flush()
+
         pt_files_processed = 0
         total_batches_processed = 0
-        
+
         try:
             losses, epoch_avg_loss = trainer.train_epoch(gcs_prefetch_loader, epoch)
             epoch_losses.extend(losses)
