@@ -85,10 +85,29 @@ run_local() {
 }
 
 # =============================================================================
+# 현재 TPU worker ID 감지 (TPU VM 내부에서 실행 시)
+# =============================================================================
+get_current_worker_id() {
+  local hostname=$(hostname)
+  # 호스트네임 형식: t1v-n-XXXXXXXX-w-N (N이 worker ID)
+  if [[ "$hostname" =~ -w-([0-9]+)$ ]]; then
+    echo "${BASH_REMATCH[1]}"
+  else
+    echo "-1"  # TPU VM이 아닌 경우
+  fi
+}
+
+# =============================================================================
 # 원격 모드 (로컬 머신에서 TPU에 명령 전송)
 # =============================================================================
 run_remote() {
   log "Running in REMOTE mode - dispatching to TPU workers"
+
+  # 현재 TPU worker ID 감지 (TPU VM 내부에서 실행 시)
+  CURRENT_WORKER_ID=$(get_current_worker_id)
+  if [[ "$CURRENT_WORKER_ID" != "-1" ]]; then
+    log "Detected running on TPU worker $CURRENT_WORKER_ID"
+  fi
 
   # 1. 먼저 코드 동기화
   log "Step 1: Syncing code to TPU workers..."
@@ -185,11 +204,17 @@ echo "[Worker $WORKER_ID] JAX_PROCESS_INDEX=\$JAX_PROCESS_INDEX"
 python3 train_tpu_256.py 2>&1 | tee /tmp/train_worker_${WORKER_ID}.log
 EOF
 
-    # 백그라운드로 각 worker에 SSH 실행
-    gcloud compute tpus tpu-vm ssh "$INSTANCE" \
-      --zone="$ZONE" \
-      --worker="$WORKER_ID" \
-      --command="bash -lc '${WORKER_CMD}'" &
+    # 현재 worker인 경우 SSH 없이 직접 실행, 아니면 SSH로 실행
+    if [[ "$WORKER_ID" == "$CURRENT_WORKER_ID" ]]; then
+      log "Worker $WORKER_ID: Running locally (current host)"
+      bash -lc "${WORKER_CMD}" &
+    else
+      log "Worker $WORKER_ID: Running via SSH"
+      gcloud compute tpus tpu-vm ssh "$INSTANCE" \
+        --zone="$ZONE" \
+        --worker="$WORKER_ID" \
+        --command="bash -lc '${WORKER_CMD}'" &
+    fi
 
     # Worker 0 (coordinator)가 먼저 시작하도록 충분한 딜레이
     if [[ $WORKER_ID -eq 0 ]]; then
