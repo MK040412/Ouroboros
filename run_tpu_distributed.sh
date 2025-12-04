@@ -188,7 +188,8 @@ echo "[Worker $WORKER_ID] Installing dependencies with pip (no venv)..."
 
 # 시스템 Python 직접 사용 (venv 없이)
 pip3 install --user -q jax[tpu] -f https://storage.googleapis.com/jax-releases/libtpu_releases.html 2>/dev/null || true
-pip3 install --user -q flax optax chex Pillow PyYAML wandb pyarrow torch transformers google-cloud-storage gemma 2>/dev/null || true
+pip3 install --user -q flax optax chex Pillow PyYAML wandb pyarrow torch transformers google-cloud-storage 2>/dev/null || true
+pip3 install --user -q git+https://github.com/google-deepmind/gemma.git 2>/dev/null || true
 
 # PYTHONPATH 설정
 export PYTHONPATH="\$DEST_DIR/src:\$PYTHONPATH"
