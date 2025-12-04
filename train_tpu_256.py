@@ -86,7 +86,7 @@ class TrainingConfig256:
     cache_dir: str = None  # 자동으로 /tmp 사용
     num_data_workers: int = 56  # 배치 샘플링 병렬 워커 (112 vCPU의 절반)
     prefetch_ahead: int = 4  # PT 파일 프리페치 개수
-    max_cache_files: int = 4  # 최대 동시 캐시 PT 파일 (worker당 ~2.7GB)
+    max_cache_files: int = 8  # 최대 동시 캐시 PT 파일 (prefetch + 여유분)
     num_download_workers: int = 16  # GCS 다운로드 병렬 워커 (대역폭 활용 극대화)
     num_load_workers: int = 4  # PT 파일 로딩 병렬 워커 (다운로드와 균형)
     
