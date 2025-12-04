@@ -102,5 +102,3 @@ echo "  Worker 3: gcloud compute tpus tpu-vm ssh $INSTANCE --zone=$ZONE --worker
 echo ""
 echo "Expected time: ~5-8 hours (92 files / 4 workers × ~15 min/file)"
 
-# Worker 0 로그 모니터링
-tail -f /tmp/precompute_worker_0.log
