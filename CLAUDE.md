@@ -73,3 +73,8 @@ Test config in `tests/conftest.py`:
 - `/src/xut/modules/transformer.py` - Transformer building block
 - `/train_tpu_256.py` - Training script and configuration
 - `/src/hdm/modules/xut.py` - PyTorch/Diffusers integration
+
+## Running Environment
+
+- TPU v5e 
+- tpuv5litepod-16 environment
