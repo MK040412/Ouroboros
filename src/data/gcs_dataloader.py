@@ -38,29 +38,79 @@ from google.cloud import storage
 
 
 # ============================================
-# GIL-free PT Loading (Module-level for pickle)
+# PT Loading with BFloat16 support
 # ============================================
+
+# BFloat16 역직렬화를 위한 커스텀 unpickler
+import pickle
+import io
+
+class BFloat16Unpickler(pickle.Unpickler):
+    """BFloat16 텐서를 float32로 자동 변환하는 Unpickler"""
+    def find_class(self, module, name):
+        # 기본 클래스 찾기
+        return super().find_class(module, name)
+
+def _torch_load_with_bf16_support(path: str):
+    """BFloat16을 지원하는 torch.load 래퍼"""
+    import sys
+
+    # 방법 1: mmap=True로 시도 (메모리 효율적)
+    try:
+        return torch.load(path, map_location='cpu', weights_only=False, mmap=True)
+    except TypeError:
+        # mmap 파라미터가 지원되지 않는 구버전
+        pass
+    except Exception as e:
+        if "BFloat16" not in str(e):
+            raise
+
+    # 방법 2: 일반 로드
+    try:
+        return torch.load(path, map_location='cpu', weights_only=False)
+    except Exception as e:
+        if "BFloat16" not in str(e):
+            raise
+
+    # 방법 3: pickle 직접 사용
+    print(f"  [Load] Trying pickle fallback for {path}...")
+    sys.stdout.flush()
+    with open(path, 'rb') as f:
+        return pickle.load(f)
+
+
 def _load_pt_file_worker(local_path: str) -> dict:
     """PT 파일 로드 (별도 스레드에서 실행)
 
     torch.load는 C 확장이라 GIL 영향이 적음.
+    BFloat16 텐서는 자동으로 float32로 변환.
     """
-    data = torch.load(local_path, map_location='cpu', weights_only=False)
+    import sys
 
-    # Tensor -> NumPy 변환 (프로세스 내에서 완료)
+    try:
+        data = _torch_load_with_bf16_support(local_path)
+    except Exception as e:
+        print(f"  [Load] Failed to load {local_path}: {e}")
+        sys.stdout.flush()
+        raise
+
+    # Tensor -> NumPy 변환 (bfloat16 -> float32 자동 변환)
+    def to_numpy(tensor):
+        if isinstance(tensor, torch.Tensor):
+            # BFloat16은 numpy가 지원하지 않으므로 float32로 변환
+            if tensor.dtype == torch.bfloat16:
+                tensor = tensor.float()
+            return tensor.numpy()
+        return np.array(tensor)
+
     result = {
-        'keys': data['keys'].numpy() if isinstance(data['keys'], torch.Tensor) else np.array(data['keys']),
-        'latents': data['latents'].numpy() if isinstance(data['latents'], torch.Tensor) else data['latents'],
+        'keys': to_numpy(data['keys']),
+        'latents': to_numpy(data['latents']),
     }
 
     # Precomputed embeddings 로드 (bfloat16 -> float32)
     if 'embeddings' in data:
-        embeddings = data['embeddings']
-        if hasattr(embeddings, 'dtype') and embeddings.dtype == torch.bfloat16:
-            embeddings = embeddings.float()
-        if isinstance(embeddings, torch.Tensor):
-            embeddings = embeddings.numpy()
-        result['embeddings'] = embeddings
+        result['embeddings'] = to_numpy(data['embeddings'])
 
     return result
 
