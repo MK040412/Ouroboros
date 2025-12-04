@@ -6,6 +6,11 @@ GCS DataLoader with Async Embedding Pipeline for TPU Training
 2. Parquet에서 caption 로드 (key로 매핑)
 3. 비동기 임베딩 계산 (CPU에서 미리 N개 배치 준비)
 4. Double buffering으로 TPU 학습과 데이터 로딩 오버랩
+
+GIL 최적화 (2024-12):
+- ProcessPoolExecutor로 torch.load 병렬화 (GIL 우회)
+- Lock-free 배치 버퍼 (atomic operations)
+- JAX 변환을 메인 스레드에서 일괄 처리
 """
 
 import os
@@ -17,7 +22,8 @@ import tempfile
 from pathlib import Path
 from typing import List, Optional, Tuple, Iterator, Any, Dict
 from dataclasses import dataclass
-from concurrent.futures import ThreadPoolExecutor, Future
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, Future
+from collections import deque
 import time
 
 import numpy as np
@@ -25,6 +31,34 @@ import jax.numpy as jnp
 import torch
 import pyarrow.parquet as pq
 from google.cloud import storage
+
+
+# ============================================
+# GIL-free PT Loading (Module-level for pickle)
+# ============================================
+def _load_pt_file_worker(local_path: str) -> dict:
+    """PT 파일 로드 (별도 프로세스에서 실행 - GIL 우회)
+
+    이 함수는 ProcessPoolExecutor에서 호출되므로 GIL 영향 없음.
+    """
+    data = torch.load(local_path, map_location='cpu', weights_only=False)
+
+    # Tensor -> NumPy 변환 (프로세스 내에서 완료)
+    result = {
+        'keys': data['keys'].numpy() if isinstance(data['keys'], torch.Tensor) else np.array(data['keys']),
+        'latents': data['latents'].numpy() if isinstance(data['latents'], torch.Tensor) else data['latents'],
+    }
+
+    # Precomputed embeddings 로드 (bfloat16 -> float32)
+    if 'embeddings' in data:
+        embeddings = data['embeddings']
+        if hasattr(embeddings, 'dtype') and embeddings.dtype == torch.bfloat16:
+            embeddings = embeddings.float()
+        if isinstance(embeddings, torch.Tensor):
+            embeddings = embeddings.numpy()
+        result['embeddings'] = embeddings
+
+    return result
 
 
 @dataclass
@@ -261,7 +295,7 @@ class PTFilePrefetchManager:
                     del self.in_progress[idx]
 
             # 다음 체크까지 짧게 대기
-            time.sleep(0.1)
+            time.sleep(0.01)  # 10ms로 감소
 
     def _download_pt_file(self, idx: int) -> str:
         """단일 PT 파일 다운로드"""
@@ -512,8 +546,13 @@ class EpochDataLoader:
     """에포크 단위 데이터로더 (3단계 비동기 파이프라인)
 
     Layer 1: PT 파일 프리페치 (PTFilePrefetchManager)
-    Layer 2: PT 파일 로딩 (torch.load)
-    Layer 3: 배치 샘플링 (병렬 처리)
+    Layer 2: PT 파일 로딩 (ProcessPoolExecutor - GIL 우회)
+    Layer 3: 배치 샘플링 (ThreadPoolExecutor)
+
+    GIL 최적화:
+    - PT 로딩을 ProcessPoolExecutor로 실행 (torch.load GIL 우회)
+    - Lock-free 배치 버퍼 (deque + atomic counter)
+    - NumPy 상태로 전달, JAX 변환은 메인 스레드에서 일괄 처리
     """
 
     def __init__(self, session: GCSDataLoaderSession, epoch: int,
@@ -528,7 +567,7 @@ class EpochDataLoader:
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.prefetch_ahead = prefetch_ahead
-        self.num_load_workers = num_load_workers  # 로딩 병렬화에 사용
+        self.num_load_workers = num_load_workers
         self.use_precomputed = use_precomputed
 
         # === Layer 1: PT 파일 프리페치 ===
@@ -540,9 +579,10 @@ class EpochDataLoader:
             max_cache_files=session.max_cache_files
         )
 
-        # === Layer 2: PT 파일 로딩 ===
-        self.load_executor = ThreadPoolExecutor(max_workers=num_load_workers)
-        self.loaded_pt_queue: queue.Queue[Tuple[int, dict]] = queue.Queue(maxsize=num_load_workers)
+        # === Layer 2: PT 파일 로딩 (ProcessPoolExecutor - GIL 우회) ===
+        # ProcessPoolExecutor는 별도 프로세스에서 torch.load 실행
+        self.load_executor = ProcessPoolExecutor(max_workers=num_load_workers)
+        self.loaded_pt_queue: queue.Queue[Tuple[int, dict]] = queue.Queue(maxsize=num_load_workers + 1)
 
         # === Layer 3: 배치 샘플링 ===
         self.batch_executor = ThreadPoolExecutor(max_workers=num_workers)
@@ -550,10 +590,15 @@ class EpochDataLoader:
             maxsize=prefetch_ahead * 2
         )
 
-        # 배치 결과 버퍼 (순서 보장용)
+        # === Lock-free 배치 버퍼 (GIL 최적화) ===
+        # Dict 대신 고정 크기 리스트 + atomic counter 사용
+        self._batch_slots = [None] * (steps_per_epoch + 1)  # Pre-allocated slots
+        self._batch_ready = [False] * (steps_per_epoch + 1)  # Ready flags
+        self.next_batch_idx = 0  # Atomic read/write in CPython
+
+        # 레거시 호환용 (제거 예정)
         self.batch_buffer: Dict[int, Tuple[np.ndarray, np.ndarray]] = {}
         self.buffer_lock = threading.Lock()
-        self.next_batch_idx = 0
 
         # 제어
         self.stop_event = threading.Event()
@@ -599,7 +644,7 @@ class EpochDataLoader:
             self.combine_thread.start()
 
     def _load_loop(self):
-        """PT 파일 로딩 루프 (Layer 2) - 진짜 병렬 실행"""
+        """PT 파일 로딩 루프 (Layer 2) - ProcessPoolExecutor로 GIL 우회"""
         pt_files_needed = (self.steps_per_epoch // 50) + 2  # 필요한 PT 파일 수 추정
         files_submitted = 0
         files_completed = 0
@@ -608,11 +653,12 @@ class EpochDataLoader:
         pending_loads: Dict[int, Tuple[Future, str]] = {}
 
         while files_completed < pt_files_needed and not self.stop_event.is_set():
-            # 1. 새 로딩 작업 시작 (워커 수만큼 동시 실행)
+            # 1. 새 로딩 작업 시작 (ProcessPoolExecutor - GIL 우회)
             while len(pending_loads) < self.num_load_workers and files_submitted < pt_files_needed:
                 try:
-                    idx, pt_path, local_path = self.prefetch_manager.get_next(timeout=0.5)
-                    future = self.load_executor.submit(self._load_pt_data, local_path)
+                    idx, pt_path, local_path = self.prefetch_manager.get_next(timeout=5.0)
+                    # 모듈 레벨 함수 사용 (pickle 가능)
+                    future = self.load_executor.submit(_load_pt_file_worker, local_path)
                     pending_loads[idx] = (future, local_path)
                     files_submitted += 1
                 except queue.Empty:
@@ -635,9 +681,9 @@ class EpochDataLoader:
             for idx in completed_indices:
                 del pending_loads[idx]
 
-            # CPU 과부하 방지
+            # CPU 과부하 방지 (polling interval)
             if not completed_indices and len(pending_loads) > 0:
-                time.sleep(0.05)
+                time.sleep(0.001)
 
         # 남은 작업 완료 대기
         for idx, (future, local_path) in pending_loads.items():
@@ -653,25 +699,8 @@ class EpochDataLoader:
         except queue.Full:
             pass
 
-    def _load_pt_data(self, local_path: str) -> dict:
-        """PT 파일 로드 (워커 함수)"""
-        data = torch.load(local_path, map_location='cpu')
-
-        result = {
-            'keys': data['keys'].numpy() if isinstance(data['keys'], torch.Tensor) else np.array(data['keys']),
-            'latents': data['latents'],
-        }
-
-        if 'embeddings' in data:
-            embeddings = data['embeddings']
-            if embeddings.dtype == torch.bfloat16:
-                embeddings = embeddings.float()
-            result['embeddings'] = embeddings.numpy()
-
-        return result
-
     def _sample_loop(self):
-        """배치 샘플링 루프 (Layer 3)"""
+        """배치 샘플링 루프 (Layer 3) - Lock-free 최적화"""
         rng = np.random.RandomState(self.epoch * 1000)
 
         current_pt_data: Optional[dict] = None
@@ -692,7 +721,7 @@ class EpochDataLoader:
                     current_pt_data = pt_data
                     steps_on_current_pt = 0
                     if step == 0:
-                        print(f"  [Sample] First PT file loaded")
+                        print(f"  [Sample] First PT file loaded (GIL-free)")
                 except queue.Empty:
                     print(f"[Sample] PT data queue timeout at step {step}")
                     continue
@@ -703,7 +732,6 @@ class EpochDataLoader:
             for i in range(batch_to_submit):
                 step_idx = step + i
                 if step_idx not in pending_futures and step_idx < self.steps_per_epoch:
-                    # 각 배치에 대한 시드 생성
                     seed = self.epoch * 10000 + step_idx
                     future = self.batch_executor.submit(
                         self._sample_single_batch,
@@ -713,7 +741,7 @@ class EpochDataLoader:
                     )
                     pending_futures[step_idx] = future
 
-            # 완료된 작업 수집
+            # 완료된 작업 수집 (Lock-free: 슬롯에 직접 저장)
             completed_steps = []
             for step_idx in list(pending_futures.keys()):
                 future = pending_futures[step_idx]
@@ -721,8 +749,9 @@ class EpochDataLoader:
                     try:
                         batch_data = future.result()
                         if batch_data is not None:
-                            with self.buffer_lock:
-                                self.batch_buffer[step_idx] = batch_data
+                            # Lock-free: atomic write to pre-allocated slot
+                            self._batch_slots[step_idx] = batch_data
+                            self._batch_ready[step_idx] = True
                         completed_steps.append(step_idx)
                     except Exception as e:
                         print(f"[Sample] Error at step {step_idx}: {e}")
@@ -731,73 +760,88 @@ class EpochDataLoader:
             for step_idx in completed_steps:
                 del pending_futures[step_idx]
 
-            # 순서대로 batch_queue에 전달
-            with self.buffer_lock:
-                while self.next_batch_idx in self.batch_buffer:
-                    batch_data = self.batch_buffer.pop(self.next_batch_idx)
-                    try:
-                        put_timeout = 600 if self.next_batch_idx == 0 else 60
-                        self.batch_queue.put(batch_data, timeout=put_timeout)
-                        if self.next_batch_idx == 0:
-                            print(f"  ✓ First batch ready (shape: {batch_data[0].shape})")
-                        self.next_batch_idx += 1
-                        step += 1
-                        steps_on_current_pt += 1
-                    except queue.Full:
-                        # 큐가 가득 차면 다시 버퍼에 저장
-                        self.batch_buffer[self.next_batch_idx] = batch_data
-                        break
+            # 순서대로 batch_queue에 전달 (Lock-free: ready flag 체크)
+            while self._batch_ready[self.next_batch_idx]:
+                batch_data = self._batch_slots[self.next_batch_idx]
+                self._batch_slots[self.next_batch_idx] = None  # Clear slot
+                self._batch_ready[self.next_batch_idx] = False
+                try:
+                    put_timeout = 600 if self.next_batch_idx == 0 else 60
+                    self.batch_queue.put(batch_data, timeout=put_timeout)
+                    if self.next_batch_idx == 0:
+                        print(f"  ✓ First batch ready (shape: {batch_data[0].shape})")
+                    self.next_batch_idx += 1
+                    step += 1
+                    steps_on_current_pt += 1
+                except queue.Full:
+                    # 큐가 가득 차면 다시 슬롯에 저장
+                    self._batch_slots[self.next_batch_idx] = batch_data
+                    self._batch_ready[self.next_batch_idx] = True
+                    break
 
-            time.sleep(0.01)  # CPU 과부하 방지
+            time.sleep(0.005)  # 5ms로 감소 (Lock-free라 오버헤드 적음)
 
         # 남은 pending futures 처리
         for step_idx, future in pending_futures.items():
             try:
                 batch_data = future.result(timeout=5.0)
                 if batch_data is not None:
-                    with self.buffer_lock:
-                        self.batch_buffer[step_idx] = batch_data
+                    self._batch_slots[step_idx] = batch_data
+                    self._batch_ready[step_idx] = True
             except Exception:
                 pass
 
         # 버퍼에 남은 배치 전달
-        with self.buffer_lock:
-            while self.next_batch_idx in self.batch_buffer and self.next_batch_idx < self.steps_per_epoch:
-                batch_data = self.batch_buffer.pop(self.next_batch_idx)
-                try:
-                    self.batch_queue.put(batch_data, timeout=5.0)
-                    self.next_batch_idx += 1
-                except queue.Full:
-                    break
+        while self.next_batch_idx < self.steps_per_epoch and self._batch_ready[self.next_batch_idx]:
+            batch_data = self._batch_slots[self.next_batch_idx]
+            self._batch_slots[self.next_batch_idx] = None
+            self._batch_ready[self.next_batch_idx] = False
+            try:
+                self.batch_queue.put(batch_data, timeout=5.0)
+                self.next_batch_idx += 1
+            except queue.Full:
+                break
 
         # 종료 신호
         self.batch_queue.put(None)
 
     def _sample_single_batch(self, pt_data: dict, step_idx: int, seed: int) -> Optional[Tuple[np.ndarray, np.ndarray]]:
-        """단일 배치 샘플링 (워커 함수)"""
+        """단일 배치 샘플링 (워커 함수) - GIL 최적화
+
+        pt_data['latents']는 이미 numpy 배열 (_load_pt_file_worker에서 변환됨)
+        """
         try:
             rng = np.random.RandomState(seed)
 
             num_samples = len(pt_data['keys'])
             indices = rng.randint(0, num_samples, size=self.batch_size)
 
-            # Latents: (B, 3, 4, 32, 32) -> 랜덤 crop -> (B, 32, 32, 4) NHWC
-            latents = pt_data['latents'][indices]
-            latents_np = latents.float().numpy()
+            # Latents: 이미 numpy 배열 (GIL-free 로딩에서 변환됨)
+            # Shape: (N, 3, 4, 32, 32) -> 랜덤 crop -> (B, 32, 32, 4) NHWC
+            latents = pt_data['latents']
+
+            # numpy 배열인지 확인 (ProcessPoolExecutor에서 이미 변환됨)
+            if isinstance(latents, torch.Tensor):
+                latents_np = latents.numpy()
+            else:
+                latents_np = latents  # 이미 numpy
+
+            latents_subset = latents_np[indices]  # (B, 3, 4, 32, 32)
 
             crop_indices = rng.randint(0, 3, size=self.batch_size)
-            latents_selected = latents_np[np.arange(self.batch_size), crop_indices]
-            latents_nhwc = np.transpose(latents_selected, (0, 2, 3, 1))
+            latents_selected = latents_subset[np.arange(self.batch_size), crop_indices]  # (B, 4, 32, 32)
+            latents_nhwc = np.transpose(latents_selected, (0, 2, 3, 1))  # (B, 32, 32, 4)
 
-            # Embeddings
+            # Embeddings (이미 numpy 배열)
             if self.use_precomputed and 'embeddings' in pt_data:
                 embeddings = pt_data['embeddings'][indices]
             else:
                 # Legacy mode: 실시간 계산 필요
                 keys = pt_data['keys'][indices]
                 captions = self.session.get_captions_for_keys(keys)
-                with self.buffer_lock:
-                    self.latent_buffer[step_idx] = latents_nhwc
+                # Lock-free: 슬롯에 직접 저장
+                self._batch_slots[step_idx] = latents_nhwc
+                self.latent_buffer[step_idx] = latents_nhwc
                 self.embedding_pipeline.submit(step_idx, captions)
                 return None  # combine_thread에서 처리
 
@@ -805,6 +849,8 @@ class EpochDataLoader:
 
         except Exception as e:
             print(f"[Sample] Batch error at {step_idx}: {e}")
+            import traceback
+            traceback.print_exc()
             return None
 
     def _combine_batches(self):
