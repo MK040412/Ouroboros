@@ -142,12 +142,6 @@ export TPU_HOST_BOUNDS="2,2,1"
 DEST_DIR=~/ouroboros
 REMOTE_URL="$REMOTE_URL"
 
-echo "[Worker $WORKER_ID] Killing previous training processes..."
-# 이전 학습 프로세스 정리 (coordinator 충돌 방지)
-pkill -9 -f "train_tpu_256.py" 2>/dev/null || true
-pkill -9 -f "python3.*train" 2>/dev/null || true
-sleep 2
-
 echo "[Worker $WORKER_ID] Setting up repository..."
 
 # Git clone or pull
@@ -202,8 +196,25 @@ EOF
 # =============================================================================
 # 메인
 # =============================================================================
+# TPU VM 내부에서 실행 중인지 감지 (t1v- 또는 tpu- 호스트네임)
+IS_ON_TPU_VM=false
+if [[ "$(hostname)" == t1v-* ]] || [[ "$(hostname)" == tpu-* ]]; then
+  IS_ON_TPU_VM=true
+fi
+
 if [[ "${1:-}" == "--local" ]]; then
   run_local
+elif [[ "$IS_ON_TPU_VM" == true ]]; then
+  log "WARNING: Detected running on TPU VM ($(hostname))"
+  log "You should run this script from your LOCAL machine, not from TPU VM."
+  log "Or use: ./run_tpu_distributed.sh --local"
+  log ""
+  log "If you want to run remote mode from TPU VM, use: ./run_tpu_distributed.sh --force-remote"
+  if [[ "${1:-}" == "--force-remote" ]]; then
+    run_remote
+  else
+    exit 1
+  fi
 else
   run_remote
 fi
