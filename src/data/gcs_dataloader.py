@@ -425,14 +425,15 @@ class EpochDataLoader:
                 crop_indices = rng.randint(0, 3, size=batch_size)
                 latents_selected = latents_np[np.arange(batch_size), crop_indices]  # (B, 4, 32, 32) NCHW
 
-                # NCHW 형식 유지 (모델이 NCHW 사용)
+                # NCHW -> NHWC (모델이 NHWC 입력 사용)
+                latents_nhwc = np.transpose(latents_selected, (0, 2, 3, 1))  # (B, 32, 32, 4)
 
                 # Captions 가져오기
                 captions = self.session.get_captions_for_keys(keys)
 
                 # Latent 버퍼에 저장
                 with self.buffer_lock:
-                    self.latent_buffer[step] = latents_selected
+                    self.latent_buffer[step] = latents_nhwc
 
                 # 임베딩 계산 요청 (비동기)
                 self.embedding_pipeline.submit(step, captions)

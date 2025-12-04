@@ -431,7 +431,10 @@ class TPUTrainer:
         @nnx.jit
         def _train_step_jit(model, optimizer, x_t, t_cond, noise, text_emb):
             def loss_fn(model):
-                pred_noise = model(x_t, t_cond, text_emb)
+                # 모델 입력: NHWC, 출력: NCHW
+                pred_noise_nchw = model(x_t, t_cond, text_emb)
+                # NCHW -> NHWC for loss computation (noise is NHWC)
+                pred_noise = jnp.transpose(pred_noise_nchw, (0, 2, 3, 1))
                 return jnp.mean((pred_noise - noise) ** 2)
 
             loss, grads = nnx.value_and_grad(loss_fn)(model)
@@ -500,10 +503,10 @@ class TPUTrainer:
             ]
 
             # Global array 생성 (모든 host의 데이터가 합쳐짐)
-            # Shape: NCHW (batch, channels, height, width)
+            # Shape: NHWC (batch, height, width, channels) - 모델 입력 형식
             global_batch_size = self.config.global_batch_size
             batch_latents = jax.make_array_from_single_device_arrays(
-                (global_batch_size, 4, 32, 32),  # NCHW
+                (global_batch_size, 32, 32, 4),  # NHWC
                 batch_sharding,
                 latent_arrays
             )
