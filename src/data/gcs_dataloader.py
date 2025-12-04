@@ -314,20 +314,53 @@ class PTFilePrefetchManager:
         print(f"  [Prefetch] Downloading {filename}...")
         return self.gcs_handler.download_file(pt_path, local_path)
 
+    def _get_protected_files(self) -> set:
+        """현재 사용 중인 파일 목록 (삭제 보호)"""
+        protected = set()
+
+        with self.lock:
+            # 1. 다운로드 진행 중인 파일들
+            for idx in self.in_progress.keys():
+                pt_path = self.pt_files[idx % len(self.pt_files)]
+                protected.add(os.path.basename(pt_path))
+
+            # 2. 다운로드 완료되어 대기 중인 파일들
+            for idx in self.completed.keys():
+                pt_path = self.pt_files[idx % len(self.pt_files)]
+                protected.add(os.path.basename(pt_path))
+
+            # 3. 현재 prefetch 범위의 파일들 (next_deliver_idx ~ +prefetch_ahead)
+            for i in range(self.prefetch_ahead + 2):  # 여유분 추가
+                idx = self.next_deliver_idx + i
+                if idx < len(self.pt_files):
+                    pt_path = self.pt_files[idx % len(self.pt_files)]
+                    protected.add(os.path.basename(pt_path))
+
+        return protected
+
     def _manage_cache_size(self):
-        """캐시 용량 관리 (오래된 파일 삭제)"""
+        """캐시 용량 관리 (오래된 파일 삭제, 사용 중인 파일 보호)"""
         cached_files = glob.glob(
             os.path.join(self.gcs_handler.cache_dir, "*.pt")
         )
+
         if len(cached_files) >= self.max_cache_files:
-            # 가장 오래된 파일 삭제
+            # 보호 대상 파일 목록
+            protected = self._get_protected_files()
+
+            # 가장 오래된 파일부터 삭제 (보호 대상 제외)
             for f in sorted(cached_files, key=os.path.getmtime):
                 if len(cached_files) < self.max_cache_files:
                     break
+
+                filename = os.path.basename(f)
+                if filename in protected:
+                    continue  # 사용 중인 파일은 건너뜀
+
                 try:
                     os.remove(f)
                     cached_files.remove(f)
-                    print(f"  [Cache] Removed old file: {os.path.basename(f)}")
+                    print(f"  [Cache] Removed old file: {filename}")
                 except Exception:
                     pass
 
