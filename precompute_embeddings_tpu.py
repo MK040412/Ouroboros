@@ -1,10 +1,10 @@
 """
 TPU-based Pre-compute Embeddings (Distributed)
 
-BERT-base (768d) 모델을 TPU에서 실행하여 임베딩 계산
+Gemma-3 270M 모델을 TPU에서 실행하여 임베딩 계산
 - 4개 Worker 분산 처리 (각 Worker가 다른 PT 파일 처리)
-- Flax 네이티브 지원
-- 각 Worker는 로컬 4개 TPU 칩 사용
+- gemma 라이브러리 네이티브 지원
+- 각 Worker는 로컬 4개 TPU 칩 사용 (pmap 병렬화)
 
 Usage:
   # 각 Worker에서 실행 (TPU_WORKER_ID 환경변수로 구분)
@@ -35,6 +35,9 @@ from tqdm import tqdm
 import jax
 import jax.numpy as jnp
 
+# Gemma 라이브러리
+from gemma import gm
+
 # TPU 초기화 확인
 print(f"JAX devices: {jax.devices()}")
 print(f"JAX default backend: {jax.default_backend()}")
@@ -45,16 +48,15 @@ class TPUPrecomputeConfig:
     """Pre-compute 설정 (분산)"""
     gcs_bucket: str = "rdy-tpu-data-2025"
     input_prefix: str = "coyo11m-256px-ccrop-latent/latents-3crop/"
-    output_prefix: str = "coyo11m-256px-ccrop-latent/latents-3crop-emb/"
+    output_prefix: str = "coyo11m-256px-ccrop-latent/latents-3crop-gemma/"
     parquet_path: str = "gs://rdy-tpu-data-2025/coyo11m-256px-ccrop-latent/coyo11m-meta.parquet"
 
-    # BERT-base has same 768d as Gemma 300M
-    model_name: str = "bert-base-uncased"
-    embedding_dim: int = 768
-    max_length: int = 128  # Shorter = faster
+    # Gemma-3 270M embedding
+    embedding_dim: int = 640  # Gemma-3 270M hidden dimension
+    max_length: int = 128  # Max tokens
 
     # TPU batch (larger batch for TPU)
-    batch_size: int = 2048  # TPU can handle large batches
+    batch_size: int = 512  # Gemma는 BERT보다 크므로 배치 줄임
 
     local_cache: str = "/tmp/precompute_cache_tpu"
 
@@ -62,39 +64,56 @@ class TPUPrecomputeConfig:
     num_workers: int = 4  # TPU pod worker 수
 
 
-class FlaxEmbeddingModel:
-    """Flax BERT embedding model for TPU with pmap parallelization"""
+class GemmaEmbeddingModel:
+    """Gemma-3 270M embedding model for TPU with pmap parallelization"""
 
-    def __init__(self, model_name: str, max_length: int = 128):
-        self.model_name = model_name
+    def __init__(self, max_length: int = 128):
         self.max_length = max_length
         self.model = None
         self.tokenizer = None
         self.params = None
         self.num_devices = jax.local_device_count()
         self._encode_pmap = None
+        self.hidden_dim = 640  # Gemma-3 270M hidden dimension
 
     def load(self):
-        """Load model on TPU"""
+        """Load Gemma model on TPU"""
         if self.model is not None:
             return
 
-        from transformers import FlaxAutoModel, AutoTokenizer
+        print(f"Loading Gemma-3 270M for TPU ({self.num_devices} devices)...")
 
-        print(f"Loading {self.model_name} for TPU ({self.num_devices} devices)...")
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
-        self.model = FlaxAutoModel.from_pretrained(self.model_name)
-        print(f"  Model loaded (dim={self.model.config.hidden_size})")
+        # Load model and params
+        self.model = gm.nn.Gemma3_270M()
+        self.params = gm.ckpts.load_params(gm.ckpts.CheckpointPath.GEMMA3_270M)
+        self.tokenizer = gm.text.Gemma3Tokenizer()
+
+        print(f"  Model loaded (hidden_dim={self.hidden_dim})")
 
         # Create pmap function for parallel execution
-        def encode_fn(input_ids, attention_mask):
-            outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
+        model = self.model
+        params = self.params
+
+        def encode_fn(tokens):
+            """Extract last hidden state and mean pool"""
+            out = model.apply(
+                {'params': params},
+                tokens=tokens,
+                return_last_only=False,
+                return_hidden_states=True,
+            )
+            # Get last hidden state: (batch, seq_len, hidden_dim)
+            last_hidden = out.hidden_states[-1]
+
+            # Create attention mask (non-zero tokens)
+            mask = (tokens != 0).astype(jnp.float32)
+            mask_expanded = mask[:, :, None]
+
             # Mean pooling
-            token_embeddings = outputs.last_hidden_state
-            mask_expanded = attention_mask[:, :, None].astype(jnp.float32)
-            sum_embeddings = jnp.sum(token_embeddings * mask_expanded, axis=1)
-            sum_mask = jnp.clip(mask_expanded.sum(axis=1), a_min=1e-9)
+            sum_embeddings = jnp.sum(last_hidden * mask_expanded, axis=1)
+            sum_mask = jnp.clip(mask.sum(axis=1, keepdims=True), a_min=1e-9)
             embeddings = sum_embeddings / sum_mask
+
             # L2 normalize
             norms = jnp.linalg.norm(embeddings, axis=1, keepdims=True)
             embeddings = embeddings / jnp.maximum(norms, 1e-8)
@@ -107,48 +126,50 @@ class FlaxEmbeddingModel:
         """Encode batch of texts using all TPU devices"""
         self.load()
 
-        # Tokenize
-        inputs = self.tokenizer(
-            texts,
-            return_tensors="np",
-            truncation=True,
-            max_length=self.max_length,
-            padding="max_length"
-        )
+        # Tokenize all texts
+        all_tokens = []
+        for text in texts:
+            tokens = self.tokenizer.encode(text, add_bos=True)
+            # Truncate or pad to max_length
+            if len(tokens) > self.max_length:
+                tokens = tokens[:self.max_length]
+            else:
+                tokens = tokens + [0] * (self.max_length - len(tokens))
+            all_tokens.append(tokens)
 
-        input_ids = inputs['input_ids']
-        attention_mask = inputs['attention_mask']
-
-        batch_size = input_ids.shape[0]
-        per_device = batch_size // self.num_devices
+        tokens_array = np.array(all_tokens, dtype=np.int32)
+        batch_size = tokens_array.shape[0]
+        original_batch_size = batch_size
 
         # Pad to be divisible by num_devices
         if batch_size % self.num_devices != 0:
             pad_size = self.num_devices - (batch_size % self.num_devices)
-            input_ids = np.pad(input_ids, ((0, pad_size), (0, 0)), mode='constant')
-            attention_mask = np.pad(attention_mask, ((0, pad_size), (0, 0)), mode='constant')
-            per_device = input_ids.shape[0] // self.num_devices
+            tokens_array = np.pad(tokens_array, ((0, pad_size), (0, 0)), mode='constant')
+            batch_size = tokens_array.shape[0]
+
+        per_device = batch_size // self.num_devices
 
         # Reshape for pmap: (num_devices, per_device_batch, seq_len)
-        input_ids = input_ids.reshape(self.num_devices, per_device, -1)
-        attention_mask = attention_mask.reshape(self.num_devices, per_device, -1)
+        tokens_array = tokens_array.reshape(self.num_devices, per_device, -1)
 
         # Run on all devices in parallel
-        embeddings = self._encode_pmap(input_ids, attention_mask)
+        embeddings = self._encode_pmap(tokens_array)
 
         # Reshape back: (num_devices, per_device_batch, dim) -> (total_batch, dim)
         embeddings = np.array(embeddings).reshape(-1, embeddings.shape[-1])
 
         # Remove padding
-        if batch_size % self.num_devices != 0:
-            embeddings = embeddings[:batch_size]
+        embeddings = embeddings[:original_batch_size]
 
         return embeddings
 
-    def encode_all(self, texts: List[str], batch_size: int = 2048) -> np.ndarray:
+    def encode_all(self, texts: List[str], batch_size: int = 512) -> np.ndarray:
         """Encode all texts in batches using all TPU devices"""
         # Adjust batch size to be divisible by num_devices
         batch_size = (batch_size // self.num_devices) * self.num_devices
+        if batch_size == 0:
+            batch_size = self.num_devices
+
         all_embeddings = []
 
         for i in tqdm(range(0, len(texts), batch_size), desc="  TPU Encoding"):
@@ -173,7 +194,7 @@ class TPUPrecomputePipeline:
         Path(self.cache_dir).mkdir(parents=True, exist_ok=True)
 
         self.captions_list: List[str] = []
-        self.embedder = FlaxEmbeddingModel(config.model_name, config.max_length)
+        self.embedder = GemmaEmbeddingModel(config.max_length)
 
     def load_parquet_metadata(self):
         """Load parquet captions"""
