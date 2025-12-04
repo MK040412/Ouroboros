@@ -465,4 +465,12 @@ class EpochDataLoader:
                 batch_count += 1
 
             except queue.Empty:
-                print(f"Batch queue tim
+                print(f"Batch queue timeout at step {batch_count}")
+                break
+
+    def stop(self):
+        """로더 중지"""
+        self.stop_event.set()
+        self.embedding_pipeline.stop()
+        self.data_thread.join(timeout=5.0)
+        self.combine_thread.join(timeout=5.0)
