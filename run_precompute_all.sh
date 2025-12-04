@@ -54,6 +54,18 @@ done
 wait
 echo "  Code synced"
 
+# gemma 라이브러리 설치 (모든 Worker)
+echo -e "\n[Step 2.5] Installing gemma library..."
+pip3 install --user -q gemma 2>/dev/null || true
+for WORKER_ID in $(seq 1 $((NUM_WORKERS - 1))); do
+    gcloud compute tpus tpu-vm ssh "$INSTANCE" \
+        --zone="$ZONE" \
+        --worker="$WORKER_ID" \
+        --command="pip3 install --user -q gemma 2>/dev/null || true" &
+done
+wait
+echo "  gemma installed"
+
 # Worker 0 시작
 echo -e "\n[Step 3] Starting Worker 0..."
 cd ~/ouroboros
