@@ -1104,7 +1104,30 @@ class EpochDataLoader:
             rng = np.random.RandomState(seed)
 
             num_samples = len(pt_data['keys'])
-            indices = rng.randint(0, num_samples, size=self.batch_size)
+
+            # Precomputed mode: embeddings가 있는 샘플만 사용
+            if self.use_precomputed:
+                if 'embeddings' not in pt_data:
+                    # PT 파일에 embeddings 키가 없으면 스킵
+                    print(f"[Sample] Warning: PT file has no 'embeddings' key, skipping batch {step_idx}")
+                    return None
+
+                embeddings_array = pt_data['embeddings']
+
+                # 유효한 샘플 인덱스 찾기 (NaN이 아닌 embeddings)
+                # embeddings shape: (N, embed_dim)
+                valid_mask = ~np.isnan(embeddings_array).any(axis=1)
+                valid_indices = np.where(valid_mask)[0]
+
+                if len(valid_indices) < self.batch_size:
+                    print(f"[Sample] Warning: Only {len(valid_indices)} valid samples, need {self.batch_size}, skipping batch {step_idx}")
+                    return None
+
+                # 유효한 샘플 중에서만 랜덤 선택
+                indices = rng.choice(valid_indices, size=self.batch_size, replace=False)
+            else:
+                # Legacy mode: 모든 샘플 사용 가능
+                indices = rng.randint(0, num_samples, size=self.batch_size)
 
             # Latents: 이미 numpy 배열 (GIL-free 로딩에서 변환됨)
             # Shape: (N, 3, 4, 32, 32) -> 랜덤 crop -> (B, 32, 32, 4) NHWC
@@ -1122,8 +1145,9 @@ class EpochDataLoader:
             latents_selected = latents_subset[np.arange(self.batch_size), crop_indices]  # (B, 4, 32, 32)
             latents_nhwc = np.transpose(latents_selected, (0, 2, 3, 1))  # (B, 32, 32, 4)
 
-            # Embeddings (이미 numpy 배열)
-            if self.use_precomputed and 'embeddings' in pt_data:
+            # Embeddings
+            if self.use_precomputed:
+                # Precomputed mode: 이미 유효한 indices만 선택됨
                 embeddings = pt_data['embeddings'][indices]
             else:
                 # Legacy mode: 실시간 계산 필요
