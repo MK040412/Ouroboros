@@ -137,10 +137,13 @@ run_remote() {
   fi
   log "Coordinator IP: $COORDINATOR_IP"
 
-  # 3. 각 worker에 대해 병렬로 실행
+  # 3. 각 worker에 대해 실행 (Worker 1,2,3 먼저, Worker 0 마지막)
+  # Worker 0이 coordinator이므로 다른 worker들이 준비된 후 시작해야 함
   log "Step 3: Launching training on all workers..."
+  log "  Order: Workers 1,2,3 first, then Worker 0 (coordinator) last"
 
-  for WORKER_ID in $(seq 0 $((NUM_WORKERS - 1))); do
+  # Worker 순서: 1, 2, 3, 0 (coordinator 마지막)
+  for WORKER_ID in 1 2 3 0; do
     log "Launching worker $WORKER_ID..."
 
     # 각 worker에서 실행할 명령
@@ -222,9 +225,12 @@ EOF
         --command="bash -lc '${WORKER_CMD}'" &
     fi
 
-    # Worker 0 (coordinator)가 먼저 시작하도록 충분한 딜레이
-    if [[ $WORKER_ID -eq 0 ]]; then
-      sleep 10
+    # Worker 0 (coordinator)이 마지막에 시작하므로, 그 전에 다른 worker들이 준비되도록 대기
+    if [[ $WORKER_ID -eq 3 ]]; then
+      # Worker 1,2,3 시작 후, Worker 0 시작 전에 충분히 대기
+      # (git pull + pip install + python 시작 시간 고려)
+      log "Waiting 90s for workers 1,2,3 to be ready before starting coordinator..."
+      sleep 90
     fi
   done
 
