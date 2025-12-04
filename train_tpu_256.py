@@ -83,7 +83,7 @@ class TrainingConfig256:
     num_data_workers: int = 56  # 배치 샘플링 병렬 워커 (112 vCPU의 절반)
     prefetch_ahead: int = 4  # PT 파일 프리페치 개수
     max_cache_files: int = 4  # 최대 동시 캐시 PT 파일 (worker당 ~2.7GB)
-    num_download_workers: int = 4  # GCS 다운로드 병렬 워커
+    num_download_workers: int = 16  # GCS 다운로드 병렬 워커 (대역폭 활용 극대화)
     num_load_workers: int = 4  # PT 파일 로딩 병렬 워커 (다운로드와 균형)
     
     # TPU 설정
@@ -353,6 +353,30 @@ def create_sharding_mesh(num_devices: int):
     return Mesh(devices, axis_names=("batch",))
 
 
+# ============================================
+# JIT-compiled Train Step (Module-level for cache reuse)
+# ============================================
+@nnx.jit
+def _train_step_jit(model, optimizer, x_t, t_cond, noise, text_emb):
+    """JIT 컴파일된 학습 스텝 (모듈 레벨 - 캐시 재사용)
+
+    이 함수를 모듈 레벨에 정의하면:
+    1. JIT 캐시가 전역적으로 유지됨
+    2. 매 호출마다 새 함수 객체 생성 방지
+    3. 컴파일 오버헤드 최소화
+    """
+    def loss_fn(model):
+        # 모델 입력: NHWC, 출력: NCHW
+        pred_noise_nchw = model(x_t, t_cond, text_emb)
+        # NCHW -> NHWC for loss computation (noise is NHWC)
+        pred_noise = jnp.transpose(pred_noise_nchw, (0, 2, 3, 1))
+        return jnp.mean((pred_noise - noise) ** 2)
+
+    loss, grads = nnx.value_and_grad(loss_fn)(model)
+    optimizer.update(grads)
+    return loss
+
+
 class TPUTrainer:
     """TPU 분산 학습기 (Sharding 적용)"""
 
@@ -424,6 +448,8 @@ class TPUTrainer:
 
         배치는 'data' 축으로 분산
         모델 파라미터는 'model' 축으로 분산
+
+        GIL 최적화: _train_step_jit를 모듈 레벨로 이동하여 JIT 캐시 재사용
         """
         # TREAD: Timestep-Random Encoder Architecture Design
         batch_size = timesteps.shape[0]
@@ -435,21 +461,7 @@ class TPUTrainer:
         # 모델은 ctx가 3D (batch, seq_len, dim) 형태를 기대함
         text_emb_3d = text_emb[:, None, :]
 
-        # JIT된 내부 함수로 gradient 계산 및 업데이트
-        # nnx.jit은 nnx.Module과 optimizer를 인자로 받아야 함
-        @nnx.jit
-        def _train_step_jit(model, optimizer, x_t, t_cond, noise, text_emb):
-            def loss_fn(model):
-                # 모델 입력: NHWC, 출력: NCHW
-                pred_noise_nchw = model(x_t, t_cond, text_emb)
-                # NCHW -> NHWC for loss computation (noise is NHWC)
-                pred_noise = jnp.transpose(pred_noise_nchw, (0, 2, 3, 1))
-                return jnp.mean((pred_noise - noise) ** 2)
-
-            loss, grads = nnx.value_and_grad(loss_fn)(model)
-            optimizer.update(grads)
-            return loss
-
+        # 모듈 레벨 JIT 함수 호출 (캐시 재사용으로 컴파일 오버헤드 제거)
         loss = _train_step_jit(self.model, self.optimizer, x_t, t_cond, noise, text_emb_3d)
         return loss, rng_key
     
