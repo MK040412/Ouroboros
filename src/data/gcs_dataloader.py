@@ -389,10 +389,17 @@ class EpochDataLoader:
                 # Keys 추출
                 keys = current_data['keys'][indices]
 
-                # Latents: (B, 4, 32, 32) -> (B, 32, 32, 4) NHWC
-                latents = current_data['latents'][indices]
+                # Latents: (B, 3, 4, 32, 32) -> 랜덤 crop 선택 -> (B, 4, 32, 32) -> (B, 32, 32, 4) NHWC
+                latents = current_data['latents'][indices]  # (B, 3, 4, 32, 32)
                 latents_np = latents.float().numpy()
-                latents_nhwc = np.transpose(latents_np, (0, 2, 3, 1))
+
+                # 3개 crop 중 랜덤 선택 (각 샘플마다 다른 crop)
+                batch_size = latents_np.shape[0]
+                crop_indices = rng.randint(0, 3, size=batch_size)
+                latents_selected = latents_np[np.arange(batch_size), crop_indices]  # (B, 4, 32, 32)
+
+                # NCHW -> NHWC
+                latents_nhwc = np.transpose(latents_selected, (0, 2, 3, 1))  # (B, 32, 32, 4)
 
                 # Captions 가져오기
                 captions = self.session.get_captions_for_keys(keys)
@@ -405,7 +412,14 @@ class EpochDataLoader:
                 self.embedding_pipeline.submit(step, captions)
 
             except Exception as e:
+                import traceback
                 print(f"Data preparation error at step {step}: {e}")
+                if step == 0:  # 첫 에러만 상세 출력
+                    traceback.print_exc()
+                    if current_data is not None:
+                        print(f"  Debug - latents type: {type(current_data['latents'])}")
+                        print(f"  Debug - latents shape: {current_data['latents'].shape}")
+                        print(f"  Debug - indices shape: {indices.shape}")
                 continue
 
         # 종료 신호
