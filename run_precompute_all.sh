@@ -55,15 +55,14 @@ done
 wait
 echo "  Code synced"
 
-# Google Gemma 라이브러리 설치 (기존 잘못된 패키지 제거 후 GitHub에서 설치)
+# Google Gemma 라이브러리 설치 (PyPI에서)
 echo -e "\n[Step 2.5] Installing Google Gemma library..."
-python3.11 -m pip uninstall -y gemma 2>/dev/null || true
-python3.11 -m pip install --user git+https://github.com/google-deepmind/gemma.git 2>&1 | tail -5
+python3.11 -m pip install --user --upgrade gemma 2>&1 | tail -5
 for WORKER_ID in $(seq 1 $((NUM_WORKERS - 1))); do
     gcloud compute tpus tpu-vm ssh "$INSTANCE" \
         --zone="$ZONE" \
         --worker="$WORKER_ID" \
-        --command="python3.11 -m pip uninstall -y gemma 2>/dev/null || true; python3.11 -m pip install --user git+https://github.com/google-deepmind/gemma.git 2>&1 | tail -3" &
+        --command="python3.11 -m pip install --user --upgrade gemma 2>&1 | tail -3" &
 done
 wait
 echo "  gemma installed"
