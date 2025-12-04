@@ -195,7 +195,12 @@ export PYTHONPATH="\$DEST_DIR/src:\$PYTHONPATH"
 
 # TPU lockfile 정리 (이전 프로세스 잔여물)
 sudo rm -f /tmp/libtpu_lockfile 2>/dev/null || true
-pkill -9 -f train_tpu_256.py 2>/dev/null || true
+# 이전 train 프로세스 정리 (현재 프로세스 제외)
+for pid in \$(pgrep -f "python.*train_tpu_256" 2>/dev/null || true); do
+  if [[ "\$pid" != "\$\$" ]] && [[ "\$pid" != "\$PPID" ]]; then
+    kill -9 "\$pid" 2>/dev/null || true
+  fi
+done
 
 echo "[Worker $WORKER_ID] Starting training..."
 echo "[Worker $WORKER_ID] JAX_COORDINATOR_ADDRESS=\$JAX_COORDINATOR_ADDRESS"
