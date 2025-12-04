@@ -381,7 +381,7 @@ def _train_step_jit(model, optimizer, x_t, t_cond, noise, text_emb):
         return jnp.mean((pred_noise - noise) ** 2)
 
     loss, grads = nnx.value_and_grad(loss_fn)(model)
-    optimizer.update(grads)
+    optimizer.update(model, grads)  # Flax 0.11.0+: model 인자 필수
     return loss
 
 
@@ -945,9 +945,9 @@ def main():
             print(f"  ✓ Model converted to bfloat16")
 
         print(f"  ✓ XUT-Small initialized")
-        print(f"    Dimension: 896")
-        print(f"    Context dim: 768")
-        print(f"    Depth: 4")
+        print(f"    Dimension: {config.model_dim}")
+        print(f"    Context dim: {config.context_dim}")
+        print(f"    Depth: {config.depth}")
         print(f"    dtype: {'bfloat16' if config.use_bfloat16 else 'float32'}")
         sys.stdout.flush()
     except Exception as e:
