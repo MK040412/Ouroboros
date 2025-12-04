@@ -55,6 +55,20 @@ class GCSFileHandler:
 
         Path(self.cache_dir).mkdir(parents=True, exist_ok=True)
 
+        # Parse bucket name and prefix from gs:// URL
+        # e.g., gs://rdy-tpu-data-2025/coyo11m-256px-ccrop-latent/
+        if self.gcs_bucket_url.startswith("gs://"):
+            parts = self.gcs_bucket_url[5:].rstrip('/').split('/', 1)
+            self.bucket_name = parts[0]
+            self.prefix = parts[1] + '/' if len(parts) > 1 else ''
+        else:
+            self.bucket_name = self.gcs_bucket_url
+            self.prefix = ''
+
+        # Initialize GCS client
+        self.client = storage.Client()
+        self.bucket = self.client.bucket(self.bucket_name)
+
     def _cleanup_old_cache_dirs(self):
         """이전 임시 캐시 디렉토리 정리 (gcs_cache_로 시작하는 랜덤 디렉토리들)"""
         try:
@@ -67,20 +81,6 @@ class GCSFileHandler:
                         shutil.rmtree(item, ignore_errors=True)
         except Exception as e:
             print(f"  Warning: Could not clean old caches: {e}")
-
-        # Parse bucket name and prefix from gs:// URL
-        # e.g., gs://rdy-tpu-data-2025/coyo11m-256px-ccrop-latent/
-        if gcs_bucket.startswith("gs://"):
-            parts = gcs_bucket[5:].rstrip('/').split('/', 1)
-            self.bucket_name = parts[0]
-            self.prefix = parts[1] + '/' if len(parts) > 1 else ''
-        else:
-            self.bucket_name = gcs_bucket
-            self.prefix = ''
-
-        # Initialize GCS client
-        self.client = storage.Client()
-        self.bucket = self.client.bucket(self.bucket_name)
 
     def download_file(self, gcs_path: str, local_path: Optional[str] = None) -> str:
         """GCS에서 파일 다운로드"""
