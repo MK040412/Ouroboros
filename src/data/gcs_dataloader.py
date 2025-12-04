@@ -7,10 +7,10 @@ GCS DataLoader with Async Embedding Pipeline for TPU Training
 3. 비동기 임베딩 계산 (CPU에서 미리 N개 배치 준비)
 4. Double buffering으로 TPU 학습과 데이터 로딩 오버랩
 
-GIL 최적화 (2024-12):
-- ProcessPoolExecutor로 torch.load 병렬화 (GIL 우회)
-- Lock-free 배치 버퍼 (atomic operations)
-- JAX 변환을 메인 스레드에서 일괄 처리
+3단계 비동기 파이프라인:
+- Layer 1: GCS Prefetch (ThreadPoolExecutor) - PT 파일 미리 다운로드
+- Layer 2: PT Loading (ThreadPoolExecutor) - torch.load 병렬 실행
+- Layer 3: Batch Sampling (ThreadPoolExecutor) - 랜덤 배치 샘플링
 """
 
 import os
@@ -19,17 +19,16 @@ import glob
 import queue
 import threading
 import tempfile
-import multiprocessing
+import warnings
 from pathlib import Path
 from typing import List, Optional, Tuple, Iterator, Any, Dict
 from dataclasses import dataclass
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, Future
+from concurrent.futures import ThreadPoolExecutor, Future
 from collections import deque
 import time
 
-# JAX 멀티스레드 환경에서 fork() deadlock 방지
-# spawn 방식은 새 Python 인터프리터를 시작하므로 안전
-_MP_CONTEXT = multiprocessing.get_context('spawn')
+# fork() 경고 억제 - torch.load 워커는 JAX 코드를 사용하지 않으므로 안전
+warnings.filterwarnings("ignore", message="os.fork\\(\\) was called")
 
 import numpy as np
 import jax.numpy as jnp
@@ -42,9 +41,9 @@ from google.cloud import storage
 # GIL-free PT Loading (Module-level for pickle)
 # ============================================
 def _load_pt_file_worker(local_path: str) -> dict:
-    """PT 파일 로드 (별도 프로세스에서 실행 - GIL 우회)
+    """PT 파일 로드 (별도 스레드에서 실행)
 
-    이 함수는 ProcessPoolExecutor에서 호출되므로 GIL 영향 없음.
+    torch.load는 C 확장이라 GIL 영향이 적음.
     """
     data = torch.load(local_path, map_location='cpu', weights_only=False)
 
@@ -584,11 +583,10 @@ class EpochDataLoader:
     """에포크 단위 데이터로더 (3단계 비동기 파이프라인)
 
     Layer 1: PT 파일 프리페치 (PTFilePrefetchManager)
-    Layer 2: PT 파일 로딩 (ProcessPoolExecutor - GIL 우회)
+    Layer 2: PT 파일 로딩 (ThreadPoolExecutor)
     Layer 3: 배치 샘플링 (ThreadPoolExecutor)
 
-    GIL 최적화:
-    - PT 로딩을 ProcessPoolExecutor로 실행 (torch.load GIL 우회)
+    최적화:
     - Lock-free 배치 버퍼 (deque + atomic counter)
     - NumPy 상태로 전달, JAX 변환은 메인 스레드에서 일괄 처리
     """
@@ -617,10 +615,10 @@ class EpochDataLoader:
             max_cache_files=session.max_cache_files
         )
 
-        # === Layer 2: PT 파일 로딩 (ProcessPoolExecutor - GIL 우회) ===
-        # ProcessPoolExecutor는 별도 프로세스에서 torch.load 실행
-        # mp_context='spawn'으로 JAX 멀티스레드 환경에서 fork() deadlock 방지
-        self.load_executor = ProcessPoolExecutor(max_workers=num_load_workers, mp_context=_MP_CONTEXT)
+        # === Layer 2: PT 파일 로딩 (ThreadPoolExecutor) ===
+        # Note: ProcessPoolExecutor + spawn은 TPU 환경에서 초기화 지연 문제 발생
+        # ThreadPoolExecutor 사용 - torch.load는 C 확장이라 GIL 영향 적음
+        self.load_executor = ThreadPoolExecutor(max_workers=num_load_workers)
         self.loaded_pt_queue: queue.Queue[Tuple[int, dict]] = queue.Queue(maxsize=num_load_workers + 1)
 
         # === Layer 3: 배치 샘플링 ===
@@ -683,7 +681,7 @@ class EpochDataLoader:
             self.combine_thread.start()
 
     def _load_loop(self):
-        """PT 파일 로딩 루프 (Layer 2) - ProcessPoolExecutor로 GIL 우회"""
+        """PT 파일 로딩 루프 (Layer 2)"""
         pt_files_needed = (self.steps_per_epoch // 50) + 2  # 필요한 PT 파일 수 추정
         files_submitted = 0
         files_completed = 0
@@ -692,7 +690,7 @@ class EpochDataLoader:
         pending_loads: Dict[int, Tuple[Future, str]] = {}
 
         while files_completed < pt_files_needed and not self.stop_event.is_set():
-            # 1. 새 로딩 작업 시작 (ProcessPoolExecutor - GIL 우회)
+            # 1. 새 로딩 작업 시작
             while len(pending_loads) < self.num_load_workers and files_submitted < pt_files_needed:
                 try:
                     idx, pt_path, local_path = self.prefetch_manager.get_next(timeout=5.0)
@@ -859,7 +857,7 @@ class EpochDataLoader:
             # Shape: (N, 3, 4, 32, 32) -> 랜덤 crop -> (B, 32, 32, 4) NHWC
             latents = pt_data['latents']
 
-            # numpy 배열인지 확인 (ProcessPoolExecutor에서 이미 변환됨)
+            # numpy 배열인지 확인 (_load_pt_file_worker에서 이미 변환됨)
             if isinstance(latents, torch.Tensor):
                 latents_np = latents.numpy()
             else:
