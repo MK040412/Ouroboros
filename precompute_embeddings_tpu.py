@@ -63,7 +63,7 @@ class TPUPrecomputeConfig:
 
 
 class FlaxEmbeddingModel:
-    """Flax BERT embedding model for TPU"""
+    """Flax BERT embedding model for TPU with pmap parallelization"""
 
     def __init__(self, model_name: str, max_length: int = 128):
         self.model_name = model_name
@@ -71,6 +71,8 @@ class FlaxEmbeddingModel:
         self.model = None
         self.tokenizer = None
         self.params = None
+        self.num_devices = jax.local_device_count()
+        self._encode_pmap = None
 
     def load(self):
         """Load model on TPU"""
@@ -79,45 +81,74 @@ class FlaxEmbeddingModel:
 
         from transformers import FlaxAutoModel, AutoTokenizer
 
-        print(f"Loading {self.model_name} for TPU...")
+        print(f"Loading {self.model_name} for TPU ({self.num_devices} devices)...")
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
         self.model = FlaxAutoModel.from_pretrained(self.model_name)
         print(f"  Model loaded (dim={self.model.config.hidden_size})")
 
-    @functools.partial(jax.jit, static_argnums=(0,))
-    def _encode_jit(self, input_ids, attention_mask):
-        """JIT-compiled encoding"""
-        outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
-        # Mean pooling
-        token_embeddings = outputs.last_hidden_state
-        mask_expanded = attention_mask[:, :, None].astype(jnp.float32)
-        sum_embeddings = jnp.sum(token_embeddings * mask_expanded, axis=1)
-        sum_mask = jnp.clip(mask_expanded.sum(axis=1), a_min=1e-9)
-        embeddings = sum_embeddings / sum_mask
-        # L2 normalize
-        norms = jnp.linalg.norm(embeddings, axis=1, keepdims=True)
-        embeddings = embeddings / jnp.maximum(norms, 1e-8)
-        return embeddings
+        # Create pmap function for parallel execution
+        def encode_fn(input_ids, attention_mask):
+            outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
+            # Mean pooling
+            token_embeddings = outputs.last_hidden_state
+            mask_expanded = attention_mask[:, :, None].astype(jnp.float32)
+            sum_embeddings = jnp.sum(token_embeddings * mask_expanded, axis=1)
+            sum_mask = jnp.clip(mask_expanded.sum(axis=1), a_min=1e-9)
+            embeddings = sum_embeddings / sum_mask
+            # L2 normalize
+            norms = jnp.linalg.norm(embeddings, axis=1, keepdims=True)
+            embeddings = embeddings / jnp.maximum(norms, 1e-8)
+            return embeddings
+
+        self._encode_pmap = jax.pmap(encode_fn)
+        print(f"  pmap ready for {self.num_devices} devices")
 
     def encode_batch(self, texts: List[str]) -> np.ndarray:
-        """Encode batch of texts"""
+        """Encode batch of texts using all TPU devices"""
         self.load()
 
         # Tokenize
         inputs = self.tokenizer(
             texts,
-            return_tensors="jax",
+            return_tensors="np",
             truncation=True,
             max_length=self.max_length,
             padding="max_length"
         )
 
-        # Encode on TPU
-        embeddings = self._encode_jit(inputs['input_ids'], inputs['attention_mask'])
-        return np.array(embeddings)
+        input_ids = inputs['input_ids']
+        attention_mask = inputs['attention_mask']
 
-    def encode_all(self, texts: List[str], batch_size: int = 4096) -> np.ndarray:
-        """Encode all texts in batches"""
+        batch_size = input_ids.shape[0]
+        per_device = batch_size // self.num_devices
+
+        # Pad to be divisible by num_devices
+        if batch_size % self.num_devices != 0:
+            pad_size = self.num_devices - (batch_size % self.num_devices)
+            input_ids = np.pad(input_ids, ((0, pad_size), (0, 0)), mode='constant')
+            attention_mask = np.pad(attention_mask, ((0, pad_size), (0, 0)), mode='constant')
+            per_device = input_ids.shape[0] // self.num_devices
+
+        # Reshape for pmap: (num_devices, per_device_batch, seq_len)
+        input_ids = input_ids.reshape(self.num_devices, per_device, -1)
+        attention_mask = attention_mask.reshape(self.num_devices, per_device, -1)
+
+        # Run on all devices in parallel
+        embeddings = self._encode_pmap(input_ids, attention_mask)
+
+        # Reshape back: (num_devices, per_device_batch, dim) -> (total_batch, dim)
+        embeddings = np.array(embeddings).reshape(-1, embeddings.shape[-1])
+
+        # Remove padding
+        if batch_size % self.num_devices != 0:
+            embeddings = embeddings[:batch_size]
+
+        return embeddings
+
+    def encode_all(self, texts: List[str], batch_size: int = 2048) -> np.ndarray:
+        """Encode all texts in batches using all TPU devices"""
+        # Adjust batch size to be divisible by num_devices
+        batch_size = (batch_size // self.num_devices) * self.num_devices
         all_embeddings = []
 
         for i in tqdm(range(0, len(texts), batch_size), desc="  TPU Encoding"):
