@@ -949,7 +949,8 @@ def main():
             optax.chain(
                 optax.clip_by_global_norm(1.0),
                 optax.adamw(learning_rate=config.learning_rate, weight_decay=1e-4)
-            )
+            ),
+            wrt=nnx.Param  # Flax 0.11.0+ requires wrt argument
         )
         print(f"  ✓ Optimizer created (AdamW + gradient clipping, lr={config.learning_rate})")
         sys.stdout.flush()

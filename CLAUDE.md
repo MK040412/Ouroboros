@@ -78,3 +78,4 @@ Test config in `tests/conftest.py`:
 
 - TPU v5e 
 - tpuv5litepod-16 environment
+- 112 vCPU
