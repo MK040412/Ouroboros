@@ -30,6 +30,7 @@ from typing import Dict, List, Optional, Tuple
 from google.cloud import storage
 from dataclasses import dataclass
 from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor, Future
 
 # JAX TPU mode
 import jax
@@ -48,7 +49,7 @@ class TPUPrecomputeConfig:
     """Pre-compute 설정 (분산)"""
     gcs_bucket: str = "rdy-tpu-data-2025"
     input_prefix: str = "coyo11m-256px-ccrop-latent/latents-3crop/"
-    output_prefix: str = "coyo11m-256px-ccrop-latent/latents-3crop-gemma/"
+    output_prefix: str = "coyo11m-256px-ccrop-latent/latents-3crop-gemma-3-270m/"
     parquet_path: str = "gs://rdy-tpu-data-2025/coyo11m-256px-ccrop-latent/coyo11m-meta.parquet"
 
     # Gemma-3 270M embedding
@@ -255,26 +256,19 @@ class TPUPrecomputePipeline:
 
         return remaining
 
-    def process_single_file(self, blob_path: str) -> bool:
-        """Process single PT file"""
+    def _download_file(self, blob_path: str) -> Optional[Tuple[str, dict, List[str]]]:
+        """Download and load PT file (for prefetch)"""
         filename = os.path.basename(blob_path)
         local_input = os.path.join(self.cache_dir, f"input_{filename}")
-        local_output = os.path.join(self.cache_dir, f"output_{filename}")
 
         try:
-            # Download
-            print(f"\n  [{filename}] Downloading...")
             blob = self.bucket.blob(blob_path)
             blob.download_to_filename(local_input)
 
-            # Load PT
-            print(f"  [{filename}] Loading PT...")
             data = torch.load(local_input, map_location='cpu')
             keys = data['keys'].numpy()
-            num_samples = len(keys)
-            print(f"  [{filename}] {num_samples:,} samples")
 
-            # Get captions (keys are row indices)
+            # Get captions
             captions = []
             for key in keys:
                 row_idx = int(key)
@@ -284,6 +278,38 @@ class TPUPrecomputePipeline:
                     caption = ""
                 captions.append(caption)
 
+            # Cleanup input file after loading
+            os.remove(local_input)
+
+            return (filename, data, captions)
+        except Exception as e:
+            print(f"  [{filename}] Download error: {e}")
+            if os.path.exists(local_input):
+                os.remove(local_input)
+            return None
+
+    def _upload_file(self, filename: str, local_output: str) -> bool:
+        """Upload file to GCS (for async upload)"""
+        try:
+            output_blob_path = self.config.output_prefix + filename
+            output_blob = self.bucket.blob(output_blob_path)
+            output_blob.upload_from_filename(local_output)
+            os.remove(local_output)
+            return True
+        except Exception as e:
+            print(f"  [{filename}] Upload error: {e}")
+            if os.path.exists(local_output):
+                os.remove(local_output)
+            return False
+
+    def _process_data(self, filename: str, data: dict, captions: List[str]) -> Optional[str]:
+        """Process data and save to local file"""
+        local_output = os.path.join(self.cache_dir, f"output_{filename}")
+
+        try:
+            num_samples = len(captions)
+            print(f"  [{filename}] {num_samples:,} samples")
+
             # Compute embeddings on TPU
             print(f"  [{filename}] Computing embeddings on TPU...")
             embeddings = self.embedder.encode_all(captions, batch_size=self.config.batch_size)
@@ -292,37 +318,23 @@ class TPUPrecomputePipeline:
             embeddings_bf16 = torch.from_numpy(embeddings).to(torch.bfloat16)
             data['embeddings'] = embeddings_bf16
 
-            print(f"  [{filename}] Saving...")
             torch.save(data, local_output)
-
-            # Upload
-            output_blob_path = self.config.output_prefix + filename
-            print(f"  [{filename}] Uploading...")
-            output_blob = self.bucket.blob(output_blob_path)
-            output_blob.upload_from_filename(local_output)
-
-            # Cleanup
-            os.remove(local_input)
-            os.remove(local_output)
-
-            print(f"  [{filename}] Done!")
-            return True
-
+            return local_output
         except Exception as e:
-            print(f"  [{filename}] Error: {e}")
+            print(f"  [{filename}] Process error: {e}")
             import traceback
             traceback.print_exc()
-            for f in [local_input, local_output]:
-                if os.path.exists(f):
-                    os.remove(f)
-            return False
+            if os.path.exists(local_output):
+                os.remove(local_output)
+            return None
 
     def run(self):
-        """Run pipeline"""
+        """Run pipeline with I/O prefetch and async upload"""
         print("=" * 60)
         print(f"TPU Pre-compute Embeddings (Worker {self.worker_id}/{self.config.num_workers})")
         print(f"JAX backend: {jax.default_backend()}")
         print(f"TPU devices: {jax.device_count()}")
+        print("Optimization: I/O Prefetch + Async Upload")
         print("=" * 60)
 
         self.load_parquet_metadata()
@@ -347,13 +359,62 @@ class TPUPrecomputePipeline:
         print("  JIT ready!")
 
         success, failed = 0, 0
-        for i, blob_path in enumerate(remaining):
-            print(f"\n--- Worker {self.worker_id}: File {i+1}/{len(remaining)} ---")
-            if self.process_single_file(blob_path):
-                success += 1
-            else:
-                failed += 1
-            gc.collect()
+
+        # Pipeline: Download N+1 | Process N | Upload N-1
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            prefetch_future: Optional[Future] = None
+            upload_future: Optional[Future] = None
+            current_data: Optional[Tuple[str, dict, List[str]]] = None
+
+            for i, blob_path in enumerate(remaining):
+                print(f"\n--- Worker {self.worker_id}: File {i+1}/{len(remaining)} ---")
+
+                # 1. Wait for prefetch (if any)
+                if prefetch_future is not None:
+                    current_data = prefetch_future.result()
+                else:
+                    # First file: download synchronously
+                    print(f"  [Downloading first file...]")
+                    current_data = self._download_file(blob_path)
+
+                # 2. Start prefetch for next file
+                if i + 1 < len(remaining):
+                    next_blob_path = remaining[i + 1]
+                    prefetch_future = executor.submit(self._download_file, next_blob_path)
+                else:
+                    prefetch_future = None
+
+                # 3. Wait for previous upload (if any)
+                if upload_future is not None:
+                    if upload_future.result():
+                        success += 1
+                    else:
+                        failed += 1
+
+                # 4. Process current file
+                if current_data is not None:
+                    filename, data, captions = current_data
+                    local_output = self._process_data(filename, data, captions)
+
+                    if local_output is not None:
+                        # 5. Start async upload
+                        upload_future = executor.submit(self._upload_file, filename, local_output)
+                        print(f"  [{filename}] Uploading in background...")
+                    else:
+                        failed += 1
+                        upload_future = None
+                else:
+                    failed += 1
+                    upload_future = None
+
+                gc.collect()
+
+            # Wait for last upload
+            if upload_future is not None:
+                if upload_future.result():
+                    success += 1
+                else:
+                    failed += 1
 
         print("\n" + "=" * 60)
         print(f"[Worker {self.worker_id}] Done: {success} success, {failed} failed")

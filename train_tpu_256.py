@@ -77,7 +77,7 @@ class TrainingConfig256:
     tread_selection_rate: float = 0.5  # 기존 연구 설정값
     
     # GCS 설정 (precomputed embeddings 포함)
-    gcs_bucket: str = "gs://rdy-tpu-data-2025/coyo11m-256px-ccrop-latent/latents-3crop-gemma/"
+    gcs_bucket: str = "gs://rdy-tpu-data-2025/coyo11m-256px-ccrop-latent/latents-3crop-gemma-3-270m/"
     parquet_file: str = None  # 자동으로 GCS에서 찾음
     cache_dir: str = None  # 자동으로 /tmp 사용
     num_data_workers: int = 8  # Prefetch workers (pre-computed embeddings이므로 적게 필요)
