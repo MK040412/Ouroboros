@@ -80,9 +80,11 @@ class TrainingConfig256:
     gcs_bucket: str = "gs://rdy-tpu-data-2025/coyo11m-256px-ccrop-latent/latents-3crop-gemma-3-270m/"
     parquet_file: str = None  # 자동으로 GCS에서 찾음
     cache_dir: str = None  # 자동으로 /tmp 사용
-    num_data_workers: int = 8  # Prefetch workers (pre-computed embeddings이므로 적게 필요)
-    prefetch_ahead: int = 4  # 미리 준비할 배치 수
-    max_cache_files: int = 2  # 최대 동시 캐시 PT 파일 (worker당 ~5.4GB)
+    num_data_workers: int = 56  # 배치 샘플링 병렬 워커 (112 vCPU의 절반)
+    prefetch_ahead: int = 4  # PT 파일 프리페치 개수
+    max_cache_files: int = 4  # 최대 동시 캐시 PT 파일 (worker당 ~2.7GB)
+    num_download_workers: int = 4  # GCS 다운로드 병렬 워커
+    num_load_workers: int = 4  # PT 파일 로딩 병렬 워커 (다운로드와 균형)
     
     # TPU 설정
     use_pjit: bool = True
@@ -911,7 +913,9 @@ def main():
         try:
             gcs_prefetch_loader = gcs_session.get_epoch_loader(
                 epoch=epoch,
-                steps_per_epoch=config.steps_per_epoch
+                steps_per_epoch=config.steps_per_epoch,
+                num_download_workers=config.num_download_workers,
+                num_load_workers=config.num_load_workers
             )
             print(f"  [E{epoch+1}b] ✓ Epoch loader ready")
             sys.stdout.flush()
