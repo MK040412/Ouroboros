@@ -85,7 +85,7 @@ class GemmaEmbeddingModel:
 
         # Load model and params
         self.model = gm.nn.Gemma3_270M()
-        self.params = gm.ckpts.load_params(gm.ckpts.CheckpointPath.GEMMA3_270M)
+        self.params = gm.ckpts.load_params(gm.ckpts.CheckpointPath.GEMMA3_270M_PT)
         self.tokenizer = gm.text.Gemma3Tokenizer()
 
         print(f"  Model loaded (hidden_dim={self.hidden_dim})")
