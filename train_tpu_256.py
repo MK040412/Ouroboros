@@ -360,8 +360,8 @@ class TPUTrainer:
         print(f"\n[Sharding Setup]")
         print(f"  Mesh shape: {self.mesh.shape}")
         print(f"  Axes: {self.mesh.axis_names}")
-        print(f"  Total devices: {self.mesh.shape[0]}")
-        print(f"  Data parallelism: {self.mesh.shape[0]}-way")
+        print(f"  Total devices: {self.mesh.shape['data']}")
+        print(f"  Data parallelism: {self.mesh.shape['data']}-way")
         
         # Learning rate schedule
         self.lr_schedule = self._create_lr_schedule()
