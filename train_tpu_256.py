@@ -920,7 +920,15 @@ def main():
     try:
         print(f"  Creating XUT-Small model...")
         sys.stdout.flush()
-        model = create_xut_small()
+        model = create_xut_small(
+            dim=config.model_dim,
+            ctx_dim=config.context_dim,
+            mlp_dim=config.mlp_dim,
+            heads=config.heads,
+            depth=config.depth,
+            enc_blocks=config.enc_blocks,
+            dec_blocks=config.dec_blocks,
+        )
 
         # bfloat16 변환 (메모리 절약 + TPU 최적화)
         if config.use_bfloat16:
