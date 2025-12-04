@@ -500,9 +500,10 @@ class TPUTrainer:
             ]
 
             # Global array 생성 (모든 host의 데이터가 합쳐짐)
+            # Shape: NCHW (batch, channels, height, width)
             global_batch_size = self.config.global_batch_size
             batch_latents = jax.make_array_from_single_device_arrays(
-                (global_batch_size, 32, 32, 4),
+                (global_batch_size, 4, 32, 32),  # NCHW
                 batch_sharding,
                 latent_arrays
             )
