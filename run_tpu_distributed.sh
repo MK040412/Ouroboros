@@ -81,7 +81,7 @@ run_local() {
   fi
 
   log "Starting training..."
-  python3 train_tpu_256.py 2>&1 | tee "/tmp/train_worker_${WORKER_ID}.log"
+  python3.11 train_tpu_256.py 2>&1 | tee "/tmp/train_worker_${WORKER_ID}.log"
 }
 
 # =============================================================================
@@ -186,10 +186,10 @@ fi
 
 echo "[Worker $WORKER_ID] Installing dependencies with pip (no venv)..."
 
-# 시스템 Python 직접 사용 (venv 없이)
-pip3 install --user -q jax[tpu] -f https://storage.googleapis.com/jax-releases/libtpu_releases.html 2>/dev/null || true
-pip3 install --user -q flax optax chex Pillow PyYAML wandb pyarrow torch transformers google-cloud-storage 2>/dev/null || true
-pip3 install --user -q git+https://github.com/google-deepmind/gemma.git 2>/dev/null || true
+# Python 3.11 사용
+python3.11 -m pip install --user -q jax[tpu] -f https://storage.googleapis.com/jax-releases/libtpu_releases.html 2>/dev/null || true
+python3.11 -m pip install --user -q flax optax chex Pillow PyYAML wandb pyarrow torch transformers google-cloud-storage 2>/dev/null || true
+python3.11 -m pip install --user -q git+https://github.com/google-deepmind/gemma.git 2>/dev/null || true
 
 # PYTHONPATH 설정
 export PYTHONPATH="\$DEST_DIR/src:\$PYTHONPATH"
@@ -207,7 +207,7 @@ echo "[Worker $WORKER_ID] Starting training..."
 echo "[Worker $WORKER_ID] JAX_COORDINATOR_ADDRESS=\$JAX_COORDINATOR_ADDRESS"
 echo "[Worker $WORKER_ID] JAX_PROCESS_INDEX=\$JAX_PROCESS_INDEX"
 
-python3 train_tpu_256.py 2>&1 | tee /tmp/train_worker_${WORKER_ID}.log
+python3.11 train_tpu_256.py 2>&1 | tee /tmp/train_worker_${WORKER_ID}.log
 EOF
 
     # 현재 worker인 경우 SSH 없이 직접 실행, 아니면 SSH로 실행

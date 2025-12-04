@@ -55,14 +55,15 @@ done
 wait
 echo "  Code synced"
 
-# Google Gemma 라이브러리 설치 (GitHub에서 직접 설치)
+# Google Gemma 라이브러리 설치 (기존 잘못된 패키지 제거 후 GitHub에서 설치)
 echo -e "\n[Step 2.5] Installing Google Gemma library..."
-pip3 install --user -q git+https://github.com/google-deepmind/gemma.git 2>/dev/null || true
+python3.11 -m pip uninstall -y gemma 2>/dev/null || true
+python3.11 -m pip install --user git+https://github.com/google-deepmind/gemma.git 2>&1 | tail -5
 for WORKER_ID in $(seq 1 $((NUM_WORKERS - 1))); do
     gcloud compute tpus tpu-vm ssh "$INSTANCE" \
         --zone="$ZONE" \
         --worker="$WORKER_ID" \
-        --command="pip3 install --user -q git+https://github.com/google-deepmind/gemma.git 2>/dev/null || true" &
+        --command="python3.11 -m pip uninstall -y gemma 2>/dev/null || true; python3.11 -m pip install --user git+https://github.com/google-deepmind/gemma.git 2>&1 | tail -3" &
 done
 wait
 echo "  gemma installed"
@@ -70,7 +71,7 @@ echo "  gemma installed"
 # Worker 0 시작
 echo -e "\n[Step 3] Starting Worker 0..."
 cd ~/ouroboros
-nohup bash -c "TPU_WORKER_ID=0 python3 -u precompute_embeddings_tpu.py" \
+nohup bash -c "TPU_WORKER_ID=0 python3.11 -u precompute_embeddings_tpu.py" \
     > /tmp/precompute_worker_0.log 2>&1 &
 WORKER0_PID=$!
 echo "  Worker 0 started (PID: $WORKER0_PID)"
@@ -84,7 +85,7 @@ for WORKER_ID in $(seq 1 $((NUM_WORKERS - 1))); do
     gcloud compute tpus tpu-vm ssh "$INSTANCE" \
         --zone="$ZONE" \
         --worker="$WORKER_ID" \
-        --command="cd ~/ouroboros && nohup bash -c 'TPU_WORKER_ID=$WORKER_ID python3 -u precompute_embeddings_tpu.py' > /tmp/precompute_worker_$WORKER_ID.log 2>&1 &" &
+        --command="cd ~/ouroboros && nohup bash -c 'TPU_WORKER_ID=$WORKER_ID python3.11 -u precompute_embeddings_tpu.py' > /tmp/precompute_worker_$WORKER_ID.log 2>&1 &" &
 done
 wait
 
