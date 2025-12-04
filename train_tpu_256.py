@@ -57,7 +57,8 @@ class TrainingConfig256:
     # 학습
     num_epochs: int = 20
     steps_per_epoch: Optional[int] = None  # None이면 데이터셋에서 자동 계산
-    learning_rate: float = 0.5          # muP base_dim=1
+    learning_rate: float = 0.5          # muP base learning rate
+    mup_base_dim: int = 1                # muP base dimension for scaling
     warmup_steps: int = 1000
     
     # 모델 (XUT-Small)
@@ -435,16 +436,19 @@ class TPUTrainer:
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
     
     def _create_lr_schedule(self):
-        """Warmup + Cosine decay"""
+        """Warmup + Cosine decay with muP scaling"""
+        # muP scaled learning rate
+        mup_lr = self.config.learning_rate * (self.config.mup_base_dim / self.config.model_dim)
+
         def lr_fn(step):
             if step < self.config.warmup_steps:
-                return self.config.learning_rate * (step / self.config.warmup_steps)
+                return mup_lr * (step / self.config.warmup_steps)
             else:
                 progress = (step - self.config.warmup_steps) / (
                     self.config.steps_per_epoch * self.config.num_epochs - self.config.warmup_steps
                 )
-                return self.config.learning_rate * 0.5 * (1 + jnp.cos(jnp.pi * progress))
-        
+                return mup_lr * 0.5 * (1 + jnp.cos(jnp.pi * progress))
+
         return lr_fn
     
     @staticmethod
@@ -957,21 +961,25 @@ def main():
         sys.stdout.flush()
         return
     
-    # 옵티마이저 (AdamW with weight decay)
-    # Note: learning_rate는 train_step에서 동적으로 설정됨
+    # 옵티마이저 (AdamW with weight decay + muP scaling)
+    # muP: lr_scaled = base_lr * (base_dim / model_dim)
     print(f"\n[Step 10] Creating Optimizer...")
     sys.stdout.flush()
-    
+
     try:
+        # muP learning rate scaling
+        mup_lr = config.learning_rate * (config.mup_base_dim / config.model_dim)
+        print(f"  muP scaling: {config.learning_rate} * ({config.mup_base_dim}/{config.model_dim}) = {mup_lr:.6f}")
+
         optimizer = nnx.Optimizer(
             model,
             optax.chain(
                 optax.clip_by_global_norm(1.0),
-                optax.adamw(learning_rate=config.learning_rate, weight_decay=1e-4)
+                optax.adamw(learning_rate=mup_lr, weight_decay=1e-4)
             ),
             wrt=nnx.Param  # Flax 0.11.0+ requires wrt argument
         )
-        print(f"  ✓ Optimizer created (AdamW + gradient clipping, lr={config.learning_rate})")
+        print(f"  ✓ Optimizer created (AdamW + gradient clipping, lr={mup_lr:.6f})")
         sys.stdout.flush()
     except Exception as e:
         print(f"  ✗ Failed to create optimizer: {e}")
