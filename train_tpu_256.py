@@ -86,7 +86,7 @@ class TrainingConfig256:
     cache_dir: str = None  # 자동으로 /tmp 사용
     num_data_workers: int = 56  # 배치 샘플링 병렬 워커 (112 vCPU의 절반)
     prefetch_ahead: int = 4  # PT 파일 프리페치 개수
-    max_cache_files: int = 8  # 최대 동시 캐시 PT 파일 (prefetch + 여유분)
+    max_cache_files: int = 16  # 최대 동시 캐시 PT 파일 (prefetch_ahead * 2 + num_load_workers)
     num_download_workers: int = 16  # GCS 다운로드 병렬 워커 (대역폭 활용 극대화)
     num_load_workers: int = 4  # PT 파일 로딩 병렬 워커 (다운로드와 균형)
     
@@ -516,6 +516,9 @@ class TPUTrainer:
                 if hasattr(x, 'value'):
                     x = x.value
                 if isinstance(x, jnp.ndarray):
+                    # PRNGKey 타입은 특별 처리 필요
+                    if hasattr(x, 'dtype') and jax.dtypes.issubdtype(x.dtype, jax.dtypes.prng_key):
+                        return np.array(jax.random.key_data(x))
                     return np.array(x)
                 return x
 
