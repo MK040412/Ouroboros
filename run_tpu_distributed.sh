@@ -139,28 +139,34 @@ export JAX_LOCAL_DEVICE_COUNT=${CHIPS_PER_WORKER}
 export TPU_CHIPS_PER_HOST_BOUNDS="2,2,1"
 export TPU_HOST_BOUNDS="2,2,1"
 
-cd ~/ouroboros
+DEST_DIR=~/ouroboros
+REMOTE_URL="$REMOTE_URL"
 
-# Git pull
-git fetch origin $BRANCH
-git checkout $BRANCH
-git pull --ff-only origin $BRANCH 2>/dev/null || true
+echo "[Worker $WORKER_ID] Setting up repository..."
 
-# venv 설정
-if [[ ! -d ".venv" ]]; then
-  python3 -m venv .venv
+# Git clone or pull
+if [[ -d "\$DEST_DIR/.git" ]]; then
+  echo "[Worker $WORKER_ID] Existing repo found, pulling..."
+  cd "\$DEST_DIR"
+  git fetch origin $BRANCH
+  git checkout $BRANCH
+  git pull --ff-only origin $BRANCH 2>/dev/null || git reset --hard origin/$BRANCH
+else
+  echo "[Worker $WORKER_ID] Cloning repo..."
+  rm -rf "\$DEST_DIR"
+  git clone "\$REMOTE_URL" "\$DEST_DIR"
+  cd "\$DEST_DIR"
+  git checkout $BRANCH
 fi
-source .venv/bin/activate
 
-# 의존성 설치 (필요시)
-if [[ -f "requirements.txt" ]]; then
-  pip install -q -r requirements.txt 2>/dev/null || true
-fi
+echo "[Worker $WORKER_ID] Installing dependencies with pip (no venv)..."
 
-# uv가 있으면 사용
-if command -v uv >/dev/null 2>&1; then
-  uv sync 2>/dev/null || true
-fi
+# 시스템 Python 직접 사용 (venv 없이)
+pip3 install --user -q jax[tpu] -f https://storage.googleapis.com/jax-releases/libtpu_releases.html 2>/dev/null || true
+pip3 install --user -q flax optax chex Pillow PyYAML wandb pyarrow torch 2>/dev/null || true
+
+# PYTHONPATH 설정
+export PYTHONPATH="\$DEST_DIR/src:\$PYTHONPATH"
 
 echo "[Worker $WORKER_ID] Starting training..."
 echo "[Worker $WORKER_ID] JAX_COORDINATOR_ADDRESS=\$JAX_COORDINATOR_ADDRESS"
