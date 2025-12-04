@@ -142,6 +142,12 @@ export TPU_HOST_BOUNDS="2,2,1"
 DEST_DIR=~/ouroboros
 REMOTE_URL="$REMOTE_URL"
 
+echo "[Worker $WORKER_ID] Killing previous training processes..."
+# 이전 학습 프로세스 정리 (coordinator 충돌 방지)
+pkill -9 -f "train_tpu_256.py" 2>/dev/null || true
+pkill -9 -f "python3.*train" 2>/dev/null || true
+sleep 2
+
 echo "[Worker $WORKER_ID] Setting up repository..."
 
 # Git clone or pull
@@ -181,9 +187,9 @@ EOF
       --worker="$WORKER_ID" \
       --command="bash -lc '${WORKER_CMD}'" &
 
-    # 약간의 딜레이 (coordinator가 먼저 시작하도록)
+    # Worker 0 (coordinator)가 먼저 시작하도록 충분한 딜레이
     if [[ $WORKER_ID -eq 0 ]]; then
-      sleep 5
+      sleep 10
     fi
   done
 
