@@ -161,6 +161,28 @@ class GCSFileHandler:
         self._download_locks: Dict[str, threading.Lock] = {}
         self._locks_lock = threading.Lock()
 
+        # 파일 참조 카운터 (사용 중인 파일 보호)
+        self._file_refcount: Dict[str, int] = {}
+        self._refcount_lock = threading.Lock()
+
+    def acquire_file(self, filename: str):
+        """파일 사용 시작 (refcount++)"""
+        with self._refcount_lock:
+            self._file_refcount[filename] = self._file_refcount.get(filename, 0) + 1
+
+    def release_file(self, filename: str):
+        """파일 사용 완료 (refcount--)"""
+        with self._refcount_lock:
+            if filename in self._file_refcount:
+                self._file_refcount[filename] -= 1
+                if self._file_refcount[filename] <= 0:
+                    del self._file_refcount[filename]
+
+    def is_file_in_use(self, filename: str) -> bool:
+        """파일이 사용 중인지 확인"""
+        with self._refcount_lock:
+            return self._file_refcount.get(filename, 0) > 0
+
     def _cleanup_old_cache_dirs(self):
         """이전 임시 캐시 디렉토리 및 고아 임시 파일 정리"""
         try:
@@ -468,6 +490,8 @@ class PTFilePrefetchManager:
             if file_size >= MIN_PT_FILE_SIZE:
                 print(f"  [Prefetch] {filename} already cached ({file_size // (1024*1024)}MB)")
                 sys.stdout.flush()
+                # 참조 획득 (Layer 2에서 사용될 때까지 삭제 방지)
+                self.gcs_handler.acquire_file(filename)
                 return local_path
             else:
                 print(f"  [Prefetch] {filename} corrupted (only {file_size} bytes), re-downloading...")
@@ -480,6 +504,8 @@ class PTFilePrefetchManager:
         final_size = os.path.getsize(result)
         print(f"  [Prefetch] Downloaded {filename} ({final_size // (1024*1024)}MB)")
         sys.stdout.flush()
+        # 참조 획득 (Layer 2에서 사용될 때까지 삭제 방지)
+        self.gcs_handler.acquire_file(filename)
         return result
 
     def _get_protected_files(self) -> set:
@@ -522,8 +548,14 @@ class PTFilePrefetchManager:
                     break
 
                 filename = os.path.basename(f)
+
+                # 1. 참조 카운터 확인 (Layer 2에서 사용 중인 파일)
+                if self.gcs_handler.is_file_in_use(filename):
+                    continue
+
+                # 2. 기존 보호 로직 (다운로드 중, 완료 대기 중, prefetch 범위)
                 if filename in protected:
-                    continue  # 사용 중인 파일은 건너뜀
+                    continue
 
                 try:
                     os.remove(f)
@@ -720,6 +752,30 @@ class GCSDataLoaderSession:
             captions.append(caption)
         return captions
 
+    @property
+    def total_samples(self) -> int:
+        """전체 샘플 수 반환 (parquet 메타데이터 기준)"""
+        if self.parquet_cache and self.parquet_cache.key_to_caption:
+            return len(self.parquet_cache.key_to_caption)
+        return 0
+
+    def calculate_steps_per_epoch(self, global_batch_size: int) -> int:
+        """에포크당 스텝 수 계산
+
+        Args:
+            global_batch_size: 전체 배치 크기 (모든 worker 합산)
+
+        Returns:
+            steps_per_epoch: 에포크당 스텝 수
+        """
+        total = self.total_samples
+        if total == 0:
+            raise ValueError("Cannot calculate steps: no samples found in parquet metadata")
+
+        steps = total // global_batch_size
+        print(f"  Calculated steps_per_epoch: {total:,} samples / {global_batch_size} batch = {steps:,} steps")
+        return steps
+
     def get_epoch_loader(self, epoch: int, steps_per_epoch: int,
                          use_precomputed: bool = True,
                          num_download_workers: int = 4,
@@ -870,8 +926,8 @@ class EpochDataLoader:
         files_submitted = 0
         files_completed = 0
 
-        # 진행 중인 로딩 작업 (idx -> (future, local_path))
-        pending_loads: Dict[int, Tuple[Future, str]] = {}
+        # 진행 중인 로딩 작업 (idx -> (future, local_path, filename))
+        pending_loads: Dict[int, Tuple[Future, str, str]] = {}
 
         while files_completed < pt_files_needed and not self.stop_event.is_set():
             # 1. 새 로딩 작업 시작
@@ -880,11 +936,12 @@ class EpochDataLoader:
                     print(f"  [LoadLoop] Waiting for prefetch (submitted={files_submitted})...")
                     sys.stdout.flush()
                     idx, pt_path, local_path = self.prefetch_manager.get_next(timeout=5.0)
-                    print(f"  [LoadLoop] Got {os.path.basename(local_path)}, submitting load...")
+                    filename = os.path.basename(local_path)
+                    print(f"  [LoadLoop] Got {filename}, submitting load...")
                     sys.stdout.flush()
                     # 모듈 레벨 함수 사용 (pickle 가능)
                     future = self.load_executor.submit(_load_pt_file_worker, local_path)
-                    pending_loads[idx] = (future, local_path)
+                    pending_loads[idx] = (future, local_path, filename)
                     files_submitted += 1
                 except queue.Empty:
                     print(f"  [LoadLoop] Prefetch queue empty, waiting...")
@@ -893,7 +950,7 @@ class EpochDataLoader:
 
             # 2. 완료된 로딩 수집 및 큐에 전달
             completed_indices = []
-            for idx, (future, local_path) in pending_loads.items():
+            for idx, (future, local_path, filename) in pending_loads.items():
                 if future.done():
                     try:
                         pt_data = future.result(timeout=1.0)
@@ -904,6 +961,9 @@ class EpochDataLoader:
                         print(f"[Load] Error loading {local_path}: {e}")
                         completed_indices.append(idx)
                         files_completed += 1
+                    finally:
+                        # 로딩 완료 (성공/실패 무관) - 파일 참조 해제
+                        self.session.gcs_handler.release_file(filename)
 
             for idx in completed_indices:
                 del pending_loads[idx]
@@ -913,12 +973,15 @@ class EpochDataLoader:
                 time.sleep(0.001)
 
         # 남은 작업 완료 대기
-        for idx, (future, local_path) in pending_loads.items():
+        for idx, (future, local_path, filename) in pending_loads.items():
             try:
                 pt_data = future.result(timeout=120.0)
                 self.loaded_pt_queue.put((idx, pt_data), timeout=30.0)
             except Exception as e:
                 print(f"[Load] Final error loading {local_path}: {e}")
+            finally:
+                # 로딩 완료 - 파일 참조 해제
+                self.session.gcs_handler.release_file(filename)
 
         # 종료 신호
         try:
