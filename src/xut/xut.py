@@ -163,20 +163,20 @@ class XUTBackBone(nnx.Module):
                 rngs=rngs,
             )
 
-        # Flax NNX 0.12.0+: tuple 대신 list 사용 (pytree 호환성)
-        self.enc_stacks = [
-            [mk_block(ctx_dim) for _ in range(enc_list[i])]
+        # Flax NNX 0.12.0+: nnx.List 사용 (pytree 호환성)
+        self.enc_stacks = nnx.List([
+            nnx.List([mk_block(ctx_dim) for _ in range(enc_list[i])])
             for i in range(depth)
-        ]
+        ])
 
-        self.dec_stacks = [
-            [
+        self.dec_stacks = nnx.List([
+            nnx.List([
                 mk_block(dim, ctx_from_self=True) if bid == 0
                 else mk_block(ctx_dim if dec_ctx else None)
                 for bid in range(dec_list[i])
-            ]
+            ])
             for i in range(depth)
-        ]
+        ])
 
     def __call__(
         self,
