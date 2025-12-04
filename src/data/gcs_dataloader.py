@@ -428,13 +428,16 @@ class EpochDataLoader:
     def _combine_batches(self):
         """Latent와 임베딩 결합"""
         completed = 0
+        first_batch = True
 
         while completed < self.steps_per_epoch:
             if self.stop_event.is_set():
                 break
 
             try:
-                result = self.embedding_pipeline.get_result(timeout=60.0)
+                # 첫 배치는 모델 로딩 시간 고려해서 timeout 길게
+                timeout = 300.0 if first_batch else 60.0
+                result = self.embedding_pipeline.get_result(timeout=timeout)
                 if result is None:
                     continue
 
@@ -442,22 +445,30 @@ class EpochDataLoader:
                 if batch_idx < 0:  # 종료 신호
                     break
 
+                first_batch = False
+
                 # Latent 버퍼에서 가져오기
                 with self.buffer_lock:
                     if batch_idx in self.latent_buffer:
                         latents = self.latent_buffer.pop(batch_idx)
                     else:
+                        print(f"  Warning: batch_idx {batch_idx} not in latent_buffer")
                         continue
 
                 # 최종 배치 큐에 추가
                 self.batch_queue.put((latents, embeddings), timeout=30)
                 completed += 1
 
+                if completed == 1:
+                    print(f"  ✓ First batch ready (embedding shape: {embeddings.shape})")
+
             except queue.Empty:
-                print(f"Combine timeout at batch {completed}")
+                print(f"Combine timeout at batch {completed} (waited {timeout}s)")
                 break
             except Exception as e:
                 print(f"Combine error: {e}")
+                import traceback
+                traceback.print_exc()
                 continue
 
         # 종료 신호
@@ -469,7 +480,9 @@ class EpochDataLoader:
 
         while batch_count < self.steps_per_epoch:
             try:
-                batch = self.batch_queue.get(timeout=120)
+                # 첫 배치는 모델 로딩 + PT 다운로드 시간 고려
+                timeout = 600 if batch_count == 0 else 120
+                batch = self.batch_queue.get(timeout=timeout)
 
                 if batch is None:
                     break
@@ -479,7 +492,7 @@ class EpochDataLoader:
                 batch_count += 1
 
             except queue.Empty:
-                print(f"Batch queue timeout at step {batch_count}")
+                print(f"Batch queue timeout at step {batch_count} (waited {timeout}s)")
                 break
 
     def stop(self):
