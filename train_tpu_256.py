@@ -410,30 +410,31 @@ class TPUTrainer:
         loss = jnp.mean((pred_noise - noise) ** 2)
         return loss
     
-    @nnx.jit
     def train_step(self, x_t, timesteps, noise, text_emb, step, rng_key):
         """한 스텝 학습 (Sharded + JIT 컴파일)
-        
+
         배치는 'data' 축으로 분산
         모델 파라미터는 'model' 축으로 분산
         """
-        # Learning rate 계산
-        lr = self.lr_schedule(step)
-        
         # TREAD: Timestep-Random Encoder Architecture Design
         batch_size = timesteps.shape[0]
         rng_key, subkey = jax.random.split(rng_key)
         mask = jax.random.uniform(subkey, (batch_size,)) < self.config.tread_selection_rate
         t_cond = jnp.where(mask, jnp.zeros_like(timesteps), timesteps)
-        
-        # Loss 및 gradient 계산 (Sharded execution)
-        loss, grads = nnx.value_and_grad(self.loss_fn)(
-            self.model, x_t, t_cond, noise, text_emb
-        )
-        
-        # 옵티마이저 업데이트
-        self.optimizer.update(grads)
-        
+
+        # JIT된 내부 함수로 gradient 계산 및 업데이트
+        # nnx.jit은 nnx.Module과 optimizer를 인자로 받아야 함
+        @nnx.jit
+        def _train_step_jit(model, optimizer, x_t, t_cond, noise, text_emb):
+            def loss_fn(model):
+                pred_noise = model(x_t, t_cond, text_emb)
+                return jnp.mean((pred_noise - noise) ** 2)
+
+            loss, grads = nnx.value_and_grad(loss_fn)(model)
+            optimizer.update(grads)
+            return loss
+
+        loss = _train_step_jit(self.model, self.optimizer, x_t, t_cond, noise, text_emb)
         return loss, rng_key
     
     def save_checkpoint(self, epoch: int, step: int, loss: float):
@@ -460,18 +461,54 @@ class TPUTrainer:
         losses = []
         rng_key = jax.random.PRNGKey(epoch)
         step = 0
-        
+
         # Sharding spec: 배치는 'data' 축, 나머지는 replica
         batch_sharding = self.sharding_rules.named_sharding(
             P(self.sharding_rules.data_axis, None, None, None),  # (B, 32, 32, 4)
             self.mesh
         )
-        
+        emb_sharding = self.sharding_rules.named_sharding(
+            P(self.sharding_rules.data_axis, None),  # (B, D)
+            self.mesh
+        )
+
+        # Local devices 정보
+        local_devices = jax.local_devices()
+        num_local_devices = len(local_devices)
+
         for batch_latents, batch_embeddings in prefetch_loader.get_batches():
-            batch_size = batch_latents.shape[0]
-            
-            # 배치를 분산 메모리에 배치
-            batch_latents = jax.device_put(batch_latents, batch_sharding)
+            local_batch_size = batch_latents.shape[0]
+            per_device_batch = local_batch_size // num_local_devices
+
+            # Multi-host: 각 worker의 local 데이터를 global array로 변환
+            # 각 local device에 데이터 조각 배치
+            latent_arrays = [
+                jax.device_put(
+                    batch_latents[i*per_device_batch:(i+1)*per_device_batch],
+                    d
+                ) for i, d in enumerate(local_devices)
+            ]
+            emb_arrays = [
+                jax.device_put(
+                    batch_embeddings[i*per_device_batch:(i+1)*per_device_batch],
+                    d
+                ) for i, d in enumerate(local_devices)
+            ]
+
+            # Global array 생성 (모든 host의 데이터가 합쳐짐)
+            global_batch_size = self.config.global_batch_size
+            batch_latents = jax.make_array_from_single_device_arrays(
+                (global_batch_size, 32, 32, 4),
+                batch_sharding,
+                latent_arrays
+            )
+            batch_embeddings = jax.make_array_from_single_device_arrays(
+                (global_batch_size, batch_embeddings.shape[1]),
+                emb_sharding,
+                emb_arrays
+            )
+
+            batch_size = global_batch_size
             
             # 타임스텝 샘플링
             rng_key, subkey = jax.random.split(rng_key)
@@ -727,8 +764,12 @@ def main():
         sys.stdout.flush()
         
         # GCS 데이터로더 세션 초기화
+        # 분산 학습: 각 worker는 local batch만 로드 (global / num_processes)
+        local_batch_size = config.global_batch_size // jax.process_count()
+        print(f"    Local batch size per worker: {local_batch_size} (global {config.global_batch_size} / {jax.process_count()} processes)")
+
         gcs_session = GCSDataLoaderSession(
-            batch_size=config.global_batch_size,
+            batch_size=local_batch_size,
             parquet_path=config.parquet_file or f"{config.gcs_bucket}coyo11m-meta.parquet",
             embedding_provider=embedding_provider,
             gcs_bucket=config.gcs_bucket,
