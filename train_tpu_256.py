@@ -26,6 +26,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import queue
 import threading
 import tempfile
+from datetime import datetime
+from google.cloud import storage
+import pickle
+import io
 
 from src.xut.xut_small import create_xut_small
 from src.embeddings import get_embedding_provider
@@ -78,7 +82,7 @@ class TrainingConfig256:
     
     # GCS 설정 (precomputed embeddings 포함)
     gcs_bucket: str = "gs://rdy-tpu-data-2025/coyo11m-256px-ccrop-latent/latents-3crop-gemma-3-270m/"
-    parquet_file: str = None  # 자동으로 GCS에서 찾음
+    parquet_file: str = "gs://rdy-tpu-data-2025/coyo11m-256px-ccrop-latent/coyo11m-meta.parquet"  # 메타데이터 파일
     cache_dir: str = None  # 자동으로 /tmp 사용
     num_data_workers: int = 56  # 배치 샘플링 병렬 워커 (112 vCPU의 절반)
     prefetch_ahead: int = 4  # PT 파일 프리페치 개수
@@ -89,10 +93,14 @@ class TrainingConfig256:
     # TPU 설정
     use_pjit: bool = True
     use_gradient_checkpointing: bool = True
-    
+
     # Wandb
     wandb_project: str = "xut-small-256"
     wandb_entity: str = None  # set to username
+
+    # GCS Checkpoint 설정
+    checkpoint_gcs_bucket: str = "rdy-tpu-data-2025"
+    checkpoint_gcs_prefix: str = "checkpoints/xut-small-256"  # gs://bucket/prefix/run_YYYYMMDD_HHMMSS/
 
 
 # ============================================
@@ -380,29 +388,51 @@ def _train_step_jit(model, optimizer, x_t, t_cond, noise, text_emb):
 class TPUTrainer:
     """TPU 분산 학습기 (Sharding 적용)"""
 
-    def __init__(self, model, optimizer, schedule, config: TrainingConfig256, wandb_enabled: bool = False):
+    def __init__(self, model, optimizer, schedule, config: TrainingConfig256,
+                 wandb_enabled: bool = False, run_id: str = None):
         self.model = model
         self.optimizer = optimizer
         self.schedule = schedule
         self.config = config
         self.wandb_enabled = wandb_enabled
-        
+
         # Sharding 설정
         self.sharding_rules = get_sharding_rules()
         self.mesh = self.sharding_rules.get_mesh()
-        
+
         print(f"\n[Sharding Setup]")
         print(f"  Mesh shape: {self.mesh.shape}")
         print(f"  Axes: {self.mesh.axis_names}")
         print(f"  Total devices: {self.mesh.shape['data']}")
         print(f"  Data parallelism: {self.mesh.shape['data']}-way")
-        
+
         # Learning rate schedule
         self.lr_schedule = self._create_lr_schedule()
-        
-        # Checkpoint 디렉토리
-        self.checkpoint_dir = Path("./checkpoints")
-        self.checkpoint_dir.mkdir(exist_ok=True)
+
+        # GCS Checkpoint 설정 (시간 기반 run ID)
+        if run_id is None:
+            run_id = datetime.now().strftime("run_%Y%m%d_%H%M%S")
+        self.run_id = run_id
+        self.gcs_checkpoint_path = f"{config.checkpoint_gcs_prefix}/{run_id}"
+
+        # GCS 클라이언트 초기화 (Process 0만 저장)
+        self.gcs_client = None
+        self.gcs_bucket = None
+        if jax.process_index() == 0:
+            try:
+                self.gcs_client = storage.Client()
+                self.gcs_bucket = self.gcs_client.bucket(config.checkpoint_gcs_bucket)
+                print(f"\n[GCS Checkpoint Setup]")
+                print(f"  Bucket: gs://{config.checkpoint_gcs_bucket}")
+                print(f"  Path: {self.gcs_checkpoint_path}/")
+                print(f"  Run ID: {run_id}")
+            except Exception as e:
+                print(f"  ⚠ GCS client init failed: {e}")
+                print(f"  Checkpoints will be saved locally only")
+
+        # 로컬 백업 디렉토리 (GCS 실패 시 사용)
+        self.checkpoint_dir = Path("./checkpoints") / run_id
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
     
     def _create_lr_schedule(self):
         """Warmup + Cosine decay"""
@@ -466,23 +496,78 @@ class TPUTrainer:
         return loss, rng_key
     
     def save_checkpoint(self, epoch: int, step: int, loss: float):
-        """체크포인트 저장"""
-        checkpoint_path = self.checkpoint_dir / f"epoch_{epoch:03d}_step_{step:06d}.ckpt"
+        """체크포인트를 GCS에 저장 (Process 0만)
+
+        저장 경로: gs://{bucket}/{prefix}/{run_id}/epoch_{epoch:03d}_step_{step:06d}.ckpt
+        """
+        # Process 0만 저장 (분산 학습에서 중복 저장 방지)
+        if jax.process_index() != 0:
+            return
+
+        checkpoint_name = f"epoch_{epoch:03d}_step_{step:06d}.ckpt"
+
         try:
-            # nnx를 사용하려면 모델이 nnx.Module이어야 함
-            # nnx.save(self.model, str(checkpoint_path))
-            # 임시로 간단한 메타데이터만 저장
+            # 모델 상태 추출 (nnx.Module -> state dict)
+            model_state = nnx.state(self.model)
+            optimizer_state = nnx.state(self.optimizer)
+
+            # JAX arrays -> numpy arrays (직렬화 가능하도록)
+            def to_numpy(x):
+                if hasattr(x, 'value'):
+                    x = x.value
+                if isinstance(x, jnp.ndarray):
+                    return np.array(x)
+                return x
+
+            model_state_np = jax.tree_util.tree_map(to_numpy, model_state)
+            optimizer_state_np = jax.tree_util.tree_map(to_numpy, optimizer_state)
+
             checkpoint_data = {
                 'epoch': epoch,
                 'step': step,
-                'loss': loss,
+                'loss': float(loss),
+                'model_state': model_state_np,
+                'optimizer_state': optimizer_state_np,
+                'config': {
+                    'model_dim': self.config.model_dim,
+                    'context_dim': self.config.context_dim,
+                    'depth': self.config.depth,
+                    'learning_rate': self.config.learning_rate,
+                },
+                'run_id': self.run_id,
+                'timestamp': datetime.now().isoformat(),
             }
-            import pickle
-            with open(checkpoint_path, 'wb') as f:
-                pickle.dump(checkpoint_data, f)
-            print(f"  ✓ Checkpoint saved: {checkpoint_path}")
+
+            # Pickle로 직렬화
+            buffer = io.BytesIO()
+            pickle.dump(checkpoint_data, buffer)
+            buffer.seek(0)
+            checkpoint_bytes = buffer.getvalue()
+
+            # GCS에 업로드
+            if self.gcs_bucket is not None:
+                gcs_path = f"{self.gcs_checkpoint_path}/{checkpoint_name}"
+                blob = self.gcs_bucket.blob(gcs_path)
+                blob.upload_from_string(checkpoint_bytes, content_type='application/octet-stream')
+                print(f"  ✓ Checkpoint saved to GCS: gs://{self.config.checkpoint_gcs_bucket}/{gcs_path}")
+
+                # Wandb에 GCS 경로 로깅
+                if self.wandb_enabled:
+                    wandb.log({
+                        "checkpoint_gcs_path": f"gs://{self.config.checkpoint_gcs_bucket}/{gcs_path}",
+                        "checkpoint_epoch": epoch,
+                    })
+            else:
+                # GCS 사용 불가 시 로컬 저장
+                local_path = self.checkpoint_dir / checkpoint_name
+                with open(local_path, 'wb') as f:
+                    f.write(checkpoint_bytes)
+                print(f"  ✓ Checkpoint saved locally: {local_path}")
+
         except Exception as e:
             print(f"  ✗ Failed to save checkpoint: {e}")
+            import traceback
+            traceback.print_exc()
     
     def train_epoch(self, prefetch_loader: 'PrefetchDataLoader', epoch: int):
         """에포크 학습 (Sharded prefetch 파이프라인)"""
