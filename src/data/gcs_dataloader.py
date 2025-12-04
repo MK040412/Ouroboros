@@ -36,10 +36,37 @@ class ParquetCache:
 class GCSFileHandler:
     """GCS 파일 다운로드 핸들러 (google-cloud-storage 사용)"""
 
-    def __init__(self, gcs_bucket: str, cache_dir: Optional[str] = None):
+    def __init__(self, gcs_bucket: str, cache_dir: Optional[str] = None,
+                 worker_id: Optional[int] = None, clean_old_caches: bool = True):
         self.gcs_bucket_url = gcs_bucket.rstrip('/')
-        self.cache_dir = cache_dir or tempfile.mkdtemp(prefix="gcs_cache_")
+
+        # 고정 캐시 디렉토리 사용 (worker별로 분리)
+        if cache_dir:
+            self.cache_dir = cache_dir
+        else:
+            # Worker ID 결정 (JAX process index 또는 환경변수)
+            if worker_id is None:
+                worker_id = int(os.environ.get('JAX_PROCESS_INDEX', '0'))
+            self.cache_dir = f"/tmp/gcs_cache_worker_{worker_id}"
+
+        # 이전 임시 캐시 디렉토리 정리 (시작 시 1회)
+        if clean_old_caches:
+            self._cleanup_old_cache_dirs()
+
         Path(self.cache_dir).mkdir(parents=True, exist_ok=True)
+
+    def _cleanup_old_cache_dirs(self):
+        """이전 임시 캐시 디렉토리 정리 (gcs_cache_로 시작하는 랜덤 디렉토리들)"""
+        try:
+            import shutil
+            for item in Path("/tmp").iterdir():
+                # gcs_cache_로 시작하지만 gcs_cache_worker_가 아닌 디렉토리 삭제
+                if item.is_dir() and item.name.startswith("gcs_cache_"):
+                    if not item.name.startswith("gcs_cache_worker_"):
+                        print(f"  Cleaning old cache dir: {item}")
+                        shutil.rmtree(item, ignore_errors=True)
+        except Exception as e:
+            print(f"  Warning: Could not clean old caches: {e}")
 
         # Parse bucket name and prefix from gs:// URL
         # e.g., gs://rdy-tpu-data-2025/coyo11m-256px-ccrop-latent/

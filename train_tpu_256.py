@@ -79,7 +79,7 @@ class TrainingConfig256:
     cache_dir: str = None  # 자동으로 /tmp 사용
     num_data_workers: int = 8  # Prefetch workers (pre-computed embeddings이므로 적게 필요)
     prefetch_ahead: int = 4  # 미리 준비할 배치 수
-    max_cache_files: int = 3  # 최대 동시 캐시 PT 파일
+    max_cache_files: int = 2  # 최대 동시 캐시 PT 파일 (worker당 ~5.4GB)
     
     # TPU 설정
     use_pjit: bool = True
