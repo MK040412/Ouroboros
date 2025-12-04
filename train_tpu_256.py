@@ -77,9 +77,9 @@ class TrainingConfig256:
     gcs_bucket: str = "gs://rdy-tpu-data-2025/coyo11m-256px-ccrop-latent/"
     parquet_file: str = None  # 자동으로 GCS에서 찾음
     cache_dir: str = None  # 자동으로 /tmp 사용
-    num_data_workers: int = 112  # CPU vCPU 수
-    prefetch_ahead: int = 3  # 미리 다운로드할 PT 파일 개수
-    max_cache_files: int = 3  # 최대 동시 캐시 PT 파일 (100GB VM에서 about 7GB 사용)
+    num_data_workers: int = 8  # Prefetch workers (pre-computed embeddings이므로 적게 필요)
+    prefetch_ahead: int = 4  # 미리 준비할 배치 수
+    max_cache_files: int = 3  # 최대 동시 캐시 PT 파일
     
     # TPU 설정
     use_pjit: bool = True
@@ -290,7 +290,7 @@ class PrefetchDataLoader:
                 batch = self.data_loader.get_batch(batch_idx, subkey)
                 self.prefetch_queue.put((batch_idx, batch), timeout=10)
             except Exception as e:
-                print(f"Prefetch error at batch {batch_idx} (worker {worker_id}): {e}")staticvariable11@t1v-n-8dff5040-w-0:~/ouroboros$ ./gcp_git_setup.sh
+                print(f"Prefetch error at batch {batch_idx} (worker {worker_id}): {e}")
                 break
             
             batch_idx += self.num_workers
@@ -672,14 +672,22 @@ def main():
     print("\n" + "="*60)
     print("[Step 7] Text Embedding Model Setup")
     print("="*60)
-    print(f"  Loading: {config.embedding_model}")
+    print(f"  Model: {config.embedding_model}")
+    print(f"  Dimension: {config.context_dim}")
+    print(f"  Strategy: Pre-computed embeddings (from PT files)")
     sys.stdout.flush()
-    
+
     try:
         print(f"  Initializing embedding provider...")
         sys.stdout.flush()
-        embedding_provider = get_embedding_provider(config.embedding_model)
-        print(f"  ✓ Text embedding provider loaded")
+        # Pre-computed embeddings 사용 (PT 파일에 포함)
+        # CPU 병목 제거!
+        embedding_provider = get_embedding_provider(
+            model_name=config.embedding_model,
+            use_precomputed=True,  # PT 파일의 pre-computed embeddings 사용
+            embedding_dim=config.context_dim
+        )
+        print(f"  ✓ Text embedding provider loaded (precomputed mode)")
         sys.stdout.flush()
     except Exception as e:
         print(f"  ✗ Failed to load embedding provider: {e}")
