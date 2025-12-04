@@ -138,15 +138,26 @@ class DiffusionSchedule:
 # ============================================
 @dataclass
 class ShardingRules:
-    """TPU Pod 16 분산 전략"""
+    """TPU Pod 16 분산 전략
+
+    TPU v5e-16 구성:
+    - 4 workers (hosts), 각 4개 TPU 칩
+    - 총 16 TPU 코어
+    - Data parallelism across all devices
+    """
     data_axis: str = "data"      # 데이터 병렬화 축
-    model_axis: str = "model"    # 모델 병렬화 축 (8칩)
-    
+
     def get_mesh(self):
-        """TPU Pod 16 메시 생성: (2, 8) = 2-way data parallel, 8-way model parallel"""
-        devices = mesh_utils.create_device_mesh((2, 8))  # 2 x 8 = 16 TPU
-        return Mesh(devices, (self.data_axis, self.model_axis))
-    
+        """TPU Pod 메시 생성 - 전체 device에 대해 data parallelism"""
+        # jax.devices()는 분산 모드에서 모든 프로세스의 device를 반환
+        all_devices = jax.devices()
+        num_devices = len(all_devices)
+        print(f"  Creating mesh with {num_devices} devices")
+
+        # 1D mesh for pure data parallelism (가장 안정적)
+        devices = mesh_utils.create_device_mesh((num_devices,))
+        return Mesh(devices, (self.data_axis,))
+
     def named_sharding(self, partition_spec, mesh):
         """PartitionSpec을 NamedSharding으로 변환"""
         return NamedSharding(mesh, partition_spec)
@@ -349,8 +360,8 @@ class TPUTrainer:
         print(f"\n[Sharding Setup]")
         print(f"  Mesh shape: {self.mesh.shape}")
         print(f"  Axes: {self.mesh.axis_names}")
-        print(f"  Data parallelism: 2-way (2 groups)")
-        print(f"  Model parallelism: 8-way (8 devices per group)")
+        print(f"  Total devices: {self.mesh.shape[0]}")
+        print(f"  Data parallelism: {self.mesh.shape[0]}-way")
         
         # Learning rate schedule
         self.lr_schedule = self._create_lr_schedule()
@@ -535,53 +546,67 @@ def main():
     print(f"\n[Step 1] Environment Check")
     logger.info("[Step 1] Environment Check starting...")
     sys.stdout.flush()
-    
-    try:
-        use_distributed = os.environ.get("JAX_COORDINATOR_ADDRESS") is not None or os.environ.get("GCLOUD_RUN_ENVIRONMENT") is not None
-        
-        print(f"  JAX_COORDINATOR_ADDRESS: {os.environ.get('JAX_COORDINATOR_ADDRESS', 'Not set')}")
-        print(f"  SLURM_PROCID: {os.environ.get('SLURM_PROCID', 'Not set')}")
-        print(f"  use_distributed: {use_distributed}")
-        
-        dev_count = len(jax.devices())
-        print(f"  Device count: {dev_count}")
-        logger.info(f"Device count: {dev_count}")
-        sys.stdout.flush()
-    except Exception as e:
-        logger.error(f"[Step 1] Error: {e}", exc_info=True)
-        print(f"  ERROR: {e}")
-        sys.stdout.flush()
-        raise
-    
+
+    # 환경변수 확인 (jax.devices() 호출 전에 분산 초기화 필요)
+    coordinator_addr = os.environ.get("JAX_COORDINATOR_ADDRESS")
+    num_processes = os.environ.get("JAX_NUM_PROCESSES")
+    process_idx = os.environ.get("JAX_PROCESS_INDEX")
+
+    print(f"  JAX_COORDINATOR_ADDRESS: {coordinator_addr or 'Not set'}")
+    print(f"  JAX_NUM_PROCESSES: {num_processes or 'Not set'}")
+    print(f"  JAX_PROCESS_INDEX: {process_idx or 'Not set'}")
+    sys.stdout.flush()
+
+    use_distributed = coordinator_addr is not None and num_processes is not None
+
     if use_distributed:
-        print(f"\n[Step 2] JAX distributed detected in environment")
-        print(f"  ⚠ WARNING: JAX_COORDINATOR_ADDRESS or GCLOUD_RUN_ENVIRONMENT is set")
-        print(f"  Attempting distributed initialization (30 second timeout)...")
+        print(f"\n[Step 2] JAX Distributed Initialization")
+        print(f"  Coordinator: {coordinator_addr}")
+        print(f"  Num processes: {num_processes}")
+        print(f"  This process index: {process_idx}")
         sys.stdout.flush()
-        logger.warning("Attempting JAX distributed init...")
-        
+        logger.info("Attempting JAX distributed init...")
+
         try:
-            # Set shorter timeout to prevent hanging
-            import os
-            os.environ['JAX_COORDINATION_SERVICE_TIMEOUT'] = '30'
-            
-            jax.distributed.initialize(timeout=30)
+            # 분산 초기화 (devices 조회 전에 반드시 수행)
+            jax.distributed.initialize(
+                coordinator_address=coordinator_addr,
+                num_processes=int(num_processes),
+                process_id=int(process_idx) if process_idx else None,
+            )
             process_index = jax.process_index()
             process_count = jax.process_count()
             local_device_count = jax.local_device_count()
             print(f"  ✓ Distributed Setup Success")
             print(f"    Process: {process_index}/{process_count}")
             print(f"    Local devices: {local_device_count}")
+            print(f"    Total devices: {jax.device_count()}")
             logger.info(f"Distributed init success: {process_index}/{process_count}")
         except Exception as e:
-            print(f"  ✗ Distributed init failed after 30s: {e}")
+            print(f"  ✗ Distributed init failed: {e}")
             print(f"  Falling back to single-host mode")
             logger.error(f"Distributed init failed: {e}", exc_info=True)
             use_distributed = False
+            process_index = 0
+            process_count = 1
         sys.stdout.flush()
     else:
         print(f"\n[Step 2] Single-Host Mode (no JAX distributed)")
         logger.info("Using single-host mode")
+        process_index = 0
+        process_count = 1
+
+    # 이제 devices 조회 가능
+    try:
+        dev_count = len(jax.devices())
+        print(f"  Device count: {dev_count}")
+        logger.info(f"Device count: {dev_count}")
+        sys.stdout.flush()
+    except Exception as e:
+        logger.error(f"[Step 1] Error getting devices: {e}", exc_info=True)
+        print(f"  ERROR: {e}")
+        sys.stdout.flush()
+        raise
     
     print(f"\n[Step 3] Creating TrainingConfig256...")
     sys.stdout.flush()
