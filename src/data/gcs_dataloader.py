@@ -19,12 +19,17 @@ import glob
 import queue
 import threading
 import tempfile
+import multiprocessing
 from pathlib import Path
 from typing import List, Optional, Tuple, Iterator, Any, Dict
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, Future
 from collections import deque
 import time
+
+# JAX 멀티스레드 환경에서 fork() deadlock 방지
+# spawn 방식은 새 Python 인터프리터를 시작하므로 안전
+_MP_CONTEXT = multiprocessing.get_context('spawn')
 
 import numpy as np
 import jax.numpy as jnp
@@ -614,7 +619,8 @@ class EpochDataLoader:
 
         # === Layer 2: PT 파일 로딩 (ProcessPoolExecutor - GIL 우회) ===
         # ProcessPoolExecutor는 별도 프로세스에서 torch.load 실행
-        self.load_executor = ProcessPoolExecutor(max_workers=num_load_workers)
+        # mp_context='spawn'으로 JAX 멀티스레드 환경에서 fork() deadlock 방지
+        self.load_executor = ProcessPoolExecutor(max_workers=num_load_workers, mp_context=_MP_CONTEXT)
         self.loaded_pt_queue: queue.Queue[Tuple[int, dict]] = queue.Queue(maxsize=num_load_workers + 1)
 
         # === Layer 3: 배치 샘플링 ===
