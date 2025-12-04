@@ -61,8 +61,15 @@ class GCSFileHandler:
             filename = os.path.basename(gcs_path)
             local_path = os.path.join(self.cache_dir, filename)
 
+        # 기존 파일이 있으면 크기 확인 (손상된 파일 감지)
         if os.path.exists(local_path):
-            return local_path
+            file_size = os.path.getsize(local_path)
+            if file_size > 1024:  # 1KB 이상이면 유효한 파일로 간주
+                return local_path
+            else:
+                # 손상된 파일 삭제
+                print(f"  Removing corrupted file: {local_path} (size={file_size})")
+                os.remove(local_path)
 
         # Parse blob name from gcs_path
         if gcs_path.startswith("gs://"):
@@ -71,11 +78,24 @@ class GCSFileHandler:
         else:
             blob_name = gcs_path
 
+        # 임시 파일로 다운로드 후 이동 (원자적 작업)
+        temp_path = local_path + ".tmp"
         try:
             blob = self.bucket.blob(blob_name)
-            blob.download_to_filename(local_path)
+            blob.download_to_filename(temp_path)
+
+            # 다운로드 성공 확인
+            if os.path.exists(temp_path) and os.path.getsize(temp_path) > 1024:
+                os.rename(temp_path, local_path)
+            else:
+                raise Exception(f"Downloaded file too small or missing: {temp_path}")
+
         except Exception as e:
             print(f"Warning: GCS download failed for {gcs_path}: {e}")
+            # 실패 시 임시 파일 삭제
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+            raise  # 에러 전파하여 호출자가 처리하도록
 
         return local_path
 
@@ -445,12 +465,4 @@ class EpochDataLoader:
                 batch_count += 1
 
             except queue.Empty:
-                print(f"Batch queue timeout at step {batch_count}")
-                break
-
-    def stop(self):
-        """로더 중지"""
-        self.stop_event.set()
-        self.embedding_pipeline.stop()
-        self.data_thread.join(timeout=5.0)
-        self.combine_thread.join(timeout=5.0)
+                print(f"Batch queue tim
