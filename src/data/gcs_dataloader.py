@@ -149,7 +149,8 @@ class PTFileLoader:
         Expected format:
         {
             'keys': tensor of shape (N,) - sample keys
-            'latents': tensor of shape (N, 4, 32, 32) - VAE latents
+            'latents': tensor of shape (N, 3, 4, 32, 32) - VAE latents (3 crops)
+            'embeddings': tensor of shape (N, 640) - Precomputed Gemma-3 270M embeddings (bfloat16)
         }
         """
         data = torch.load(pt_path, map_location='cpu')
@@ -158,6 +159,13 @@ class PTFileLoader:
             'keys': data['keys'].numpy() if isinstance(data['keys'], torch.Tensor) else np.array(data['keys']),
             'latents': data['latents'],  # Keep as torch tensor
         }
+
+        # Precomputed embeddings 로드 (bfloat16 -> float32)
+        if 'embeddings' in data:
+            embeddings = data['embeddings']
+            if embeddings.dtype == torch.bfloat16:
+                embeddings = embeddings.float()
+            result['embeddings'] = embeddings.numpy()
 
         return result
 
@@ -229,11 +237,13 @@ class AsyncEmbeddingPipeline:
 class GCSDataLoaderSession:
     """GCS 기반 데이터로더 세션
 
-    PT 파일 + Parquet caption + 실시간 임베딩 계산
+    PT 파일 + Parquet caption
+    - Precomputed mode: PT 파일의 embeddings 직접 사용 (embedding_provider=None 허용)
+    - Legacy mode: 실시간 임베딩 계산 (embedding_provider 필요)
     """
 
     def __init__(self, batch_size: int, parquet_path: str,
-                 embedding_provider: Any, gcs_bucket: str,
+                 embedding_provider: Any = None, gcs_bucket: str = "",
                  cache_dir: Optional[str] = None,
                  num_workers: int = 4,
                  prefetch_ahead: int = 4,
@@ -332,7 +342,8 @@ class GCSDataLoaderSession:
             captions.append(caption)
         return captions
 
-    def get_epoch_loader(self, epoch: int, steps_per_epoch: int) -> 'EpochDataLoader':
+    def get_epoch_loader(self, epoch: int, steps_per_epoch: int,
+                         use_precomputed: bool = True) -> 'EpochDataLoader':
         """에포크용 데이터로더 생성"""
         return EpochDataLoader(
             session=self,
@@ -340,7 +351,8 @@ class GCSDataLoaderSession:
             steps_per_epoch=steps_per_epoch,
             batch_size=self.batch_size,
             num_workers=self.num_workers,
-            prefetch_ahead=self.prefetch_ahead
+            prefetch_ahead=self.prefetch_ahead,
+            use_precomputed=use_precomputed
         )
 
     def shutdown(self):
@@ -354,31 +366,39 @@ class EpochDataLoader:
 
     def __init__(self, session: GCSDataLoaderSession, epoch: int,
                  steps_per_epoch: int, batch_size: int,
-                 num_workers: int = 4, prefetch_ahead: int = 4):
+                 num_workers: int = 4, prefetch_ahead: int = 4,
+                 use_precomputed: bool = True):
         self.session = session
         self.epoch = epoch
         self.steps_per_epoch = steps_per_epoch
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.prefetch_ahead = prefetch_ahead
+        self.use_precomputed = use_precomputed
 
         # 최종 배치 큐 (latents + embeddings)
         self.batch_queue = queue.Queue(maxsize=prefetch_ahead)
         self.stop_event = threading.Event()
 
-        # 비동기 임베딩 파이프라인
-        self.embedding_pipeline = AsyncEmbeddingPipeline(
-            session.embedding_provider,
-            num_prefetch=prefetch_ahead
-        )
+        # 비동기 임베딩 파이프라인 (precomputed mode에서는 불필요)
+        if not use_precomputed:
+            self.embedding_pipeline = AsyncEmbeddingPipeline(
+                session.embedding_provider,
+                num_prefetch=prefetch_ahead
+            )
+        else:
+            self.embedding_pipeline = None
 
         # 데이터 준비 스레드
         self.data_thread = threading.Thread(target=self._prepare_batches, daemon=True)
         self.data_thread.start()
 
-        # 임베딩 결합 스레드
-        self.combine_thread = threading.Thread(target=self._combine_batches, daemon=True)
-        self.combine_thread.start()
+        # 임베딩 결합 스레드 (precomputed mode에서는 불필요)
+        if not use_precomputed:
+            self.combine_thread = threading.Thread(target=self._combine_batches, daemon=True)
+            self.combine_thread.start()
+        else:
+            self.combine_thread = None
 
         # Latent 버퍼 (batch_idx -> latents)
         self.latent_buffer: Dict[int, np.ndarray] = {}
@@ -428,15 +448,19 @@ class EpochDataLoader:
                 # NCHW -> NHWC (모델이 NHWC 입력 사용)
                 latents_nhwc = np.transpose(latents_selected, (0, 2, 3, 1))  # (B, 32, 32, 4)
 
-                # Captions 가져오기
-                captions = self.session.get_captions_for_keys(keys)
-
-                # Latent 버퍼에 저장
-                with self.buffer_lock:
-                    self.latent_buffer[step] = latents_nhwc
-
-                # 임베딩 계산 요청 (비동기)
-                self.embedding_pipeline.submit(step, captions)
+                # Precomputed mode: PT 파일에서 임베딩 직접 사용
+                if self.use_precomputed and 'embeddings' in current_data:
+                    batch_embeddings = current_data['embeddings'][indices]
+                    put_timeout = 600 if step == 0 else 60
+                    self.batch_queue.put((latents_nhwc, batch_embeddings), timeout=put_timeout)
+                    if step == 0:
+                        print(f"  ✓ First batch ready (precomputed embeddings: {batch_embeddings.shape})")
+                else:
+                    # Legacy mode: 실시간 임베딩 계산
+                    captions = self.session.get_captions_for_keys(keys)
+                    with self.buffer_lock:
+                        self.latent_buffer[step] = latents_nhwc
+                    self.embedding_pipeline.submit(step, captions)
 
             except Exception as e:
                 import traceback
@@ -450,7 +474,10 @@ class EpochDataLoader:
                 continue
 
         # 종료 신호
-        self.embedding_pipeline.submit(-1, [])
+        if self.embedding_pipeline:
+            self.embedding_pipeline.submit(-1, [])
+        else:
+            self.batch_queue.put(None)
 
     def _combine_batches(self):
         """Latent와 임베딩 결합"""

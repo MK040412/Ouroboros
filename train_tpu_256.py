@@ -58,7 +58,7 @@ class TrainingConfig256:
     
     # 모델 (XUT-Small)
     model_dim: int = 896
-    context_dim: int = 768              # Embedding Gemma 300M dimension
+    context_dim: int = 640              # Gemma-3 270M dimension (precomputed)
     mlp_dim: int = 3072
     heads: int = 14
     depth: int = 4
@@ -71,13 +71,13 @@ class TrainingConfig256:
     T: int = 1000
     
     # Text embedding
-    embedding_model: str = "google/embeddinggemma-300m"  # 768d
+    embedding_model: str = "gemma-3-270m"  # 640d, precomputed
     
     # TREAD (Timestep-Random Encoder Architecture Design)
     tread_selection_rate: float = 0.5  # 기존 연구 설정값
     
-    # GCS 설정
-    gcs_bucket: str = "gs://rdy-tpu-data-2025/coyo11m-256px-ccrop-latent/"
+    # GCS 설정 (precomputed embeddings 포함)
+    gcs_bucket: str = "gs://rdy-tpu-data-2025/coyo11m-256px-ccrop-latent/latents-3crop-gemma/"
     parquet_file: str = None  # 자동으로 GCS에서 찾음
     cache_dir: str = None  # 자동으로 /tmp 사용
     num_data_workers: int = 8  # Prefetch workers (pre-computed embeddings이므로 적게 필요)
@@ -749,24 +749,15 @@ def main():
     print(f"  Strategy: Pre-computed embeddings (from PT files)")
     sys.stdout.flush()
 
-    try:
-        print(f"  Initializing embedding provider...")
-        sys.stdout.flush()
-        # Pre-computed embeddings 사용 (PT 파일에 포함)
-        # CPU 병목 제거!
-        embedding_provider = get_embedding_provider(
-            model_name=config.embedding_model,
-            use_precomputed=True,  # PT 파일의 pre-computed embeddings 사용
-            embedding_dim=config.context_dim
-        )
-        print(f"  ✓ Text embedding provider loaded (precomputed mode)")
-        sys.stdout.flush()
-    except Exception as e:
-        print(f"  ✗ Failed to load embedding provider: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.stdout.flush()
-        return
+    # Pre-computed embeddings 사용 (PT 파일에 포함)
+    # CPU 병목 제거! embedding_provider 불필요
+    embedding_provider = get_embedding_provider(
+        model_name=config.embedding_model,
+        use_precomputed=True,  # PT 파일의 pre-computed embeddings 사용
+        embedding_dim=config.context_dim
+    )
+    # embedding_provider is None in precomputed mode
+    sys.stdout.flush()
     
     # GCS 데이터 설정
     print("\n" + "="*60)
