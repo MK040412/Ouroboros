@@ -519,15 +519,26 @@ class TPUTrainer:
 def main():
     import sys
     import logging
-    
-    # 파일 + 콘솔 로깅 (core dump 시 추적 가능)
-    logging.basicConfig(
-        level=logging.DEBUG,
-        format='[%(asctime)s] %(levelname)s: %(message)s',
-        handlers=[
-            logging.FileHandler('/tmp/train_debug.log'),
+    import os as _os
+
+    # Worker별 고유 로그 파일 (권한 문제 방지)
+    worker_id = _os.environ.get('JAX_PROCESS_INDEX', '0')
+    log_file = f'/tmp/train_worker_{worker_id}.log'
+
+    # 파일 + 콘솔 로깅
+    try:
+        handlers = [
+            logging.FileHandler(log_file, mode='w'),
             logging.StreamHandler(sys.stdout)
         ]
+    except PermissionError:
+        # 파일 권한 오류 시 콘솔만 사용
+        handlers = [logging.StreamHandler(sys.stdout)]
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format='[%(asctime)s] %(levelname)s: %(message)s',
+        handlers=handlers
     )
     logger = logging.getLogger(__name__)
     
