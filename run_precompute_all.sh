@@ -55,17 +55,19 @@ done
 wait
 echo "  Code synced"
 
-# Google Gemma 라이브러리 설치 (PyPI에서)
-echo -e "\n[Step 2.5] Installing Google Gemma library..."
-python3.11 -m pip install --user --upgrade gemma 2>&1 | tail -5
+# Python 3.11 패키지 설치
+echo -e "\n[Step 2.5] Installing Python packages..."
+python3.11 -m pip install --user -q jax[tpu] -f https://storage.googleapis.com/jax-releases/libtpu_releases.html 2>/dev/null || true
+python3.11 -m pip install --user -q torch flax optax transformers google-cloud-storage tqdm 2>&1 | tail -3
+python3.11 -m pip install --user --upgrade gemma 2>&1 | tail -3
 for WORKER_ID in $(seq 1 $((NUM_WORKERS - 1))); do
     gcloud compute tpus tpu-vm ssh "$INSTANCE" \
         --zone="$ZONE" \
         --worker="$WORKER_ID" \
-        --command="python3.11 -m pip install --user --upgrade gemma 2>&1 | tail -3" &
+        --command="python3.11 -m pip install --user -q jax[tpu] -f https://storage.googleapis.com/jax-releases/libtpu_releases.html 2>/dev/null || true; python3.11 -m pip install --user -q torch flax optax transformers google-cloud-storage tqdm 2>&1 | tail -2; python3.11 -m pip install --user --upgrade gemma 2>&1 | tail -2" &
 done
 wait
-echo "  gemma installed"
+echo "  packages installed"
 
 # Worker 0 시작
 echo -e "\n[Step 3] Starting Worker 0..."
