@@ -43,13 +43,16 @@ from src.data.gcs_dataloader import (
 class TrainingConfig256:
     """256² 스테이지 학습 설정"""
     # 배치 및 데이터
-    global_batch_size: int = 2048      # 분할 안 함
+    global_batch_size: int = 1024      # OOM 방지: 2048 → 1024
     num_devices: int = 16              # TPU v5e pod size (또는 112 for TPU v5e 256)
-    batch_size_per_device: int = 128   # 2048 / 16 = 128
+    batch_size_per_device: int = 64    # OOM 방지: 128 → 64
+
+    # dtype (TPU bfloat16 최적화)
+    use_bfloat16: bool = True          # 메모리 절반 + TPU 최적화
     
     # 학습
     num_epochs: int = 20
-    steps_per_epoch: int = 3750         # 7.624M / 2048
+    steps_per_epoch: int = 7500         # 7.624M / 1024 (batch size 줄어서 2배)
     learning_rate: float = 0.5          # muP base_dim=1
     warmup_steps: int = 1000
     
@@ -114,7 +117,7 @@ class DiffusionSchedule:
     def forward_diffusion(self, x_0: jnp.ndarray, noise: jnp.ndarray, timesteps: jnp.ndarray) -> jnp.ndarray:
         """
         Forward diffusion: x_t = sqrt(alpha_cumprod_t) * x_0 + sqrt(1 - alpha_cumprod_t) * noise
-        
+
         Args:
             x_0: (B, 4, 32, 32) - 원본 VAE latent
             noise: (B, 4, 32, 32) - 노이즈
@@ -124,11 +127,15 @@ class DiffusionSchedule:
         """
         sqrt_alpha = self.sqrt_alphas_cumprod[timesteps]  # (B,)
         sqrt_one_minus_alpha = self.sqrt_one_minus_alphas_cumprod[timesteps]  # (B,)
-        
+
         # Reshape for broadcasting: (B,) -> (B, 1, 1, 1)
         sqrt_alpha = sqrt_alpha[:, None, None, None]
         sqrt_one_minus_alpha = sqrt_one_minus_alpha[:, None, None, None]
-        
+
+        # 입력 dtype에 맞춰 캐스팅 (bfloat16 지원)
+        sqrt_alpha = sqrt_alpha.astype(x_0.dtype)
+        sqrt_one_minus_alpha = sqrt_one_minus_alpha.astype(x_0.dtype)
+
         x_t = sqrt_alpha * x_0 + sqrt_one_minus_alpha * noise
         return x_t
 
@@ -522,9 +529,14 @@ class TPUTrainer:
             rng_key, subkey = jax.random.split(rng_key)
             timesteps = jax.random.randint(subkey, (batch_size,), 0, self.config.T)
             
-            # 노이즈 샘플링
+            # 노이즈 샘플링 (bfloat16 사용 시 변환)
             rng_key, subkey = jax.random.split(rng_key)
-            noise = jax.random.normal(subkey, batch_latents.shape, dtype=jnp.float32)
+            compute_dtype = jnp.bfloat16 if self.config.use_bfloat16 else jnp.float32
+            noise = jax.random.normal(subkey, batch_latents.shape, dtype=compute_dtype)
+
+            # 데이터도 동일 dtype으로 변환
+            batch_latents = batch_latents.astype(compute_dtype)
+            batch_embeddings = batch_embeddings.astype(compute_dtype)
             
             # Forward diffusion
             x_t = self.schedule.forward_diffusion(batch_latents, noise, timesteps)
@@ -808,11 +820,26 @@ def main():
         print(f"  Creating XUT-Small model...")
         sys.stdout.flush()
         model = create_xut_small()
+
+        # bfloat16 변환 (메모리 절약 + TPU 최적화)
+        if config.use_bfloat16:
+            print(f"  Converting model to bfloat16...")
+
+            def to_bf16(x):
+                if hasattr(x, 'dtype') and jnp.issubdtype(x.dtype, jnp.floating):
+                    return x.astype(jnp.bfloat16)
+                return x
+
+            for path, value in nnx.iter_graph(model):
+                if isinstance(value, nnx.Variable) and hasattr(value, 'value'):
+                    value.value = to_bf16(value.value)
+            print(f"  ✓ Model converted to bfloat16")
+
         print(f"  ✓ XUT-Small initialized")
         print(f"    Dimension: 896")
-        print(f"    Context dim: 640")
+        print(f"    Context dim: 768")
         print(f"    Depth: 4")
-        print(f"    Parameters: ~237M (XUT part) + ~270M (Gemma)")
+        print(f"    dtype: {'bfloat16' if config.use_bfloat16 else 'float32'}")
         sys.stdout.flush()
     except Exception as e:
         print(f"  ✗ Failed to create model: {e}")
