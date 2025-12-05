@@ -984,12 +984,17 @@ class EpochDataLoader:
             for idx, (future, local_path, filename) in pending_loads.items():
                 if future.done():
                     try:
-                        pt_data = future.result(timeout=1.0)
+                        pt_data = future.result(timeout=60.0)  # 3GB 로드에 충분한 시간
                         self.loaded_pt_queue.put((idx, pt_data), timeout=30.0)
                         files_completed += 1
                         completed_indices.append(idx)
                     except Exception as e:
-                        print(f"[Load] Error loading {local_path}: {e}")
+                        error_type = type(e).__name__
+                        error_msg = str(e) if str(e) else "(no message)"
+                        print(f"[Load] Error loading {local_path}: {error_type}: {error_msg}")
+                        import traceback
+                        traceback.print_exc()
+                        sys.stdout.flush()
                         completed_indices.append(idx)
                         files_completed += 1
                     finally:
@@ -1006,10 +1011,15 @@ class EpochDataLoader:
         # 남은 작업 완료 대기
         for idx, (future, local_path, filename) in pending_loads.items():
             try:
-                pt_data = future.result(timeout=120.0)
+                pt_data = future.result(timeout=300.0)  # 3GB 로드에 충분한 시간
                 self.loaded_pt_queue.put((idx, pt_data), timeout=30.0)
             except Exception as e:
-                print(f"[Load] Final error loading {local_path}: {e}")
+                error_type = type(e).__name__
+                error_msg = str(e) if str(e) else "(no message)"
+                print(f"[Load] Final error loading {local_path}: {error_type}: {error_msg}")
+                import traceback
+                traceback.print_exc()
+                sys.stdout.flush()
             finally:
                 # 로딩 완료 - 파일 참조 해제
                 self.session.gcs_handler.release_file(filename)
