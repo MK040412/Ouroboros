@@ -170,13 +170,30 @@ class GCSFileHandler:
         with self._refcount_lock:
             self._file_refcount[filename] = self._file_refcount.get(filename, 0) + 1
 
-    def release_file(self, filename: str):
-        """파일 사용 완료 (refcount--)"""
+    def release_file(self, filename: str, delete_immediately: bool = True):
+        """파일 사용 완료 (refcount--) 및 즉시 삭제
+
+        Args:
+            filename: 파일명
+            delete_immediately: True이면 refcount가 0이 될 때 즉시 삭제
+        """
+        should_delete = False
         with self._refcount_lock:
             if filename in self._file_refcount:
                 self._file_refcount[filename] -= 1
                 if self._file_refcount[filename] <= 0:
                     del self._file_refcount[filename]
+                    should_delete = delete_immediately
+
+        # 락 밖에서 파일 삭제 (I/O 블록킹 최소화)
+        if should_delete:
+            file_path = os.path.join(self.cache_dir, filename)
+            try:
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+                    print(f"  [Cache] Deleted completed file: {filename}")
+            except Exception as e:
+                pass  # 삭제 실패해도 계속 진행
 
     def is_file_in_use(self, filename: str) -> bool:
         """파일이 사용 중인지 확인"""

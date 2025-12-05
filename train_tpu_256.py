@@ -86,10 +86,10 @@ class TrainingConfig256:
     parquet_file: str = "gs://rdy-tpu-data-2025/coyo11m-256px-ccrop-latent/coyo11m-meta.parquet"  # 메타데이터 파일
     cache_dir: str = None  # 자동으로 /tmp 사용
     num_data_workers: int = 56  # 배치 샘플링 병렬 워커 (112 vCPU의 절반)
-    prefetch_ahead: int = 4  # PT 파일 프리페치 개수 (순차 다운로드 우선)
+    prefetch_ahead: int = 10  # PT 파일 프리페치 개수 (네트워크 최대 활용)
     max_cache_files: int = 12  # 최대 캐시 PT 파일 (47GB 디스크, 3GB/파일, 11GB 여유)
-    num_download_workers: int = 2  # GCS 다운로드 병렬 워커 (낮춰서 순차 우선)
-    num_load_workers: int = 2  # PT 파일 로딩 병렬 워커 (다운로드와 균형)
+    num_download_workers: int = 10  # GCS 다운로드 병렬 워커 (prefetch_ahead와 동일)
+    num_load_workers: int = 2  # PT 파일 로딩 워커 (CPU 바운드, 2개면 충분)
     
     # TPU 설정
     use_pjit: bool = True
