@@ -107,7 +107,6 @@ class TrainingConfig256:
     # GCS Checkpoint 설정
     checkpoint_gcs_bucket: str = "rdy-tpu-data-2025"
     checkpoint_gcs_prefix: str = "checkpoints/xut-small-256"  # gs://bucket/prefix/run_YYYYMMDD_HHMMSS/
-    checkpoint_every_n_steps: int = 500  # 스텝 단위 체크포인트 (Preemption 대비)
     checkpoint_keep_last_n: int = 3  # 최근 N개 체크포인트만 유지
 
 
@@ -226,26 +225,19 @@ class GracefulKiller:
 
     def _handle_signal(self, signum, frame):
         sig_name = "SIGTERM" if signum == signal.SIGTERM else "SIGINT"
-        print(f"\n{'='*60}")
-        print(f"[SIGNAL] Received {sig_name} - Saving emergency checkpoint...")
-        print(f"{'='*60}")
-        sys.stdout.flush()
+
+        # Worker 0만 메시지 출력
+        if jax.process_index() == 0:
+            print(f"\n{'='*60}")
+            print(f"[SIGNAL] Received {sig_name} - Preemption detected!")
+            print(f"{'='*60}")
+            print(f"  Current: epoch={self.current_epoch}, step={self.current_step}")
+            print(f"  Last checkpoint: epoch {self.current_epoch} start")
+            print(f"  Resume with: ./run_tpu_distributed.sh")
+            print(f"{'='*60}")
+            sys.stdout.flush()
 
         self.kill_now = True
-
-        # 긴급 체크포인트 저장
-        if self.trainer is not None:
-            try:
-                self.trainer.save_checkpoint(
-                    self.current_epoch,
-                    self.current_step,
-                    self.current_loss,
-                    emergency=True
-                )
-                print(f"  ✓ Emergency checkpoint saved")
-            except Exception as e:
-                print(f"  ✗ Emergency checkpoint failed: {e}")
-            sys.stdout.flush()
 
     def register_trainer(self, trainer, epoch, step, loss):
         """현재 학습 상태 등록 (주기적 호출)"""
@@ -680,23 +672,21 @@ class TPUTrainer:
         loss = _train_step_jit(self.model, self.optimizer, x_t, t_cond, velocity_target, text_emb_3d)
         return loss, rng_key
     
-    def save_checkpoint(self, epoch: int, step: int, loss: float, emergency: bool = False):
-        """체크포인트를 GCS에 저장 (Process 0만)
+    def save_checkpoint(self, epoch: int, step: int, loss: float):
+        """체크포인트를 GCS에 저장 (Process 0만, 에포크 단위)
 
-        저장 경로: gs://{bucket}/{prefix}/epoch_{epoch:03d}_step_{step:06d}.ckpt
+        저장 경로: gs://{bucket}/{prefix}/epoch_{epoch:03d}.ckpt
 
         Args:
             epoch: 현재 에포크
             step: 현재 스텝 (에포크 내)
             loss: 현재 loss 값
-            emergency: True면 긴급 체크포인트 (SIGTERM 등)
         """
         # Process 0만 저장 (분산 학습에서 중복 저장 방지)
         if jax.process_index() != 0:
             return
 
-        prefix = "emergency_" if emergency else ""
-        checkpoint_name = f"{prefix}epoch_{epoch:03d}_step_{step:06d}.ckpt"
+        checkpoint_name = f"epoch_{epoch:03d}.ckpt"
 
         try:
             # 모델 상태 추출 (nnx.Module -> state dict)
@@ -731,7 +721,6 @@ class TPUTrainer:
                 },
                 'run_id': self.run_id,
                 'timestamp': datetime.now().isoformat(),
-                'emergency': emergency,
             }
 
             # Pickle로 직렬화
@@ -745,19 +734,16 @@ class TPUTrainer:
                 gcs_path = f"{self.gcs_checkpoint_path}/{checkpoint_name}"
                 blob = self.gcs_bucket.blob(gcs_path)
                 blob.upload_from_string(checkpoint_bytes, content_type='application/octet-stream')
-                ckpt_type = "Emergency checkpoint" if emergency else "Checkpoint"
-                print(f"  ✓ {ckpt_type} saved: gs://{self.config.checkpoint_gcs_bucket}/{gcs_path}")
+                print(f"  ✓ Checkpoint saved: gs://{self.config.checkpoint_gcs_bucket}/{gcs_path}")
 
-                # 로테이션: 최근 N개만 유지 (emergency가 아닐 때만)
-                if not emergency:
-                    self._rotate_checkpoints()
+                # 로테이션: 최근 N개만 유지
+                self._rotate_checkpoints()
 
                 # Wandb에 GCS 경로 로깅
-                if self.wandb_enabled and not emergency:
+                if self.wandb_enabled:
                     wandb.log({
                         "checkpoint_gcs_path": f"gs://{self.config.checkpoint_gcs_bucket}/{gcs_path}",
                         "checkpoint_epoch": epoch,
-                        "checkpoint_step": step,
                     })
             else:
                 # GCS 사용 불가 시 로컬 저장
@@ -779,8 +765,7 @@ class TPUTrainer:
         try:
             # 체크포인트 목록 조회
             blobs = list(self.gcs_bucket.list_blobs(prefix=self.gcs_checkpoint_path + "/"))
-            # emergency가 아닌 일반 체크포인트만 필터
-            ckpt_blobs = [b for b in blobs if b.name.endswith('.ckpt') and 'emergency_' not in b.name]
+            ckpt_blobs = [b for b in blobs if b.name.endswith('.ckpt')]
 
             if len(ckpt_blobs) <= self.config.checkpoint_keep_last_n:
                 return
@@ -937,11 +922,6 @@ class TPUTrainer:
                 }, step=global_step)
 
             step += 1
-
-            # 스텝 단위 체크포인트 저장
-            if step % self.config.checkpoint_every_n_steps == 0:
-                avg_loss = np.mean(losses[-100:]) if len(losses) >= 100 else np.mean(losses)
-                self.save_checkpoint(epoch, step, avg_loss)
 
             if step % 100 == 0:
                 avg_loss = np.mean(losses[-100:])
@@ -1387,7 +1367,7 @@ def main():
     print(f"  PT files per epoch: {len(data_session.pt_files)}")
     print(f"  Steps per epoch: {config.steps_per_epoch:,} ({data_session.total_samples:,} samples / {config.global_batch_size} batch)")
     print(f"  Global batch size: {config.global_batch_size}")
-    print(f"  Checkpoint every: {config.checkpoint_every_n_steps} steps")
+    print(f"  Checkpoint: every epoch")
     print(f"  Data mode: {'RAM Preload (network I/O free)' if config.use_ram_preload else 'GCS Streaming'}")
     sys.stdout.flush()
 
