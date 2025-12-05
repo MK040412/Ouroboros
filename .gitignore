@@ -26,6 +26,7 @@ ENV/
 *.parquet
 decoded_output/
 checkpoints/
+checkpoint/
 *.pth
 *.safetensors
 captions_*.txt
