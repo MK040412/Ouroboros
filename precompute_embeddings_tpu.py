@@ -62,7 +62,7 @@ class TPUPrecomputeConfig:
     local_cache: str = "/tmp/precompute_cache_tpu"
 
     # 분산 설정
-    num_workers: int = 4  # TPU pod worker 수
+    num_workers: int = 8  # TPU pod worker 수
 
 
 class GemmaEmbeddingModel:

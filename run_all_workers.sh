@@ -7,7 +7,7 @@ set -euo pipefail
 
 ZONE="europe-west4-b"
 INSTANCE="ouroboros"
-NUM_WORKERS=4
+NUM_WORKERS=8
 
 # Coordinator IP (Worker 0 내부 IP)
 COORDINATOR_IP=$(hostname -I | awk '{print $1}')

@@ -2,11 +2,11 @@
 set -euo pipefail
 
 # =============================================================================
-# TPU v5e-16 (vtlitepod-16) 분산 학습 스크립트
+# TPU v5e-32 (vtlitepod-32) 분산 학습 스크립트
 # =============================================================================
-# TPU v5e-16 구성:
-#   - 4개 worker (호스트), 각 worker에 4개 TPU 칩
-#   - 총 16개 TPU 코어
+# TPU v5e-32 구성:
+#   - 8개 worker (호스트), 각 worker에 4개 TPU 칩
+#   - 총 32개 TPU 코어
 #   - worker 0이 coordinator 역할
 #
 # 사용법:
@@ -20,7 +20,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG_PREFIX="[tpu-dist]"
 
 # TPU Pod 설정
-NUM_WORKERS=4
+NUM_WORKERS=8
 CHIPS_PER_WORKER=4
 COORDINATOR_PORT=8476
 

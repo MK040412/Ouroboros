@@ -41,7 +41,7 @@ class DistributedConfig:
     batch_size: int = 256
 
     local_cache: str = "/tmp/precompute_distributed"
-    num_workers: int = 4
+    num_workers: int = 8
     num_threads: int = 28  # vCPU per worker (112 / 4)
 
 

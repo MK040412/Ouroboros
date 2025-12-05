@@ -2,12 +2,12 @@
 set -euo pipefail
 
 # =============================================================================
-# 4개 Worker에서 Pre-compute 분산 실행
+# 8개 Worker에서 Pre-compute 분산 실행
 # =============================================================================
 
 ZONE="europe-west4-b"
 INSTANCE="ouroboros"
-NUM_WORKERS=4
+NUM_WORKERS=8
 
 echo "=============================================="
 echo "Distributed Pre-compute Embeddings"
