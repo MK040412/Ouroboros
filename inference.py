@@ -17,6 +17,17 @@ import argparse
 from pathlib import Path
 from datetime import datetime
 
+# Patch jax.monitoring for older JAX versions (compatibility with orbax-checkpoint)
+import jax
+if not hasattr(jax, 'monitoring'):
+    class _DummyMonitoring:
+        @staticmethod
+        def record_scalar(*args, **kwargs):
+            pass
+    jax.monitoring = _DummyMonitoring()
+elif not hasattr(jax.monitoring, 'record_scalar'):
+    jax.monitoring.record_scalar = lambda *args, **kwargs: None
+
 import numpy as np
 
 
@@ -114,6 +125,60 @@ def download_latest_checkpoint(
         sys.exit(1)
 
 
+class FlaxStateContainer:
+    """Generic container for Flax NNX state objects with version compatibility"""
+
+    def __init__(self):
+        self.value = None
+        self._state = None
+
+    def __setstate__(self, state):
+        # Store the raw state
+        self._state = state
+        # Try to extract the actual value from various Flax versions
+        if isinstance(state, dict):
+            # Try different key names used in different Flax versions
+            self.value = (
+                state.get('raw_value') or
+                state.get('value') or
+                state.get('_value') or
+                state
+            )
+        else:
+            self.value = state
+
+
+class FlaxStateDict(dict):
+    """Dict subclass that handles Flax State unpickling"""
+
+    def __setstate__(self, state):
+        if isinstance(state, dict):
+            self.update(state)
+        elif isinstance(state, (list, tuple)):
+            # State might be saved as (dict_items,) or similar
+            for item in state:
+                if isinstance(item, dict):
+                    self.update(item)
+                elif isinstance(item, (list, tuple)) and len(item) == 2:
+                    self[item[0]] = item[1]
+
+
+class FlaxCompatUnpickler(pickle.Unpickler):
+    """Custom unpickler to handle Flax NNX version mismatches"""
+
+    def find_class(self, module, name):
+        # Handle ALL flax.nnx classes to avoid version mismatch issues
+        # This catches Variable, Param, BatchStat, Cache, State, and any other classes
+        if 'flax.nnx' in module or 'flax.linen' in module:
+            # State is a dict-like container
+            if name == 'State':
+                return FlaxStateDict
+            # All other classes get our compatible container
+            return FlaxStateContainer
+
+        return super().find_class(module, name)
+
+
 def load_checkpoint(ckpt_path: Path) -> dict:
     """Load checkpoint data from file
 
@@ -125,8 +190,9 @@ def load_checkpoint(ckpt_path: Path) -> dict:
     """
     print(f"[Checkpoint] Loading: {ckpt_path}")
 
+    # Use custom unpickler to handle Flax version mismatches
     with open(ckpt_path, 'rb') as f:
-        ckpt_data = pickle.load(f)
+        ckpt_data = FlaxCompatUnpickler(f).load()
 
     print(f"  Epoch: {ckpt_data.get('epoch', 'N/A')}")
     print(f"  Step: {ckpt_data.get('step', 'N/A')}")
@@ -184,13 +250,29 @@ def restore_model(model, ckpt_data: dict, use_bfloat16: bool = False):
 
     model_state = ckpt_data['model_state']
 
-    # Convert numpy to JAX arrays
+    # Convert to JAX arrays with proper dtype handling
     def to_jax(x):
+        # Handle FlaxStateContainer objects (from our custom unpickler)
+        if isinstance(x, FlaxStateContainer):
+            x = x.value
+        # Handle nnx.Variable objects
+        elif hasattr(x, 'value') and not isinstance(x, (np.ndarray, type(None))):
+            x = x.value
+        # Handle _state attribute
+        if hasattr(x, '_state') and x is not None:
+            x = x._state if hasattr(x, '_state') else x
+
+        # Handle numpy arrays
         if isinstance(x, np.ndarray):
             arr = jnp.array(x)
             if use_bfloat16 and jnp.issubdtype(arr.dtype, jnp.floating):
                 return arr.astype(jnp.bfloat16)
             return arr
+        # Handle JAX arrays
+        if hasattr(jnp, 'ndarray') and isinstance(x, jnp.ndarray):
+            if use_bfloat16 and jnp.issubdtype(x.dtype, jnp.floating):
+                return x.astype(jnp.bfloat16)
+            return x
         return x
 
     model_state_jax = jax.tree_util.tree_map(to_jax, model_state)
@@ -251,65 +333,28 @@ def get_text_embedding(text: str, embedding_dim: int = 640) -> np.ndarray:
         embedding = embedding / np.maximum(norm, 1e-8)
 
         print(f"  Embedding shape: {embedding.shape}")
+
+        # Save embedding to file for debugging
+        emb_file = "outputs/embedding_debug.txt"
+        os.makedirs("outputs", exist_ok=True)
+        with open(emb_file, 'w') as f:
+            f.write(f"Text: {text}\n")
+            f.write(f"Shape: {embedding.shape}\n")
+            f.write(f"Dtype: {embedding.dtype}\n")
+            f.write(f"Range: [{embedding.min():.6f}, {embedding.max():.6f}]\n")
+            f.write(f"Mean: {embedding.mean():.6f}\n")
+            f.write(f"Std: {embedding.std():.6f}\n")
+            f.write(f"L2 norm: {np.linalg.norm(embedding):.6f}\n")
+            f.write(f"\nFirst 20 values:\n{embedding[0, :20]}\n")
+            f.write(f"\nFull embedding:\n{embedding[0].tolist()}\n")
+        print(f"  Embedding saved to: {emb_file}")
+
         return embedding.astype(np.float32)
 
-    except ImportError:
-        print("[Warning] Gemma library not available, using random embedding")
+    except Exception as e:
+        print(f"[Warning] Gemma failed: {e}")
+        print("[Warning] Using random embedding as fallback")
         embedding = np.random.randn(1, embedding_dim).astype(np.float32)
-        norm = np.linalg.norm(embedding, axis=1, keepdims=True)
-        return embedding / np.maximum(norm, 1e-8)
-
-
-def get_text_embedding_transformers(text: str, model_name: str = "google/embeddinggemma-300m") -> np.ndarray:
-    """Get text embedding using transformers (fallback method)
-
-    Args:
-        text: Input text prompt
-        model_name: HuggingFace model name
-
-    Returns:
-        (1, D) numpy array of text embedding
-    """
-    try:
-        import torch
-        from transformers import AutoModel, AutoTokenizer
-
-        print(f"[Embedding] Loading {model_name}...")
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
-        model = AutoModel.from_pretrained(model_name)
-        model.eval()
-
-        # Tokenize
-        inputs = tokenizer(
-            [text],
-            return_tensors="pt",
-            truncation=True,
-            max_length=512,
-            padding=True
-        )
-
-        with torch.no_grad():
-            outputs = model(**inputs)
-
-            # Mean pooling
-            attention_mask = inputs['attention_mask']
-            token_embeddings = outputs.last_hidden_state
-
-            mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
-            sum_embeddings = torch.sum(token_embeddings * mask_expanded, dim=1)
-            sum_mask = torch.clamp(mask_expanded.sum(dim=1), min=1e-9)
-            embedding = (sum_embeddings / sum_mask).numpy()
-
-        # L2 normalize
-        norm = np.linalg.norm(embedding, axis=1, keepdims=True)
-        embedding = embedding / np.maximum(norm, 1e-8)
-
-        print(f"  Embedding shape: {embedding.shape}")
-        return embedding.astype(np.float32)
-
-    except ImportError:
-        print("[Warning] transformers not available, using random embedding")
-        embedding = np.random.randn(1, 768).astype(np.float32)
         norm = np.linalg.norm(embedding, axis=1, keepdims=True)
         return embedding / np.maximum(norm, 1e-8)
 
@@ -321,7 +366,7 @@ def sample_rectified_flow(
     model,
     text_embedding: np.ndarray,
     num_steps: int = 50,
-    cfg_scale: float = 7.5,
+    cfg_scale: float = 0.0,
     latent_shape: tuple = (1, 32, 32, 4),
     seed: int = None,
     device_type: str = 'cpu'
@@ -336,7 +381,7 @@ def sample_rectified_flow(
         model: XUDiT model
         text_embedding: (1, D) text embedding
         num_steps: Number of sampling steps
-        cfg_scale: Classifier-free guidance scale
+        cfg_scale: Classifier-free guidance scale (0 = conditional only, no CFG)
         latent_shape: Shape of latent (B, H, W, C)
         seed: Random seed
         device_type: 'gpu' or 'cpu'
@@ -350,8 +395,11 @@ def sample_rectified_flow(
     if seed is None:
         seed = int(datetime.now().timestamp()) % (2**31)
 
+    # CFG only needed when scale > 1
+    use_cfg = cfg_scale > 1.0
+
     print(f"\n[Sampling] Rectified Flow with {num_steps} steps")
-    print(f"  CFG scale: {cfg_scale}")
+    print(f"  CFG scale: {cfg_scale}" + (" (conditional only)" if not use_cfg else ""))
     print(f"  Seed: {seed}")
 
     # Start from pure noise (t=1)
@@ -359,11 +407,14 @@ def sample_rectified_flow(
     dtype = jnp.bfloat16 if device_type == 'gpu' else jnp.float32
     x = jax.random.normal(key, latent_shape, dtype=dtype)
 
+    print(f"  Initial noise range: [{float(x.min()):.2f}, {float(x.max()):.2f}]")
+
     # Text embedding: (1, D) -> (1, 1, D)
     text_emb = jnp.array(text_embedding[:, None, :], dtype=dtype)
 
-    # Null embedding for CFG
-    null_emb = jnp.zeros_like(text_emb)
+    # Null embedding for CFG (only if needed)
+    if use_cfg:
+        null_emb = jnp.zeros_like(text_emb)
 
     # Time steps from t=1 to t=0
     dt = 1.0 / num_steps
@@ -375,11 +426,14 @@ def sample_rectified_flow(
         # Conditional prediction
         v_cond = model(x, t_batch, ctx=text_emb, deterministic=True)
 
-        # Unconditional prediction (for CFG)
-        v_uncond = model(x, t_batch, ctx=null_emb, deterministic=True)
-
-        # CFG: v = v_uncond + cfg_scale * (v_cond - v_uncond)
-        v = v_uncond + cfg_scale * (v_cond - v_uncond)
+        if use_cfg:
+            # Unconditional prediction (for CFG)
+            v_uncond = model(x, t_batch, ctx=null_emb, deterministic=True)
+            # CFG: v = v_uncond + cfg_scale * (v_cond - v_uncond)
+            v = v_uncond + cfg_scale * (v_cond - v_uncond)
+        else:
+            # No CFG - use conditional prediction directly
+            v = v_cond
 
         # Transpose output from NCHW to NHWC if needed
         if v.shape[1] == 4 and v.shape[-1] != 4:  # NCHW format
@@ -389,9 +443,16 @@ def sample_rectified_flow(
         x = x - dt * v
 
         if (step + 1) % 10 == 0 or step == 0:
-            print(f"  Step {step + 1}/{num_steps}, t={t:.3f}")
+            x_min, x_max = float(x.min()), float(x.max())
+            print(f"  Step {step + 1}/{num_steps}, t={t:.3f}, x_range=[{x_min:.2f}, {x_max:.2f}]")
 
-    return np.array(x)
+    # Final stats
+    x_np = np.array(x)
+    print(f"\n  Final latent stats:")
+    print(f"    Range: [{x_np.min():.2f}, {x_np.max():.2f}]")
+    print(f"    Mean: {x_np.mean():.4f}, Std: {x_np.std():.4f}")
+
+    return x_np
 
 
 # ===========================================
@@ -411,9 +472,10 @@ def decode_latent_to_image(latent: np.ndarray, output_path: str = None):
     from diffusers import AutoencoderKL
     from PIL import Image
 
-    print("\n[Decode] Loading SDXL-VAE...")
+    # Force CPU to avoid OOM when JAX is using GPU
+    device = "cpu"
+    print(f"\n[Decode] Loading SDXL-VAE on {device}...")
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
     vae = AutoencoderKL.from_pretrained("stabilityai/sdxl-vae")
     vae.eval().to(device)
 
@@ -429,7 +491,7 @@ def decode_latent_to_image(latent: np.ndarray, output_path: str = None):
         decoded = vae.decode(latent_tensor).sample
 
     # Convert to image: (B, C, H, W) -> (H, W, C)
-    image = decoded[0].cpu().permute(1, 2, 0).numpy()
+    image = decoded[0].permute(1, 2, 0).numpy()
     image = np.clip((image + 1) / 2 * 255, 0, 255).astype(np.uint8)
 
     pil_image = Image.fromarray(image)
@@ -449,7 +511,7 @@ def run_inference(
     checkpoint_path: Path = None,
     output_dir: Path = Path("./outputs"),
     num_steps: int = 50,
-    cfg_scale: float = 7.5,
+    cfg_scale: float = 0.0,
     seed: int = None,
 ):
     """Run full inference pipeline
@@ -517,7 +579,7 @@ def interactive_mode(
     checkpoint_path: Path = None,
     output_dir: Path = Path("./outputs"),
     num_steps: int = 50,
-    cfg_scale: float = 7.5,
+    cfg_scale: float = 0.0,
 ):
     """Interactive mode for continuous image generation"""
     import jax
@@ -630,8 +692,8 @@ def main():
                         help='Output directory for generated images')
     parser.add_argument('--steps', '-s', type=int, default=50,
                         help='Number of sampling steps (default: 50)')
-    parser.add_argument('--cfg-scale', type=float, default=7.5,
-                        help='CFG guidance scale (default: 7.5)')
+    parser.add_argument('--cfg-scale', type=float, default=0.0,
+                        help='CFG guidance scale (0 = conditional only, no CFG)')
     parser.add_argument('--seed', type=int, default=None,
                         help='Random seed')
 

@@ -558,12 +558,13 @@ def _train_step_jit(model, optimizer, x_t, t, velocity_target, text_emb):
         x_t: (B, H, W, C) - interpolated sample (NHWC)
         t: (B,) 또는 (B, 1) - 시간 [0, 1] 범위
         velocity_target: (B, H, W, C) - velocity target v = x_1 - x_0 (NHWC)
-        text_emb: (B, 1, D) - text embeddings
+        text_emb: (B, 1, D) - text embeddings (CFG 드롭된 상태)
     """
     def loss_fn(model):
         # 모델 입력: NHWC, 출력: NCHW
         # 모델은 velocity를 예측
-        pred_v_nchw = model(x_t, t, text_emb)
+        # deterministic=False: TREAD 토큰 드롭아웃 활성화
+        pred_v_nchw = model(x_t, t, ctx=text_emb, deterministic=False)
         # NCHW -> NHWC for loss computation
         pred_v = jnp.transpose(pred_v_nchw, (0, 2, 3, 1))
         # MSE loss: ||v_pred - v_target||^2
@@ -675,18 +676,24 @@ class TPUTrainer:
             text_emb: (B, D) - text embeddings
             rng_key: JAX random key
         """
-        # TREAD: Timestep-Random Encoder Architecture Design
-        # t=0으로 마스킹하여 unconditional 학습
+        # CFG (Classifier-Free Guidance): text embedding 마스킹
+        # tread_selection_rate 확률로 text embedding을 0으로 마스킹 → unconditional 학습
+        # 참고: TREAD (token dropout)는 모델 내부에서 deterministic=False로 처리됨
         batch_size = t.shape[0]
         rng_key, subkey = jax.random.split(rng_key)
-        mask = jax.random.uniform(subkey, (batch_size,)) < self.config.tread_selection_rate
-        t_cond = jnp.where(mask, jnp.zeros_like(t), t)
+        cfg_mask = jax.random.uniform(subkey, (batch_size,)) < self.config.tread_selection_rate
 
         # text_emb: (batch, dim) → (batch, 1, dim) for sequence concatenation
         text_emb_3d = text_emb[:, None, :]
 
+        # CFG 드롭: mask가 True인 샘플은 text embedding을 0으로
+        text_emb_cond = jnp.where(cfg_mask[:, None, None], jnp.zeros_like(text_emb_3d), text_emb_3d)
+
         # 모듈 레벨 JIT 함수 호출
-        loss = _train_step_jit(self.model, self.optimizer, x_t, t_cond, velocity_target, text_emb_3d)
+        # - t: 원본 timestep (마스킹 없음)
+        # - text_emb_cond: CFG 드롭된 text embedding
+        # - deterministic=False: TREAD 토큰 드롭아웃 활성화 (_train_step_jit 내부)
+        loss = _train_step_jit(self.model, self.optimizer, x_t, t, velocity_target, text_emb_cond)
         return loss, rng_key
     
     def save_checkpoint(self, epoch: int, step: int, loss: float, is_step_checkpoint: bool = False):
