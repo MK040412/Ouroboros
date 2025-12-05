@@ -1309,3 +1309,361 @@ class EpochDataLoader:
             self.sample_thread.join(timeout=5.0)
         if self.combine_thread:
             self.combine_thread.join(timeout=5.0)
+
+
+# ============================================
+# RAM Preload Data Loader (네트워크 병목 제거)
+# ============================================
+
+class RAMPreloadSession:
+    """모든 PT 파일을 RAM에 프리로드하는 세션
+
+    시작 시 1회 다운로드 → RAM에 상주 → 학습 중 네트워크 I/O 제로
+
+    메모리 요구사항:
+    - 92개 PT 파일 / 4 workers = 23개/worker
+    - 23개 × 3GB = ~69GB/worker
+    - 150GB RAM에서 ~81GB 여유
+    """
+
+    def __init__(self, batch_size: int, gcs_bucket: str,
+                 parquet_path: str = None,
+                 num_download_workers: int = 8,
+                 shard_pt_files: bool = True):
+        """
+        Args:
+            batch_size: 배치 크기 (per worker)
+            gcs_bucket: GCS 버킷 URL (gs://...)
+            parquet_path: Parquet 메타데이터 경로 (optional)
+            num_download_workers: 병렬 다운로드 워커 수
+            shard_pt_files: True면 worker별로 PT 파일 분배
+        """
+        import sys
+
+        self.batch_size = batch_size
+        self.num_download_workers = num_download_workers
+
+        # Worker 정보
+        self.process_index = int(os.environ.get('JAX_PROCESS_INDEX', '0'))
+        self.num_processes = int(os.environ.get('JAX_NUM_PROCESSES', '1'))
+
+        print(f"\n[RAMPreload] Initializing (Worker {self.process_index}/{self.num_processes})")
+        sys.stdout.flush()
+
+        # GCS 핸들러 (임시 캐시 디렉토리)
+        self.gcs_handler = GCSFileHandler(
+            gcs_bucket,
+            cache_dir=f"/tmp/ram_preload_worker_{self.process_index}",
+            clean_old_caches=True
+        )
+
+        # 전체 PT 파일 목록
+        all_pt_files = self.gcs_handler.list_pt_files()
+        print(f"[RAMPreload] Found {len(all_pt_files)} total PT files")
+        sys.stdout.flush()
+
+        # Worker별 PT 파일 샤딩
+        if shard_pt_files and self.num_processes > 1:
+            self.pt_files = [f for i, f in enumerate(all_pt_files)
+                           if i % self.num_processes == self.process_index]
+            print(f"[RAMPreload] Worker {self.process_index}: {len(self.pt_files)} PT files (sharded)")
+        else:
+            self.pt_files = all_pt_files
+
+        # === RAM 데이터 저장소 ===
+        # 모든 PT 파일의 데이터를 메모리에 저장
+        self.ram_data: Dict[str, dict] = {}  # filename -> {keys, latents, embeddings}
+
+        # 통합 인덱스 (빠른 랜덤 샘플링용)
+        self.all_latents: Optional[np.ndarray] = None  # (N_total, 3, 4, 32, 32)
+        self.all_embeddings: Optional[np.ndarray] = None  # (N_total, embed_dim)
+        self.total_samples = 0
+
+        # 프리로드 실행
+        self._preload_all_pt_files()
+
+    def _preload_all_pt_files(self):
+        """모든 PT 파일을 RAM에 로드"""
+        import sys
+
+        print(f"\n[RAMPreload] === Starting Preload ===")
+        print(f"[RAMPreload] Files to load: {len(self.pt_files)}")
+        print(f"[RAMPreload] Estimated memory: {len(self.pt_files) * 3:.1f} GB")
+        sys.stdout.flush()
+
+        start_time = time.time()
+
+        # 1단계: 병렬 다운로드
+        print(f"\n[RAMPreload] Phase 1: Downloading from GCS...")
+        sys.stdout.flush()
+
+        local_paths = []
+        with ThreadPoolExecutor(max_workers=self.num_download_workers) as executor:
+            futures = {}
+            for pt_path in self.pt_files:
+                future = executor.submit(self._download_pt_file, pt_path)
+                futures[future] = pt_path
+
+            for i, future in enumerate(as_completed(futures)):
+                pt_path = futures[future]
+                try:
+                    local_path = future.result()
+                    local_paths.append((pt_path, local_path))
+                    if (i + 1) % 5 == 0 or i == len(self.pt_files) - 1:
+                        print(f"  Downloaded {i+1}/{len(self.pt_files)}: {os.path.basename(pt_path)}")
+                        sys.stdout.flush()
+                except Exception as e:
+                    print(f"  ✗ Failed to download {pt_path}: {e}")
+                    sys.stdout.flush()
+
+        download_time = time.time() - start_time
+        print(f"[RAMPreload] Download complete in {download_time:.1f}s")
+        sys.stdout.flush()
+
+        # 2단계: 메모리 로드
+        print(f"\n[RAMPreload] Phase 2: Loading into RAM...")
+        sys.stdout.flush()
+
+        load_start = time.time()
+        all_latents_list = []
+        all_embeddings_list = []
+
+        for i, (pt_path, local_path) in enumerate(local_paths):
+            try:
+                data = _load_pt_file_worker(local_path)
+                filename = os.path.basename(pt_path)
+
+                # 유효한 샘플만 필터링 (NaN 임베딩 제외)
+                if 'embeddings' in data:
+                    valid_mask = ~np.isnan(data['embeddings']).any(axis=1)
+                    num_valid = valid_mask.sum()
+
+                    if num_valid > 0:
+                        all_latents_list.append(data['latents'][valid_mask])
+                        all_embeddings_list.append(data['embeddings'][valid_mask])
+                        self.total_samples += num_valid
+
+                # 로컬 파일 삭제 (RAM에 로드 완료)
+                try:
+                    os.remove(local_path)
+                except:
+                    pass
+
+                if (i + 1) % 5 == 0 or i == len(local_paths) - 1:
+                    mem_gb = self.total_samples * 3 * 4 * 32 * 32 * 4 / (1024**3)  # float32 기준
+                    print(f"  Loaded {i+1}/{len(local_paths)}: {self.total_samples:,} samples (~{mem_gb:.1f}GB)")
+                    sys.stdout.flush()
+
+            except Exception as e:
+                print(f"  ✗ Failed to load {local_path}: {e}")
+                import traceback
+                traceback.print_exc()
+                sys.stdout.flush()
+
+        # 3단계: 배열 통합
+        print(f"\n[RAMPreload] Phase 3: Consolidating arrays...")
+        sys.stdout.flush()
+
+        if all_latents_list:
+            self.all_latents = np.concatenate(all_latents_list, axis=0)
+            self.all_embeddings = np.concatenate(all_embeddings_list, axis=0)
+
+            # 메모리 해제
+            del all_latents_list
+            del all_embeddings_list
+            gc.collect()
+
+        total_time = time.time() - start_time
+        latent_mem = self.all_latents.nbytes / (1024**3) if self.all_latents is not None else 0
+        embed_mem = self.all_embeddings.nbytes / (1024**3) if self.all_embeddings is not None else 0
+
+        print(f"\n[RAMPreload] === Preload Complete ===")
+        print(f"  Total samples: {self.total_samples:,}")
+        print(f"  Latents shape: {self.all_latents.shape if self.all_latents is not None else 'None'}")
+        print(f"  Embeddings shape: {self.all_embeddings.shape if self.all_embeddings is not None else 'None'}")
+        print(f"  Memory usage: {latent_mem:.2f}GB (latents) + {embed_mem:.2f}GB (embeddings) = {latent_mem + embed_mem:.2f}GB")
+        print(f"  Total time: {total_time:.1f}s ({download_time:.1f}s download + {total_time - download_time:.1f}s load)")
+        sys.stdout.flush()
+
+    def _download_pt_file(self, gcs_path: str) -> str:
+        """단일 PT 파일 다운로드"""
+        filename = os.path.basename(gcs_path)
+        local_path = os.path.join(self.gcs_handler.cache_dir, filename)
+        return self.gcs_handler.download_file(gcs_path, local_path)
+
+    def calculate_steps_per_epoch(self, global_batch_size: int) -> int:
+        """에포크당 스텝 수 계산"""
+        if self.total_samples == 0:
+            raise ValueError("No samples loaded!")
+
+        # 분산 학습: 각 worker의 total_samples는 이미 샤딩됨
+        # global 관점에서 전체 샘플 수 계산
+        global_samples = self.total_samples * self.num_processes
+        steps = global_samples // global_batch_size
+
+        print(f"[RAMPreload] Steps calculation:")
+        print(f"  Local samples: {self.total_samples:,}")
+        print(f"  Global samples: {global_samples:,}")
+        print(f"  Global batch size: {global_batch_size}")
+        print(f"  Steps per epoch: {steps:,}")
+
+        return steps
+
+    def get_epoch_loader(self, epoch: int, steps_per_epoch: int,
+                        num_workers: int = 8) -> 'RAMEpochDataLoader':
+        """에포크용 데이터로더 생성"""
+        return RAMEpochDataLoader(
+            session=self,
+            epoch=epoch,
+            steps_per_epoch=steps_per_epoch,
+            batch_size=self.batch_size,
+            num_workers=num_workers
+        )
+
+    def shutdown(self):
+        """세션 종료 및 메모리 해제"""
+        self.all_latents = None
+        self.all_embeddings = None
+        self.ram_data.clear()
+        gc.collect()
+        print("[RAMPreload] Session shutdown, memory released")
+
+
+class RAMEpochDataLoader:
+    """RAM 프리로드 데이터에서 배치 샘플링
+
+    네트워크 I/O 없음 - 순수 메모리 연산만
+    """
+
+    def __init__(self, session: RAMPreloadSession, epoch: int,
+                 steps_per_epoch: int, batch_size: int,
+                 num_workers: int = 8):
+        self.session = session
+        self.epoch = epoch
+        self.steps_per_epoch = steps_per_epoch
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+
+        # 배치 큐 (prefetch)
+        self.batch_queue: queue.Queue = queue.Queue(maxsize=num_workers * 2)
+        self.stop_event = threading.Event()
+
+        # 샘플링 스레드풀
+        self.executor = ThreadPoolExecutor(max_workers=num_workers)
+        self.sampler_thread: Optional[threading.Thread] = None
+        self.started = False
+
+    def _start_sampling(self):
+        """배치 샘플링 스레드 시작"""
+        if self.started:
+            return
+        self.started = True
+
+        self.sampler_thread = threading.Thread(target=self._sampling_loop, daemon=True)
+        self.sampler_thread.start()
+
+    def _sampling_loop(self):
+        """배치 샘플링 루프 (순수 메모리 연산)"""
+        import sys
+
+        rng = np.random.RandomState(self.epoch * 10000)
+        num_samples = self.session.total_samples
+
+        pending_futures: Dict[int, Future] = {}
+        next_step = 0
+        completed_batches: Dict[int, Tuple[np.ndarray, np.ndarray]] = {}
+
+        print(f"[RAMLoader] Starting sampling loop (epoch {self.epoch}, {self.steps_per_epoch} steps)")
+        sys.stdout.flush()
+
+        while next_step < self.steps_per_epoch and not self.stop_event.is_set():
+            # 새 작업 제출
+            while len(pending_futures) < self.num_workers * 2:
+                step_to_submit = next_step + len(pending_futures) + len(completed_batches)
+                if step_to_submit >= self.steps_per_epoch:
+                    break
+                if step_to_submit not in pending_futures and step_to_submit not in completed_batches:
+                    seed = self.epoch * 100000 + step_to_submit
+                    future = self.executor.submit(
+                        self._sample_batch, seed
+                    )
+                    pending_futures[step_to_submit] = future
+
+            # 완료된 작업 수집
+            done_steps = []
+            for step_idx, future in pending_futures.items():
+                if future.done():
+                    try:
+                        batch = future.result()
+                        completed_batches[step_idx] = batch
+                        done_steps.append(step_idx)
+                    except Exception as e:
+                        print(f"[RAMLoader] Sampling error at step {step_idx}: {e}")
+                        done_steps.append(step_idx)
+
+            for step_idx in done_steps:
+                del pending_futures[step_idx]
+
+            # 순서대로 큐에 전달
+            while next_step in completed_batches:
+                batch = completed_batches.pop(next_step)
+                try:
+                    self.batch_queue.put(batch, timeout=1.0)
+                    if next_step == 0:
+                        print(f"[RAMLoader] ✓ First batch ready (shape: {batch[0].shape})")
+                        sys.stdout.flush()
+                    next_step += 1
+                except queue.Full:
+                    completed_batches[next_step] = batch
+                    break
+
+            time.sleep(0.001)  # 1ms (메모리 연산이라 빠름)
+
+        # 종료 신호
+        self.batch_queue.put(None)
+
+    def _sample_batch(self, seed: int) -> Tuple[np.ndarray, np.ndarray]:
+        """단일 배치 샘플링 (순수 NumPy 연산)"""
+        rng = np.random.RandomState(seed)
+        num_samples = self.session.total_samples
+
+        # 랜덤 인덱스
+        indices = rng.randint(0, num_samples, size=self.batch_size)
+
+        # Latents: (N, 3, 4, 32, 32) -> random crop -> (B, 32, 32, 4) NHWC
+        latents = self.session.all_latents[indices]  # (B, 3, 4, 32, 32)
+        crop_indices = rng.randint(0, 3, size=self.batch_size)
+        latents_cropped = latents[np.arange(self.batch_size), crop_indices]  # (B, 4, 32, 32)
+        latents_nhwc = np.transpose(latents_cropped, (0, 2, 3, 1))  # (B, 32, 32, 4)
+
+        # Embeddings
+        embeddings = self.session.all_embeddings[indices]  # (B, embed_dim)
+
+        return (latents_nhwc, embeddings)
+
+    def get_batches(self) -> Iterator[Tuple[jnp.ndarray, jnp.ndarray]]:
+        """배치 이터레이터"""
+        self._start_sampling()
+
+        batch_count = 0
+        while batch_count < self.steps_per_epoch:
+            try:
+                batch = self.batch_queue.get(timeout=60)  # 메모리 연산이라 60초면 충분
+
+                if batch is None:
+                    break
+
+                latents, embeddings = batch
+                yield jnp.array(latents), jnp.array(embeddings)
+                batch_count += 1
+
+            except queue.Empty:
+                print(f"[RAMLoader] Queue timeout at step {batch_count}")
+                break
+
+    def stop(self):
+        """로더 중지"""
+        self.stop_event.set()
+        self.executor.shutdown(wait=False)
+        if self.sampler_thread:
+            self.sampler_thread.join(timeout=2.0)
