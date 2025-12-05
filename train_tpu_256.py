@@ -34,9 +34,10 @@ import io
 from src.xut.xut_small import create_xut_small
 from src.embeddings import get_embedding_provider
 from src.data.gcs_dataloader import (
-    GCSDataLoaderSession, 
-    GCSFileHandler, 
-    ParquetCache
+    GCSDataLoaderSession,
+    GCSFileHandler,
+    ParquetCache,
+    RAMPreloadSession,  # RAM 프리로드 모드
 )
 
 
@@ -90,6 +91,10 @@ class TrainingConfig256:
     max_cache_files: int = 12  # 최대 캐시 PT 파일 (47GB 디스크, 3GB/파일, 11GB 여유)
     num_download_workers: int = 10  # GCS 다운로드 병렬 워커 (prefetch_ahead와 동일)
     num_load_workers: int = 2  # PT 파일 로딩 워커 (CPU 바운드, 2개면 충분)
+
+    # RAM 프리로드 모드 (네트워크 병목 제거)
+    use_ram_preload: bool = True  # True: 시작 시 모든 PT 파일을 RAM에 로드 (권장)
+    ram_preload_download_workers: int = 8  # 병렬 다운로드 워커 수
     
     # TPU 설정
     use_pjit: bool = True
@@ -867,50 +872,71 @@ def main():
     
     # GCS 데이터 설정
     print("\n" + "="*60)
-    print("[Step 8] GCS Data Setup")
+    print("[Step 8] Data Setup")
     print("="*60)
-    
-    print(f"  GCS Bucket: {config.gcs_bucket}")
-    print(f"  CPU Workers: {config.num_data_workers} vCPUs")
-    print(f"  Prefetch ahead: {config.prefetch_ahead} PT files")
-    print(f"  Max cache files: {config.max_cache_files} (disk optimization)")
-    sys.stdout.flush()
-    
-    try:
-        print(f"\n  [8a] Initializing GCSDataLoaderSession...")
-        sys.stdout.flush()
-        
-        # GCS 데이터로더 세션 초기화
-        # 분산 학습: 각 worker는 local batch만 로드 (global / num_processes)
-        local_batch_size = config.global_batch_size // jax.process_count()
-        print(f"    Local batch size per worker: {local_batch_size} (global {config.global_batch_size} / {jax.process_count()} processes)")
 
-        gcs_session = GCSDataLoaderSession(
-            batch_size=local_batch_size,
-            parquet_path=config.parquet_file or f"{config.gcs_bucket}coyo11m-meta.parquet",
-            embedding_provider=embedding_provider,
-            gcs_bucket=config.gcs_bucket,
-            cache_dir=config.cache_dir,
-            num_workers=config.num_data_workers,
-            prefetch_ahead=config.prefetch_ahead,
-            max_cache_files=config.max_cache_files
-        )
-        print(f"  ✓ GCS session initialized")
-        print(f"    PT files for this worker: {len(gcs_session.pt_files)} (sharded)")
-        print(f"    Total samples (global): {gcs_session.total_samples:,}")
-        if gcs_session.pt_files:
-            print(f"    First PT file: {gcs_session.pt_files[0]}")
-            print(f"    Last PT file: {gcs_session.pt_files[-1]}")
+    print(f"  GCS Bucket: {config.gcs_bucket}")
+    print(f"  Mode: {'RAM Preload' if config.use_ram_preload else 'GCS Streaming'}")
+    sys.stdout.flush()
+
+    # 분산 학습: 각 worker는 local batch만 로드 (global / num_processes)
+    local_batch_size = config.global_batch_size // jax.process_count()
+    print(f"  Local batch size per worker: {local_batch_size} (global {config.global_batch_size} / {jax.process_count()} processes)")
+
+    data_session = None  # 통합 세션 변수
+
+    try:
+        if config.use_ram_preload:
+            # === RAM 프리로드 모드 (권장) ===
+            print(f"\n  [8a] Initializing RAMPreloadSession...")
+            print(f"    Download workers: {config.ram_preload_download_workers}")
+            print(f"    Expected memory: ~69GB per worker (23 PT files × 3GB)")
+            sys.stdout.flush()
+
+            data_session = RAMPreloadSession(
+                batch_size=local_batch_size,
+                gcs_bucket=config.gcs_bucket,
+                parquet_path=config.parquet_file,
+                num_download_workers=config.ram_preload_download_workers,
+                shard_pt_files=True
+            )
+            print(f"  ✓ RAM Preload session initialized")
+            print(f"    PT files loaded: {len(data_session.pt_files)} (sharded)")
+            print(f"    Total samples in RAM: {data_session.total_samples:,}")
+        else:
+            # === GCS 스트리밍 모드 (레거시) ===
+            print(f"\n  [8a] Initializing GCSDataLoaderSession...")
+            print(f"    CPU Workers: {config.num_data_workers} vCPUs")
+            print(f"    Prefetch ahead: {config.prefetch_ahead} PT files")
+            print(f"    Max cache files: {config.max_cache_files} (disk optimization)")
+            sys.stdout.flush()
+
+            data_session = GCSDataLoaderSession(
+                batch_size=local_batch_size,
+                parquet_path=config.parquet_file or f"{config.gcs_bucket}coyo11m-meta.parquet",
+                embedding_provider=embedding_provider,
+                gcs_bucket=config.gcs_bucket,
+                cache_dir=config.cache_dir,
+                num_workers=config.num_data_workers,
+                prefetch_ahead=config.prefetch_ahead,
+                max_cache_files=config.max_cache_files
+            )
+            print(f"  ✓ GCS session initialized")
+            print(f"    PT files for this worker: {len(data_session.pt_files)} (sharded)")
+            print(f"    Total samples (global): {data_session.total_samples:,}")
+            if data_session.pt_files:
+                print(f"    First PT file: {data_session.pt_files[0]}")
+                print(f"    Last PT file: {data_session.pt_files[-1]}")
 
         # steps_per_epoch 자동 계산 (None이면)
         if config.steps_per_epoch is None:
-            config.steps_per_epoch = gcs_session.calculate_steps_per_epoch(config.global_batch_size)
+            config.steps_per_epoch = data_session.calculate_steps_per_epoch(config.global_batch_size)
         else:
             print(f"  Using manual steps_per_epoch: {config.steps_per_epoch}")
 
         sys.stdout.flush()
     except Exception as e:
-        print(f"  ✗ Failed to initialize GCS session: {e}")
+        print(f"  ✗ Failed to initialize data session: {e}")
         import traceback
         traceback.print_exc()
         sys.stdout.flush()
@@ -1014,9 +1040,10 @@ def main():
     print("[Step 13] Training Starting")
     print("="*70)
     print(f"  Total epochs: {config.num_epochs}")
-    print(f"  PT files per epoch: {len(gcs_session.pt_files)}")
-    print(f"  Steps per epoch: {config.steps_per_epoch:,} ({gcs_session.total_samples:,} samples / {config.global_batch_size} batch)")
+    print(f"  PT files per epoch: {len(data_session.pt_files)}")
+    print(f"  Steps per epoch: {config.steps_per_epoch:,} ({data_session.total_samples:,} samples / {config.global_batch_size} batch)")
     print(f"  Global batch size: {config.global_batch_size}")
+    print(f"  Data mode: {'RAM Preload (network I/O free)' if config.use_ram_preload else 'GCS Streaming'}")
     sys.stdout.flush()
     
     total_start = time.time()
@@ -1031,17 +1058,26 @@ def main():
         epoch_start = time.time()
         epoch_losses = []
         
-        # GCS 에포크 로더 생성 (자동 prefetch + 병렬 다운로드)
+        # 에포크 로더 생성
         print(f"  [E{epoch+1}a] Creating epoch loader...")
         sys.stdout.flush()
-        
+
         try:
-            gcs_prefetch_loader = gcs_session.get_epoch_loader(
-                epoch=epoch,
-                steps_per_epoch=config.steps_per_epoch,
-                num_download_workers=config.num_download_workers,
-                num_load_workers=config.num_load_workers
-            )
+            if config.use_ram_preload:
+                # RAM 모드: 메모리에서 직접 샘플링 (네트워크 I/O 없음)
+                epoch_loader = data_session.get_epoch_loader(
+                    epoch=epoch,
+                    steps_per_epoch=config.steps_per_epoch,
+                    num_workers=config.num_data_workers
+                )
+            else:
+                # GCS 스트리밍 모드
+                epoch_loader = data_session.get_epoch_loader(
+                    epoch=epoch,
+                    steps_per_epoch=config.steps_per_epoch,
+                    num_download_workers=config.num_download_workers,
+                    num_load_workers=config.num_load_workers
+                )
             print(f"  [E{epoch+1}b] ✓ Epoch loader ready")
             sys.stdout.flush()
         except Exception as e:
@@ -1066,22 +1102,22 @@ def main():
         total_batches_processed = 0
 
         try:
-            losses, epoch_avg_loss = trainer.train_epoch(gcs_prefetch_loader, epoch)
+            losses, epoch_avg_loss = trainer.train_epoch(epoch_loader, epoch)
             epoch_losses.extend(losses)
             total_batches_processed += len(losses)
-            
+
             # PT 파일 개수 계산 (대략적)
             if losses:
-                pt_files_processed = len(gcs_session.pt_files)
+                pt_files_processed = len(data_session.pt_files)
         except Exception as e:
             print(f"  ✗ Training error: {e}")
             import traceback
             traceback.print_exc()
             sys.stdout.flush()
         finally:
-            print(f"  [E{epoch+1}d] Stopping prefetch loader...")
+            print(f"  [E{epoch+1}d] Stopping epoch loader...")
             sys.stdout.flush()
-            gcs_prefetch_loader.stop()
+            epoch_loader.stop()
             gc.collect()
             print(f"  [E{epoch+1}e] ✓ Cleanup done")
             sys.stdout.flush()
@@ -1105,7 +1141,7 @@ def main():
                 "epoch_min_loss": np.min(epoch_losses) if epoch_losses else 0.0,
                 "epoch_max_loss": np.max(epoch_losses) if epoch_losses else 0.0,
                 "epoch_time_hours": epoch_time / 3600,
-                "num_pt_files": len(gcs_session.pt_files),
+                "num_pt_files": len(data_session.pt_files),
                 "batches_processed": total_batches_processed,
                 "epoch": epoch + 1,
             }, step=epoch)
@@ -1120,9 +1156,9 @@ def main():
     print("✓ Training completed!")
     print("="*60)
     print(f"Total training time: {total_time/3600:.1f}h")
-    
-    # GCS 세션 종료
-    gcs_session.shutdown()
+
+    # 데이터 세션 종료
+    data_session.shutdown()
     
     # 최종 통계 (Process 0만)
     if process_index == 0 and wandb_enabled:
