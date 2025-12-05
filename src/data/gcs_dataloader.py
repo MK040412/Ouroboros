@@ -533,18 +533,27 @@ class PTFilePrefetchManager:
         return protected
 
     def _manage_cache_size(self):
-        """캐시 용량 관리 (오래된 파일 삭제, 사용 중인 파일 보호)"""
+        """캐시 용량 관리 (오래된 파일 삭제, 사용 중인 파일 보호)
+
+        NOTE: 레이스 컨디션 방지를 위해 보수적으로 동작:
+        - max_cache_files의 80%를 초과할 때만 삭제 시작
+        - 삭제 시 최소 10%의 여유 공간 확보 목표
+        """
         cached_files = glob.glob(
             os.path.join(self.gcs_handler.cache_dir, "*.pt")
         )
 
-        if len(cached_files) >= self.max_cache_files:
+        # 80% 초과 시에만 삭제 시작 (여유 공간 확보)
+        threshold = int(self.max_cache_files * 0.8)
+        target = int(self.max_cache_files * 0.7)  # 70%까지 줄이는 것이 목표
+
+        if len(cached_files) >= threshold:
             # 보호 대상 파일 목록
             protected = self._get_protected_files()
 
             # 가장 오래된 파일부터 삭제 (보호 대상 제외)
             for f in sorted(cached_files, key=os.path.getmtime):
-                if len(cached_files) < self.max_cache_files:
+                if len(cached_files) <= target:
                     break
 
                 filename = os.path.basename(f)
@@ -650,6 +659,12 @@ class GCSDataLoaderSession:
     PT 파일 + Parquet caption
     - Precomputed mode: PT 파일의 embeddings 직접 사용 (embedding_provider=None 허용)
     - Legacy mode: 실시간 임베딩 계산 (embedding_provider 필요)
+
+    분산 학습 시 Worker별 PT 파일 샤딩:
+    - 각 Worker는 자신에게 할당된 PT 파일만 다운로드/처리
+    - Worker 0: idx % num_processes == 0 인 파일들
+    - Worker 1: idx % num_processes == 1 인 파일들
+    - 이를 통해 GCS 대역폭 및 디스크 사용량 최적화
     """
 
     def __init__(self, batch_size: int, parquet_path: str,
@@ -657,7 +672,8 @@ class GCSDataLoaderSession:
                  cache_dir: Optional[str] = None,
                  num_workers: int = 4,
                  prefetch_ahead: int = 4,
-                 max_cache_files: int = 3):
+                 max_cache_files: int = 3,
+                 shard_pt_files: bool = True):
         self.batch_size = batch_size
         self.embedding_provider = embedding_provider
         self.num_workers = num_workers
@@ -667,9 +683,24 @@ class GCSDataLoaderSession:
         # GCS 핸들러
         self.gcs_handler = GCSFileHandler(gcs_bucket, cache_dir)
 
-        # PT 파일 목록
-        self.pt_files = self.gcs_handler.list_pt_files()
-        print(f"Found {len(self.pt_files)} PT files in {gcs_bucket}")
+        # PT 파일 목록 (전체)
+        all_pt_files = self.gcs_handler.list_pt_files()
+        print(f"Found {len(all_pt_files)} PT files in {gcs_bucket}")
+
+        # Worker별 PT 파일 샤딩 (분산 학습 최적화)
+        if shard_pt_files:
+            process_index = int(os.environ.get('JAX_PROCESS_INDEX', '0'))
+            num_processes = int(os.environ.get('JAX_NUM_PROCESSES', '1'))
+
+            if num_processes > 1:
+                # 각 Worker가 담당할 PT 파일만 선택 (round-robin 분배)
+                self.pt_files = [f for i, f in enumerate(all_pt_files) if i % num_processes == process_index]
+                print(f"  Worker {process_index}/{num_processes}: Sharded to {len(self.pt_files)} PT files "
+                      f"(indices {process_index}, {process_index + num_processes}, {process_index + 2*num_processes}, ...)")
+            else:
+                self.pt_files = all_pt_files
+        else:
+            self.pt_files = all_pt_files
 
         # PT 로더
         self.pt_loader = PTFileLoader()
