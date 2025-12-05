@@ -1035,7 +1035,8 @@ class EpochDataLoader:
             # 새 PT 데이터 필요한지 확인
             if current_pt_data is None or steps_on_current_pt >= steps_per_pt:
                 try:
-                    timeout = 300.0 if current_pt_data is None else 120.0
+                    # PT 데이터 대기 timeout (3GB 파일 다운로드 시간 고려)
+                    timeout = 600.0 if current_pt_data is None else 300.0
                     pt_idx, pt_data = self.loaded_pt_queue.get(timeout=timeout)
                     if pt_idx < 0:  # 종료 신호
                         break
@@ -1250,7 +1251,8 @@ class EpochDataLoader:
 
         while batch_count < self.steps_per_epoch:
             try:
-                timeout = 600 if batch_count == 0 else 120
+                # 첫 배치는 600초, 이후 배치도 300초 (3GB PT 다운로드 시간 고려)
+                timeout = 600 if batch_count == 0 else 300
                 batch = self.batch_queue.get(timeout=timeout)
 
                 if batch is None:
