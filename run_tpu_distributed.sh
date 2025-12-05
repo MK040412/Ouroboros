@@ -139,16 +139,89 @@ run_remote() {
   fi
   log "Coordinator IP: $COORDINATOR_IP"
 
-  # 3. 각 worker에 대해 실행 (Worker 1,2,3,4,5,6,7 먼저, Worker 0 마지막)
-  # Worker 0이 coordinator이므로 다른 worker들이 준비된 후 시작해야 함
-  log "Step 3: Launching training on all workers..."
-  log "  Order: Workers 1,2,3,4,5,6,7 first, then Worker 0 (coordinator) last"
+  # 3. 모든 worker 정리 및 코드 동기화 (병렬)
+  log "Step 3: Cleaning up and syncing code on all workers..."
+  for WORKER_ID in $(seq 0 $((NUM_WORKERS - 1))); do
+    gcloud compute tpus tpu-vm ssh "$INSTANCE" \
+      --zone="$ZONE" \
+      --worker="$WORKER_ID" \
+      --command="pkill -9 -f 'python.*train_tpu' 2>/dev/null || true; sudo rm -f /tmp/libtpu_lockfile 2>/dev/null || true" &
+  done
+  wait
+  log "  Cleanup done"
 
-  # Worker 순서: 1, 2, 3, 0 (coordinator 마지막)
-  for WORKER_ID in 1 2 3 4 5 6 7 0; do
-    log "Launching worker $WORKER_ID..."
+  # 4. 코드 동기화 (병렬)
+  log "Step 4: Syncing code on all workers..."
+  for WORKER_ID in $(seq 0 $((NUM_WORKERS - 1))); do
+    read -r -d '' SYNC_CMD <<EOF || true
+set -e
+DEST_DIR=~/ouroboros
+REMOTE_URL="$REMOTE_URL"
 
-    # 각 worker에서 실행할 명령
+if [[ -d "\$DEST_DIR/.git" ]]; then
+  cd "\$DEST_DIR"
+  git fetch origin $BRANCH
+  git checkout $BRANCH
+  git pull --ff-only origin $BRANCH 2>/dev/null || git reset --hard origin/$BRANCH
+else
+  rm -rf "\$DEST_DIR"
+  git clone "\$REMOTE_URL" "\$DEST_DIR"
+  cd "\$DEST_DIR"
+  git checkout $BRANCH
+fi
+
+# Python 패키지 설치
+python3.11 -m pip install --user -q jax[tpu] -f https://storage.googleapis.com/jax-releases/libtpu_releases.html 2>/dev/null || true
+python3.11 -m pip install --user -q flax optax chex Pillow PyYAML wandb pyarrow torch transformers google-cloud-storage 2>/dev/null || true
+EOF
+    gcloud compute tpus tpu-vm ssh "$INSTANCE" \
+      --zone="$ZONE" \
+      --worker="$WORKER_ID" \
+      --command="bash -c '$SYNC_CMD'" &
+  done
+  wait
+  log "  Code synced on all workers"
+
+  # 5. Worker 0 (coordinator) 먼저 시작
+  log "Step 5: Starting Worker 0 (coordinator) first..."
+
+  read -r -d '' WORKER0_CMD <<EOF || true
+set -e
+export TPU_WORKER_ID=0
+export COORDINATOR_IP="$COORDINATOR_IP"
+export JAX_COORDINATOR_ADDRESS="${COORDINATOR_IP}:${COORDINATOR_PORT}"
+export JAX_COORDINATOR_PORT="${COORDINATOR_PORT}"
+export JAX_NUM_PROCESSES=${NUM_WORKERS}
+export JAX_PROCESS_INDEX=0
+export JAX_LOCAL_DEVICE_COUNT=${CHIPS_PER_WORKER}
+export TPU_CHIPS_PER_HOST_BOUNDS="2,2,1"
+export TPU_HOST_BOUNDS="2,2,1"
+export PYTHONPATH=~/ouroboros/src:\$PYTHONPATH
+export PYTHONUNBUFFERED=1
+
+cd ~/ouroboros
+echo "[Worker 0] Starting coordinator..."
+echo "[Worker 0] JAX_COORDINATOR_ADDRESS=\$JAX_COORDINATOR_ADDRESS"
+
+# nohup으로 백그라운드 실행
+nohup python3.11 -u train_tpu_256.py > /tmp/train_worker_0.log 2>&1 &
+echo "[Worker 0] Coordinator started with PID \$!"
+EOF
+
+  gcloud compute tpus tpu-vm ssh "$INSTANCE" \
+    --zone="$ZONE" \
+    --worker="0" \
+    --command="bash -c '$WORKER0_CMD'"
+
+  # Coordinator가 listening 상태가 될 때까지 대기
+  log "  Waiting 30s for coordinator to start listening..."
+  sleep 30
+
+  # 6. Worker 1-7 시작 (병렬)
+  log "Step 6: Starting workers 1-7..."
+  for WORKER_ID in $(seq 1 $((NUM_WORKERS - 1))); do
+    log "  Launching worker $WORKER_ID..."
+
     read -r -d '' WORKER_CMD <<EOF || true
 set -e
 export TPU_WORKER_ID=$WORKER_ID
@@ -158,98 +231,34 @@ export JAX_COORDINATOR_PORT="${COORDINATOR_PORT}"
 export JAX_NUM_PROCESSES=${NUM_WORKERS}
 export JAX_PROCESS_INDEX=${WORKER_ID}
 export JAX_LOCAL_DEVICE_COUNT=${CHIPS_PER_WORKER}
-
-# TPU 설정
 export TPU_CHIPS_PER_HOST_BOUNDS="2,2,1"
 export TPU_HOST_BOUNDS="2,2,1"
-
-# HuggingFace 토큰 설정 (embeddinggemma-300m 접근용)
-# 로컬 환경에서 HF_TOKEN 환경변수 설정 필요
-# export HF_TOKEN="your_token_here" 를 ~/.bashrc 에 추가
-export HF_TOKEN="\${HF_TOKEN:-}"
-export HUGGING_FACE_HUB_TOKEN="\${HF_TOKEN:-}"
-
-DEST_DIR=~/ouroboros
-REMOTE_URL="$REMOTE_URL"
-
-echo "[Worker $WORKER_ID] Setting up repository..."
-
-# Git clone or pull
-if [[ -d "\$DEST_DIR/.git" ]]; then
-  echo "[Worker $WORKER_ID] Existing repo found, pulling..."
-  cd "\$DEST_DIR"
-  git fetch origin $BRANCH
-  git checkout $BRANCH
-  git pull --ff-only origin $BRANCH 2>/dev/null || git reset --hard origin/$BRANCH
-else
-  echo "[Worker $WORKER_ID] Cloning repo..."
-  rm -rf "\$DEST_DIR"
-  git clone "\$REMOTE_URL" "\$DEST_DIR"
-  cd "\$DEST_DIR"
-  git checkout $BRANCH
-fi
-
-echo "[Worker $WORKER_ID] Installing dependencies with pip (no venv)..."
-
-# Python 3.11 사용
-python3.11 -m pip install --user -q jax[tpu] -f https://storage.googleapis.com/jax-releases/libtpu_releases.html 2>/dev/null || true
-python3.11 -m pip install --user -q flax optax chex Pillow PyYAML wandb pyarrow torch transformers google-cloud-storage 2>/dev/null || true
-python3.11 -m pip install --user -q gemma 2>/dev/null || true
-
-# PYTHONPATH 설정
-export PYTHONPATH="\$DEST_DIR/src:\$PYTHONPATH"
-
-# TPU lockfile 정리 (이전 프로세스 잔여물)
-sudo rm -f /tmp/libtpu_lockfile 2>/dev/null || true
-# 이전 train 프로세스 정리 (현재 프로세스 제외)
-for pid in \$(pgrep -f "python.*train_tpu_256" 2>/dev/null || true); do
-  if [[ "\$pid" != "\$\$" ]] && [[ "\$pid" != "\$PPID" ]]; then
-    kill -9 "\$pid" 2>/dev/null || true
-  fi
-done
-
-echo "[Worker $WORKER_ID] Starting training..."
-echo "[Worker $WORKER_ID] JAX_COORDINATOR_ADDRESS=\$JAX_COORDINATOR_ADDRESS"
-echo "[Worker $WORKER_ID] JAX_PROCESS_INDEX=\$JAX_PROCESS_INDEX"
-
-# Python 출력 버퍼링 비활성화 (즉시 로그 출력)
+export PYTHONPATH=~/ouroboros/src:\$PYTHONPATH
 export PYTHONUNBUFFERED=1
 
-# nohup으로 SSH 끊어져도 프로세스 유지, -u로 unbuffered 출력
-nohup python3.11 -u train_tpu_256.py > /tmp/train_worker_${WORKER_ID}.log 2>&1 &
-TRAIN_PID=\$!
-echo "[Worker $WORKER_ID] Training started with PID \$TRAIN_PID"
+cd ~/ouroboros
+echo "[Worker $WORKER_ID] Starting training..."
+echo "[Worker $WORKER_ID] JAX_COORDINATOR_ADDRESS=\$JAX_COORDINATOR_ADDRESS"
 
-# 프로세스가 종료될 때까지 대기 (로그는 파일로 저장됨)
-wait \$TRAIN_PID
-echo "[Worker $WORKER_ID] Training finished"
+# nohup으로 백그라운드 실행
+nohup python3.11 -u train_tpu_256.py > /tmp/train_worker_${WORKER_ID}.log 2>&1 &
+echo "[Worker $WORKER_ID] Started with PID \$!"
 EOF
 
-    # 현재 worker인 경우 SSH 없이 직접 실행, 아니면 SSH로 실행
-    if [[ "$WORKER_ID" == "$CURRENT_WORKER_ID" ]]; then
-      log "Worker $WORKER_ID: Running locally (current host)"
-      bash -lc "${WORKER_CMD}" &
-    else
-      log "Worker $WORKER_ID: Running via SSH"
-      gcloud compute tpus tpu-vm ssh "$INSTANCE" \
-        --zone="$ZONE" \
-        --worker="$WORKER_ID" \
-        --command="bash -lc '${WORKER_CMD}'" &
-    fi
-
-    # Worker 0 (coordinator)이 마지막에 시작하므로, 그 전에 다른 worker들이 준비되도록 대기
-    if [[ $WORKER_ID -eq 7 ]]; then
-      # Worker 1-7 시작 후, Worker 0 시작 전에 충분히 대기
-      # (git pull + pip install + python 시작 시간 고려)
-      log "Waiting 90s for workers 1-7 to be ready before starting coordinator..."
-      sleep 90
-    fi
+    gcloud compute tpus tpu-vm ssh "$INSTANCE" \
+      --zone="$ZONE" \
+      --worker="$WORKER_ID" \
+      --command="bash -c '$WORKER_CMD'" &
   done
-
-  log "All workers launched. Waiting for completion..."
   wait
 
-  log "Training completed on all workers"
+  log "All workers launched!"
+  log ""
+  log "Monitor logs:"
+  log "  ./gcp_show_log.sh --worker=0 -f"
+  log "  ./gcp_show_log.sh --worker=1 -f"
+  log ""
+  log "Kill all: ./gcp_killall.sh"
 }
 
 # =============================================================================
