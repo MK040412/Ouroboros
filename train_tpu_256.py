@@ -76,11 +76,6 @@ class TrainingConfig256:
     enc_blocks: int = 1
     dec_blocks: int = 2
     
-    # 노이즈 스케줄
-    beta_min: float = 0.0001
-    beta_max: float = 0.02
-    T: int = 1000
-    
     # Text embedding
     embedding_model: str = "gemma-3-270m"  # 640d, precomputed
     
@@ -265,50 +260,69 @@ _graceful_killer = GracefulKiller()
 
 
 # ============================================
-# Diffusion Schedule (기존 HDM 코드와 동일)
+# Rectified Flow Schedule with Logit-Normal Sampling
 # ============================================
-class DiffusionSchedule:
-    """노이즈 스케줄 (alphas_cumprod 기반)"""
-    
-    def __init__(self, beta_min: float = 0.0001, beta_max: float = 0.02, T: int = 1000):
-        self.beta_min = beta_min
-        self.beta_max = beta_max
-        self.T = T
-        self._cache_alphas()
-    
-    def _cache_alphas(self):
-        # Linear schedule
-        betas = jnp.linspace(self.beta_min, self.beta_max, self.T)
-        self.alphas = 1.0 - betas
-        self.alphas_cumprod = jnp.cumprod(self.alphas)
-        # sqrt_alphas_cumprod and sqrt(1 - alphas_cumprod)
-        self.sqrt_alphas_cumprod = jnp.sqrt(self.alphas_cumprod)
-        self.sqrt_one_minus_alphas_cumprod = jnp.sqrt(1.0 - self.alphas_cumprod)
-    
-    def forward_diffusion(self, x_0: jnp.ndarray, noise: jnp.ndarray, timesteps: jnp.ndarray) -> jnp.ndarray:
+class RectifiedFlowSchedule:
+    """Rectified Flow 스케줄 (Logit-Normal timestep sampling)
+
+    Linear interpolation: x_t = (1 - t) * x_0 + t * x_1
+    여기서 x_1 = noise (standard Gaussian)
+
+    Logit-Normal sampling (SD3 논문):
+    - t = sigmoid(normal(mean, std))
+    - 중간 timestep에 더 많은 샘플링 집중
+    - mean=0, std=1이 기본값
+
+    모델은 velocity v = x_1 - x_0 를 예측
+    """
+
+    def __init__(self, logit_mean: float = 0.0, logit_std: float = 1.0):
         """
-        Forward diffusion: x_t = sqrt(alpha_cumprod_t) * x_0 + sqrt(1 - alpha_cumprod_t) * noise
+        Args:
+            logit_mean: logit-normal 분포의 mean (기본 0.0)
+            logit_std: logit-normal 분포의 std (기본 1.0)
+        """
+        self.logit_mean = logit_mean
+        self.logit_std = logit_std
+
+    def sample_timesteps(self, key: jnp.ndarray, batch_size: int) -> jnp.ndarray:
+        """Logit-normal 분포에서 timestep 샘플링
 
         Args:
-            x_0: (B, 4, 32, 32) - 원본 VAE latent
-            noise: (B, 4, 32, 32) - 노이즈
-            timesteps: (B,) - 각 샘플의 타임스텝
+            key: JAX random key
+            batch_size: 배치 크기
         Returns:
-            x_t: (B, 4, 32, 32) - noisy latent
+            t: (B,) - 시간 [0, 1] 범위 (logit-normal 분포)
         """
-        sqrt_alpha = self.sqrt_alphas_cumprod[timesteps]  # (B,)
-        sqrt_one_minus_alpha = self.sqrt_one_minus_alphas_cumprod[timesteps]  # (B,)
+        # Sample from normal distribution
+        u = jax.random.normal(key, (batch_size,))
+        # Apply logit-normal transform: t = sigmoid(mean + std * u)
+        t = jax.nn.sigmoid(self.logit_mean + self.logit_std * u)
+        return t
 
-        # Reshape for broadcasting: (B,) -> (B, 1, 1, 1)
-        sqrt_alpha = sqrt_alpha[:, None, None, None]
-        sqrt_one_minus_alpha = sqrt_one_minus_alpha[:, None, None, None]
+    def forward(self, x_0: jnp.ndarray, x_1: jnp.ndarray, t: jnp.ndarray) -> jnp.ndarray:
+        """
+        Rectified Flow forward: x_t = (1 - t) * x_0 + t * x_1
 
-        # 입력 dtype에 맞춰 캐스팅 (bfloat16 지원)
-        sqrt_alpha = sqrt_alpha.astype(x_0.dtype)
-        sqrt_one_minus_alpha = sqrt_one_minus_alpha.astype(x_0.dtype)
+        Args:
+            x_0: (B, H, W, C) - 원본 VAE latent (clean)
+            x_1: (B, H, W, C) - 노이즈 (target, standard Gaussian)
+            t: (B,) - 시간 [0, 1] 범위
+        Returns:
+            x_t: (B, H, W, C) - interpolated sample
+        """
+        # Reshape t for broadcasting: (B,) -> (B, 1, 1, 1)
+        t = t[:, None, None, None]
 
-        x_t = sqrt_alpha * x_0 + sqrt_one_minus_alpha * noise
+        # dtype 맞추기
+        t = t.astype(x_0.dtype)
+
+        x_t = (1.0 - t) * x_0 + t * x_1
         return x_t
+
+    def get_velocity(self, x_0: jnp.ndarray, x_1: jnp.ndarray) -> jnp.ndarray:
+        """Velocity target: v = x_1 - x_0"""
+        return x_1 - x_0
 
 
 # ============================================
@@ -526,23 +540,28 @@ def create_sharding_mesh(num_devices: int):
 # JIT-compiled Train Step (Module-level for cache reuse)
 # ============================================
 @nnx.jit
-def _train_step_jit(model, optimizer, x_t, t_cond, noise, text_emb):
-    """JIT 컴파일된 학습 스텝 (모듈 레벨 - 캐시 재사용)
+def _train_step_jit(model, optimizer, x_t, t, velocity_target, text_emb):
+    """JIT 컴파일된 학습 스텝 (Rectified Flow)
 
-    이 함수를 모듈 레벨에 정의하면:
-    1. JIT 캐시가 전역적으로 유지됨
-    2. 매 호출마다 새 함수 객체 생성 방지
-    3. 컴파일 오버헤드 최소화
+    Args:
+        model: XUDiT 모델
+        optimizer: nnx.Optimizer
+        x_t: (B, H, W, C) - interpolated sample (NHWC)
+        t: (B,) 또는 (B, 1) - 시간 [0, 1] 범위
+        velocity_target: (B, H, W, C) - velocity target v = x_1 - x_0 (NHWC)
+        text_emb: (B, 1, D) - text embeddings
     """
     def loss_fn(model):
         # 모델 입력: NHWC, 출력: NCHW
-        pred_noise_nchw = model(x_t, t_cond, text_emb)
-        # NCHW -> NHWC for loss computation (noise is NHWC)
-        pred_noise = jnp.transpose(pred_noise_nchw, (0, 2, 3, 1))
-        return jnp.mean((pred_noise - noise) ** 2)
+        # 모델은 velocity를 예측
+        pred_v_nchw = model(x_t, t, text_emb)
+        # NCHW -> NHWC for loss computation
+        pred_v = jnp.transpose(pred_v_nchw, (0, 2, 3, 1))
+        # MSE loss: ||v_pred - v_target||^2
+        return jnp.mean((pred_v - velocity_target) ** 2)
 
     loss, grads = nnx.value_and_grad(loss_fn)(model)
-    optimizer.update(model, grads)  # Flax 0.11.0+: model 인자 필수
+    optimizer.update(model, grads)
     return loss
 
 
@@ -637,26 +656,28 @@ class TPUTrainer:
         loss = jnp.mean((pred_noise - noise) ** 2)
         return loss
     
-    def train_step(self, x_t, timesteps, noise, text_emb, step, rng_key):
-        """한 스텝 학습 (Sharded + JIT 컴파일)
+    def train_step(self, x_t, t, velocity_target, text_emb, rng_key):
+        """한 스텝 학습 (Rectified Flow, Sharded + JIT 컴파일)
 
-        배치는 'data' 축으로 분산
-        모델 파라미터는 'model' 축으로 분산
-
-        GIL 최적화: _train_step_jit를 모듈 레벨로 이동하여 JIT 캐시 재사용
+        Args:
+            x_t: (B, H, W, C) - interpolated sample
+            t: (B,) - 시간 [0, 1] 범위
+            velocity_target: (B, H, W, C) - velocity target v = x_1 - x_0
+            text_emb: (B, D) - text embeddings
+            rng_key: JAX random key
         """
         # TREAD: Timestep-Random Encoder Architecture Design
-        batch_size = timesteps.shape[0]
+        # t=0으로 마스킹하여 unconditional 학습
+        batch_size = t.shape[0]
         rng_key, subkey = jax.random.split(rng_key)
         mask = jax.random.uniform(subkey, (batch_size,)) < self.config.tread_selection_rate
-        t_cond = jnp.where(mask, jnp.zeros_like(timesteps), timesteps)
+        t_cond = jnp.where(mask, jnp.zeros_like(t), t)
 
         # text_emb: (batch, dim) → (batch, 1, dim) for sequence concatenation
-        # 모델은 ctx가 3D (batch, seq_len, dim) 형태를 기대함
         text_emb_3d = text_emb[:, None, :]
 
-        # 모듈 레벨 JIT 함수 호출 (캐시 재사용으로 컴파일 오버헤드 제거)
-        loss = _train_step_jit(self.model, self.optimizer, x_t, t_cond, noise, text_emb_3d)
+        # 모듈 레벨 JIT 함수 호출
+        loss = _train_step_jit(self.model, self.optimizer, x_t, t_cond, velocity_target, text_emb_3d)
         return loss, rng_key
     
     def save_checkpoint(self, epoch: int, step: int, loss: float, emergency: bool = False):
@@ -854,27 +875,29 @@ class TPUTrainer:
             )
 
             batch_size = global_batch_size
-            
-            # 타임스텝 샘플링
+
+            # Rectified Flow: t ~ Logit-Normal (SD3 스타일)
             rng_key, subkey = jax.random.split(rng_key)
-            timesteps = jax.random.randint(subkey, (batch_size,), 0, self.config.T)
-            
-            # 노이즈 샘플링 (bfloat16 사용 시 변환)
+            t = self.schedule.sample_timesteps(subkey, batch_size)
+
+            # 노이즈 샘플링 (x_1 = noise, standard Gaussian)
             rng_key, subkey = jax.random.split(rng_key)
             compute_dtype = jnp.bfloat16 if self.config.use_bfloat16 else jnp.float32
-            noise = jax.random.normal(subkey, batch_latents.shape, dtype=compute_dtype)
+            x_1 = jax.random.normal(subkey, batch_latents.shape, dtype=compute_dtype)
 
             # 데이터도 동일 dtype으로 변환
-            batch_latents = batch_latents.astype(compute_dtype)
+            x_0 = batch_latents.astype(compute_dtype)
             batch_embeddings = batch_embeddings.astype(compute_dtype)
-            
-            # Forward diffusion
-            x_t = self.schedule.forward_diffusion(batch_latents, noise, timesteps)
-            
+
+            # Rectified Flow forward: x_t = (1 - t) * x_0 + t * x_1
+            x_t = self.schedule.forward(x_0, x_1, t)
+
+            # Velocity target: v = x_1 - x_0
+            velocity_target = self.schedule.get_velocity(x_0, x_1)
+
             # 학습 스텝 (Sharded execution)
             global_step = epoch * self.config.steps_per_epoch + step
-            loss, rng_key = self.train_step(x_t, timesteps, noise, batch_embeddings,
-                                            global_step, rng_key)
+            loss, rng_key = self.train_step(x_t, t, velocity_target, batch_embeddings, rng_key)
 
             loss_val = float(loss)
 
@@ -882,13 +905,14 @@ class TPUTrainer:
             if np.isnan(loss_val) or np.isinf(loss_val):
                 print(f"[LOSS ERROR] Step {step}: loss={loss_val} (NaN or Inf detected!)")
                 print(f"  x_t range: [{float(x_t.min()):.4f}, {float(x_t.max()):.4f}]")
-                print(f"  noise range: [{float(noise.min()):.4f}, {float(noise.max()):.4f}]")
-                print(f"  timesteps: min={int(timesteps.min())}, max={int(timesteps.max())}")
+                print(f"  x_0 range: [{float(x_0.min()):.4f}, {float(x_0.max()):.4f}]")
+                print(f"  x_1 range: [{float(x_1.min()):.4f}, {float(x_1.max()):.4f}]")
+                print(f"  t range: [{float(t.min()):.4f}, {float(t.max()):.4f}]")
                 sys.stdout.flush()
             elif loss_val > 1e6 and step > 100:  # warmup 이후 loss 폭발 감지
                 print(f"[LOSS WARNING] Step {step}: loss={loss_val:.2e} (explosion detected!)")
                 print(f"  x_t range: [{float(x_t.min()):.4f}, {float(x_t.max()):.4f}]")
-                print(f"  batch_embeddings range: [{float(batch_embeddings.min()):.4f}, {float(batch_embeddings.max()):.4f}]")
+                print(f"  velocity_target range: [{float(velocity_target.min()):.4f}, {float(velocity_target.max()):.4f}]")
                 print(f"  learning_rate: {self.lr_schedule(global_step):.8f}")
                 sys.stdout.flush()
 
@@ -1332,16 +1356,12 @@ def main():
         print("="*60)
     sys.stdout.flush()
 
-    # 스케줄
-    print(f"\n[Step 11] Creating Diffusion Schedule...")
+    # 스케줄 (Rectified Flow)
+    print(f"\n[Step 11] Creating Rectified Flow Schedule...")
     sys.stdout.flush()
-    
-    schedule = DiffusionSchedule(
-        beta_min=config.beta_min,
-        beta_max=config.beta_max,
-        T=config.T
-    )
-    print(f"  ✓ Diffusion schedule created (T={config.T})")
+
+    schedule = RectifiedFlowSchedule()
+    print(f"  ✓ Rectified Flow schedule created")
     sys.stdout.flush()
     
     # 학습기
