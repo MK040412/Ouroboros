@@ -1383,57 +1383,60 @@ class RAMPreloadSession:
         self._preload_all_pt_files()
 
     def _preload_all_pt_files(self):
-        """모든 PT 파일을 RAM에 로드"""
+        """모든 PT 파일을 RAM에 로드 (디스크 공간 최소화)
+
+        전략: 1개씩 다운로드 → RAM 로드 → 즉시 삭제
+        디스크 최대 사용량: ~3GB (1개 PT 파일)
+        """
         import sys
 
         print(f"\n[RAMPreload] === Starting Preload ===")
         print(f"[RAMPreload] Files to load: {len(self.pt_files)}")
-        print(f"[RAMPreload] Estimated memory: {len(self.pt_files) * 3:.1f} GB")
+        print(f"[RAMPreload] Estimated RAM: {len(self.pt_files) * 3:.1f} GB")
+        print(f"[RAMPreload] Strategy: Sequential download → RAM load → delete (max 3GB disk)")
         sys.stdout.flush()
+
+        # 시작 전 캐시 디렉토리 정리 (이전 실행에서 남은 파일 삭제)
+        self._cleanup_cache_directory()
 
         start_time = time.time()
-
-        # 1단계: 병렬 다운로드
-        print(f"\n[RAMPreload] Phase 1: Downloading from GCS...")
-        sys.stdout.flush()
-
-        local_paths = []
-        with ThreadPoolExecutor(max_workers=self.num_download_workers) as executor:
-            futures = {}
-            for pt_path in self.pt_files:
-                future = executor.submit(self._download_pt_file, pt_path)
-                futures[future] = pt_path
-
-            for i, future in enumerate(as_completed(futures)):
-                pt_path = futures[future]
-                try:
-                    local_path = future.result()
-                    local_paths.append((pt_path, local_path))
-                    if (i + 1) % 5 == 0 or i == len(self.pt_files) - 1:
-                        print(f"  Downloaded {i+1}/{len(self.pt_files)}: {os.path.basename(pt_path)}")
-                        sys.stdout.flush()
-                except Exception as e:
-                    print(f"  ✗ Failed to download {pt_path}: {e}")
-                    sys.stdout.flush()
-
-        download_time = time.time() - start_time
-        print(f"[RAMPreload] Download complete in {download_time:.1f}s")
-        sys.stdout.flush()
-
-        # 2단계: 메모리 로드
-        print(f"\n[RAMPreload] Phase 2: Loading into RAM...")
-        sys.stdout.flush()
-
-        load_start = time.time()
         all_latents_list = []
         all_embeddings_list = []
 
-        for i, (pt_path, local_path) in enumerate(local_paths):
-            try:
-                data = _load_pt_file_worker(local_path)
-                filename = os.path.basename(pt_path)
+        for i, pt_path in enumerate(self.pt_files):
+            filename = os.path.basename(pt_path)
+            file_start = time.time()
 
-                # 유효한 샘플만 필터링 (NaN 임베딩 제외)
+            try:
+                # 1. 다운로드
+                local_path = self._download_pt_file(pt_path)
+                download_time = time.time() - file_start
+
+                # 2. RAM에 로드
+                load_start = time.time()
+                data = _load_pt_file_worker(local_path)
+                load_time = time.time() - load_start
+
+                # 3. 즉시 디스크에서 삭제 (디스크 공간 확보)
+                try:
+                    if os.path.exists(local_path):
+                        os.remove(local_path)
+                        # 삭제 확인
+                        if os.path.exists(local_path):
+                            print(f"  [RAMPreload] Warning: Failed to delete {filename}, file still exists")
+                            sys.stdout.flush()
+                except Exception as delete_err:
+                    print(f"  [RAMPreload] Warning: Could not delete {filename}: {delete_err}")
+                    sys.stdout.flush()
+                    # 강제 삭제 재시도
+                    try:
+                        import shutil
+                        if os.path.exists(local_path):
+                            os.unlink(local_path)
+                    except:
+                        pass
+
+                # 4. 유효한 샘플만 필터링 (NaN 임베딩 제외)
                 if 'embeddings' in data:
                     valid_mask = ~np.isnan(data['embeddings']).any(axis=1)
                     num_valid = valid_mask.sum()
@@ -1443,25 +1446,27 @@ class RAMPreloadSession:
                         all_embeddings_list.append(data['embeddings'][valid_mask])
                         self.total_samples += num_valid
 
-                # 로컬 파일 삭제 (RAM에 로드 완료)
-                try:
-                    os.remove(local_path)
-                except:
-                    pass
+                # 진행 상황 출력
+                total_time_file = time.time() - file_start
+                mem_gb = self.total_samples * 3 * 4 * 32 * 32 * 4 / (1024**3)
+                print(f"  [{i+1}/{len(self.pt_files)}] {filename}: "
+                      f"{num_valid:,} samples, {download_time:.1f}s dl + {load_time:.1f}s load "
+                      f"(total: {self.total_samples:,}, ~{mem_gb:.1f}GB)")
+                sys.stdout.flush()
 
-                if (i + 1) % 5 == 0 or i == len(local_paths) - 1:
-                    mem_gb = self.total_samples * 3 * 4 * 32 * 32 * 4 / (1024**3)  # float32 기준
-                    print(f"  Loaded {i+1}/{len(local_paths)}: {self.total_samples:,} samples (~{mem_gb:.1f}GB)")
-                    sys.stdout.flush()
+                # 메모리 정리 (중간중간)
+                del data
+                if (i + 1) % 10 == 0:
+                    gc.collect()
 
             except Exception as e:
-                print(f"  ✗ Failed to load {local_path}: {e}")
+                print(f"  [{i+1}/{len(self.pt_files)}] ✗ {filename}: {e}")
                 import traceback
                 traceback.print_exc()
                 sys.stdout.flush()
 
-        # 3단계: 배열 통합
-        print(f"\n[RAMPreload] Phase 3: Consolidating arrays...")
+        # 배열 통합
+        print(f"\n[RAMPreload] Consolidating arrays...")
         sys.stdout.flush()
 
         if all_latents_list:
@@ -1482,14 +1487,52 @@ class RAMPreloadSession:
         print(f"  Latents shape: {self.all_latents.shape if self.all_latents is not None else 'None'}")
         print(f"  Embeddings shape: {self.all_embeddings.shape if self.all_embeddings is not None else 'None'}")
         print(f"  Memory usage: {latent_mem:.2f}GB (latents) + {embed_mem:.2f}GB (embeddings) = {latent_mem + embed_mem:.2f}GB")
-        print(f"  Total time: {total_time:.1f}s ({download_time:.1f}s download + {total_time - download_time:.1f}s load)")
+        print(f"  Total time: {total_time:.1f}s ({total_time/len(self.pt_files):.1f}s/file avg)")
         sys.stdout.flush()
+
+        # 캐시 디렉토리 최종 정리 (혹시 남은 파일 삭제)
+        self._cleanup_cache_directory()
 
     def _download_pt_file(self, gcs_path: str) -> str:
         """단일 PT 파일 다운로드"""
         filename = os.path.basename(gcs_path)
         local_path = os.path.join(self.gcs_handler.cache_dir, filename)
         return self.gcs_handler.download_file(gcs_path, local_path)
+
+    def _cleanup_cache_directory(self):
+        """캐시 디렉토리의 모든 PT 파일 및 임시 파일 삭제"""
+        import sys
+        import shutil
+
+        cache_dir = self.gcs_handler.cache_dir
+        if not os.path.exists(cache_dir):
+            return
+
+        deleted_count = 0
+        deleted_size = 0
+
+        try:
+            for filename in os.listdir(cache_dir):
+                filepath = os.path.join(cache_dir, filename)
+                if os.path.isfile(filepath):
+                    try:
+                        file_size = os.path.getsize(filepath)
+                        os.remove(filepath)
+                        deleted_count += 1
+                        deleted_size += file_size
+                    except Exception as e:
+                        print(f"  [RAMPreload] Warning: Could not delete {filename}: {e}")
+
+            if deleted_count > 0:
+                print(f"[RAMPreload] Cache cleanup: deleted {deleted_count} files ({deleted_size / (1024**3):.2f} GB)")
+                sys.stdout.flush()
+            else:
+                print(f"[RAMPreload] Cache directory already clean")
+                sys.stdout.flush()
+
+        except Exception as e:
+            print(f"[RAMPreload] Cache cleanup error: {e}")
+            sys.stdout.flush()
 
     def calculate_steps_per_epoch(self, global_batch_size: int) -> int:
         """에포크당 스텝 수 계산"""
