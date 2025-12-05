@@ -10,8 +10,25 @@ set -euo pipefail
 #   - worker 0이 coordinator 역할
 #
 # 사용법:
-#   로컬에서 실행: ./run_tpu_distributed.sh
+#   로컬에서 실행: ./run_tpu_distributed.sh           # 자동 resume (기존 체크포인트에서 재개)
+#   새로 시작:     ./run_tpu_distributed.sh --fresh   # 기존 체크포인트 무시, 새 학습 시작
 # =============================================================================
+
+# 커맨드라인 인자 파싱
+FRESH_START=""
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --fresh)
+      FRESH_START="--fresh"
+      shift
+      ;;
+    *)
+      echo "Unknown option: $1"
+      echo "Usage: $0 [--fresh]"
+      exit 1
+      ;;
+  esac
+done
 
 ZONE="europe-west4-b"
 INSTANCE="ouroboros"
@@ -133,8 +150,8 @@ echo "[Worker \$WORKER_ID] JAX_COORDINATOR_ADDRESS=\$JAX_COORDINATOR_ADDRESS"
 echo "[Worker \$WORKER_ID] JAX_PROCESS_INDEX=\$JAX_PROCESS_INDEX"
 
 # nohup으로 백그라운드 실행
-nohup python3.11 -u train_tpu_256.py > /tmp/train_worker_\${WORKER_ID}.log 2>&1 &
-echo "[Worker \$WORKER_ID] Started with PID \$!"
+nohup python3.11 -u train_tpu_256.py $FRESH_START > /tmp/train_worker_\${WORKER_ID}.log 2>&1 &
+echo "[Worker \$WORKER_ID] Started with PID \$! $FRESH_START"
 EOF
 
   gcloud compute tpus tpu-vm ssh "$INSTANCE" \
@@ -143,6 +160,11 @@ EOF
     --command="bash -c '$TRAIN_CMD'"
 
   log "All workers launched!"
+  if [[ -n "$FRESH_START" ]]; then
+    log "Mode: FRESH START (ignoring existing checkpoints)"
+  else
+    log "Mode: AUTO RESUME (will resume from latest checkpoint if exists)"
+  fi
   log ""
   log "Monitor logs:"
   log "  ./gcp_show_log.sh --worker=0 -f"
