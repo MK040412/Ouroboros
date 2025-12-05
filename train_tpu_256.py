@@ -87,7 +87,7 @@ class TrainingConfig256:
     cache_dir: str = None  # 자동으로 /tmp 사용
     num_data_workers: int = 56  # 배치 샘플링 병렬 워커 (112 vCPU의 절반)
     prefetch_ahead: int = 4  # PT 파일 프리페치 개수
-    max_cache_files: int = 16  # 최대 동시 캐시 PT 파일 (prefetch_ahead * 2 + num_load_workers)
+    max_cache_files: int = 12  # 최대 캐시 PT 파일 (47GB 디스크, 3GB/파일, 11GB 여유)
     num_download_workers: int = 16  # GCS 다운로드 병렬 워커 (대역폭 활용 극대화)
     num_load_workers: int = 4  # PT 파일 로딩 병렬 워커 (다운로드와 균형)
     
@@ -896,8 +896,8 @@ def main():
             max_cache_files=config.max_cache_files
         )
         print(f"  ✓ GCS session initialized")
-        print(f"    PT files found: {len(gcs_session.pt_files)}")
-        print(f"    Total samples: {gcs_session.total_samples:,}")
+        print(f"    PT files for this worker: {len(gcs_session.pt_files)} (sharded)")
+        print(f"    Total samples (global): {gcs_session.total_samples:,}")
         if gcs_session.pt_files:
             print(f"    First PT file: {gcs_session.pt_files[0]}")
             print(f"    Last PT file: {gcs_session.pt_files[-1]}")
