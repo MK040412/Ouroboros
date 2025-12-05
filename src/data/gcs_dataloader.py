@@ -1383,81 +1383,133 @@ class RAMPreloadSession:
         self._preload_all_pt_files()
 
     def _preload_all_pt_files(self):
-        """모든 PT 파일을 RAM에 로드 (디스크 공간 최소화)
+        """모든 PT 파일을 RAM에 로드 (1-pass GCS 메타데이터 기반)
 
-        전략: 1개씩 다운로드 → RAM 로드 → 즉시 삭제
+        전략 (OOM 방지 + 속도 최적화):
+        - GCS 메타데이터로 파일 크기 조회 (다운로드 없음, 빠름)
+        - 파일 크기 기반 샘플 수 예측 → Pre-allocate
+        - 1-pass: 다운로드 → 직접 복사 → 삭제
+
         디스크 최대 사용량: ~3GB (1개 PT 파일)
+        메모리 피크: ~143GB (pre-allocated + 1 chunk)
         """
         import sys
 
-        print(f"\n[RAMPreload] === Starting Preload ===")
+        print(f"\n[RAMPreload] === Starting Preload (1-Pass with GCS Metadata) ===")
         print(f"[RAMPreload] Files to load: {len(self.pt_files)}")
-        print(f"[RAMPreload] Estimated RAM: {len(self.pt_files) * 3:.1f} GB")
-        print(f"[RAMPreload] Strategy: Sequential download → RAM load → delete (max 3GB disk)")
+        print(f"[RAMPreload] Strategy: GCS metadata → Pre-allocate → 1-pass load")
         sys.stdout.flush()
 
-        # 시작 전 캐시 디렉토리 정리 (이전 실행에서 남은 파일 삭제)
+        # 시작 전 캐시 디렉토리 정리
         self._cleanup_cache_directory()
 
         start_time = time.time()
-        all_latents_list = []
-        all_embeddings_list = []
+
+        # ============================================================
+        # GCS 메타데이터로 샘플 수 예측 (다운로드 없음)
+        # ============================================================
+        print(f"\n[Metadata] Querying file sizes from GCS...")
+        sys.stdout.flush()
+
+        total_bytes = 0
+        for pt_path in self.pt_files:
+            # gs://bucket/path/file.pt → path/file.pt
+            if pt_path.startswith("gs://"):
+                blob_name = pt_path[5:].split('/', 1)[1]
+            else:
+                blob_name = pt_path
+
+            blob = self.gcs_handler.bucket.blob(blob_name)
+            blob.reload()  # 메타데이터 조회
+            total_bytes += blob.size
+
+        # 파일 크기 → 샘플 수 변환 (관찰값: 3GB ≈ 120K samples → 1 sample ≈ 27KB)
+        # 10% 버퍼 추가 (NaN 필터링 고려하면 실제로는 더 적을 것)
+        BYTES_PER_SAMPLE = 27000
+        estimated_samples = int(total_bytes / BYTES_PER_SAMPLE * 1.10)
+
+        print(f"  Total file size: {total_bytes / (1024**3):.2f} GB")
+        print(f"  Estimated samples: {estimated_samples:,} (with 10% buffer)")
+        sys.stdout.flush()
+
+        # ============================================================
+        # PRE-ALLOCATE: 예측 기반 배열 할당
+        # ============================================================
+        print(f"\n[Pre-allocate] Allocating arrays for {estimated_samples:,} samples...")
+        sys.stdout.flush()
+
+        # 고정 shape (첫 파일 다운로드 전에 알아야 하므로)
+        latent_shape = (3, 4, 32, 32)  # crops, channels, height, width
+        embed_dim = 640  # Gemma-3 270M embedding dim
+
+        latent_bytes = estimated_samples * np.prod(latent_shape) * 4
+        embed_bytes = estimated_samples * embed_dim * 4
+        print(f"  Latents: ({estimated_samples:,}, {latent_shape}) = {latent_bytes/(1024**3):.1f}GB")
+        print(f"  Embeddings: ({estimated_samples:,}, {embed_dim}) = {embed_bytes/(1024**3):.1f}GB")
+        print(f"  Total: {(latent_bytes + embed_bytes)/(1024**3):.1f}GB")
+        sys.stdout.flush()
+
+        self.all_latents = np.empty((estimated_samples, *latent_shape), dtype=np.float32)
+        self.all_embeddings = np.empty((estimated_samples, embed_dim), dtype=np.float32)
+        print(f"  Pre-allocation successful!")
+        sys.stdout.flush()
+
+        # ============================================================
+        # 1-PASS: 다운로드 → 직접 복사 → 삭제
+        # ============================================================
+        print(f"\n[Loading] Downloading and copying directly to arrays...")
+        sys.stdout.flush()
+
+        offset = 0
 
         for i, pt_path in enumerate(self.pt_files):
             filename = os.path.basename(pt_path)
             file_start = time.time()
 
             try:
-                # 1. 다운로드
+                # 다운로드
                 local_path = self._download_pt_file(pt_path)
                 download_time = time.time() - file_start
 
-                # 2. RAM에 로드
+                # 로드
                 load_start = time.time()
                 data = _load_pt_file_worker(local_path)
                 load_time = time.time() - load_start
 
-                # 3. 즉시 디스크에서 삭제 (디스크 공간 확보)
-                try:
-                    if os.path.exists(local_path):
-                        os.remove(local_path)
-                        # 삭제 확인
-                        if os.path.exists(local_path):
-                            print(f"  [RAMPreload] Warning: Failed to delete {filename}, file still exists")
-                            sys.stdout.flush()
-                except Exception as delete_err:
-                    print(f"  [RAMPreload] Warning: Could not delete {filename}: {delete_err}")
-                    sys.stdout.flush()
-                    # 강제 삭제 재시도
-                    try:
-                        import shutil
-                        if os.path.exists(local_path):
-                            os.unlink(local_path)
-                    except:
-                        pass
+                # 유효한 샘플만 직접 복사
+                valid_mask = ~np.isnan(data['embeddings']).any(axis=1)
+                num_valid = int(valid_mask.sum())
 
-                # 4. 유효한 샘플만 필터링 (NaN 임베딩 제외)
-                if 'embeddings' in data:
-                    valid_mask = ~np.isnan(data['embeddings']).any(axis=1)
-                    num_valid = valid_mask.sum()
+                if num_valid > 0:
+                    # 버퍼 초과 체크
+                    if offset + num_valid > estimated_samples:
+                        print(f"  [Warning] Buffer overflow! Extending array...")
+                        # 동적 확장 (비상용)
+                        new_size = int((offset + num_valid) * 1.2)
+                        new_latents = np.empty((new_size, *latent_shape), dtype=np.float32)
+                        new_embeddings = np.empty((new_size, embed_dim), dtype=np.float32)
+                        new_latents[:offset] = self.all_latents[:offset]
+                        new_embeddings[:offset] = self.all_embeddings[:offset]
+                        self.all_latents = new_latents
+                        self.all_embeddings = new_embeddings
+                        estimated_samples = new_size
 
-                    if num_valid > 0:
-                        all_latents_list.append(data['latents'][valid_mask])
-                        all_embeddings_list.append(data['embeddings'][valid_mask])
-                        self.total_samples += num_valid
+                    self.all_latents[offset:offset + num_valid] = data['latents'][valid_mask]
+                    self.all_embeddings[offset:offset + num_valid] = data['embeddings'][valid_mask]
+                    offset += num_valid
 
-                # 진행 상황 출력
-                total_time_file = time.time() - file_start
-                mem_gb = self.total_samples * 3 * 4 * 32 * 32 * 4 / (1024**3)
-                print(f"  [{i+1}/{len(self.pt_files)}] {filename}: "
-                      f"{num_valid:,} samples, {download_time:.1f}s dl + {load_time:.1f}s load "
-                      f"(total: {self.total_samples:,}, ~{mem_gb:.1f}GB)")
-                sys.stdout.flush()
-
-                # 메모리 정리 (중간중간)
+                # 즉시 삭제 (메모리 + 디스크)
                 del data
-                if (i + 1) % 10 == 0:
-                    gc.collect()
+                del valid_mask
+                gc.collect()
+
+                self._delete_file_safe(local_path, filename)
+
+                mem_used = offset * (np.prod(latent_shape) + embed_dim) * 4 / (1024**3)
+                print(f"  [{i+1}/{len(self.pt_files)}] {filename}: "
+                      f"{num_valid:,} samples → offset {offset:,} "
+                      f"({download_time:.1f}s + {load_time:.1f}s, ~{mem_used:.1f}GB used)")
+                sys.stdout.flush()
 
             except Exception as e:
                 print(f"  [{i+1}/{len(self.pt_files)}] ✗ {filename}: {e}")
@@ -1465,55 +1517,12 @@ class RAMPreloadSession:
                 traceback.print_exc()
                 sys.stdout.flush()
 
-        # 배열 통합 (메모리 효율적 방식: pre-allocate + copy + free)
-        print(f"\n[RAMPreload] Consolidating arrays (memory-efficient)...")
-        print(f"  Total samples to consolidate: {self.total_samples:,}")
-        sys.stdout.flush()
-
-        if all_latents_list and self.total_samples > 0:
-            # 1. 첫 번째 배열에서 shape 정보 추출
-            latent_shape = all_latents_list[0].shape[1:]  # (3, 4, 32, 32)
-            embed_dim = all_embeddings_list[0].shape[1]   # 640
-
-            # 2. 최종 배열 pre-allocate (원본 리스트 메모리 먼저 일부 해제)
-            # 예상 메모리: latents ~130GB, embeddings ~7GB
-            latent_bytes = self.total_samples * np.prod(latent_shape) * 4
-            embed_bytes = self.total_samples * embed_dim * 4
-            print(f"  Pre-allocating: latents ({self.total_samples}, {latent_shape}) = {latent_bytes/(1024**3):.1f}GB")
-            print(f"  Pre-allocating: embeddings ({self.total_samples}, {embed_dim}) = {embed_bytes/(1024**3):.1f}GB")
-            sys.stdout.flush()
-
-            # GC 실행하여 가능한 메모리 확보
-            gc.collect()
-
-            self.all_latents = np.empty((self.total_samples, *latent_shape), dtype=np.float32)
-            self.all_embeddings = np.empty((self.total_samples, embed_dim), dtype=np.float32)
-            print(f"  Pre-allocation successful")
-            sys.stdout.flush()
-
-            # 3. 청크 단위로 복사하면서 원본 즉시 해제
-            offset = 0
-            for i, (lat_chunk, emb_chunk) in enumerate(zip(all_latents_list, all_embeddings_list)):
-                chunk_size = lat_chunk.shape[0]
-                self.all_latents[offset:offset + chunk_size] = lat_chunk
-                self.all_embeddings[offset:offset + chunk_size] = emb_chunk
-                offset += chunk_size
-
-                # 원본 청크 즉시 해제
-                all_latents_list[i] = None
-                all_embeddings_list[i] = None
-
-                # 5개 청크마다 GC 실행
-                if (i + 1) % 5 == 0:
-                    gc.collect()
-
-            print(f"  Consolidation complete (offset={offset})")
-            sys.stdout.flush()
-
-            # 리스트 자체 해제
-            del all_latents_list
-            del all_embeddings_list
-            gc.collect()
+        # 실제 크기로 truncate
+        self.total_samples = offset
+        if offset < estimated_samples:
+            print(f"\n[Truncate] {estimated_samples:,} → {offset:,} (saving memory)")
+            self.all_latents = self.all_latents[:offset]
+            self.all_embeddings = self.all_embeddings[:offset]
 
         total_time = time.time() - start_time
         latent_mem = self.all_latents.nbytes / (1024**3) if self.all_latents is not None else 0
@@ -1535,6 +1544,19 @@ class RAMPreloadSession:
         filename = os.path.basename(gcs_path)
         local_path = os.path.join(self.gcs_handler.cache_dir, filename)
         return self.gcs_handler.download_file(gcs_path, local_path)
+
+    def _delete_file_safe(self, local_path: str, filename: str):
+        """파일 안전 삭제 (에러 무시)"""
+        import sys
+        try:
+            if os.path.exists(local_path):
+                os.remove(local_path)
+                if os.path.exists(local_path):
+                    print(f"  [RAMPreload] Warning: Failed to delete {filename}")
+                    sys.stdout.flush()
+        except Exception as e:
+            print(f"  [RAMPreload] Warning: Could not delete {filename}: {e}")
+            sys.stdout.flush()
 
     def _cleanup_cache_directory(self):
         """캐시 디렉토리의 모든 PT 파일 및 임시 파일 삭제"""
