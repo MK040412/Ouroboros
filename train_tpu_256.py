@@ -79,7 +79,7 @@ class TrainingConfig256:
     
     # 학습
     num_epochs: int = 20
-    steps_per_epoch: Optional[int] = None  # None이면 데이터셋에서 자동 계산
+    steps_per_epoch: Optional[int] = 10000  # 고정값 (10000 × 1024 = 10.24M images/epoch)
     learning_rate: float = 0.5          # muP base learning rate
     mup_base_dim: int = 1                # muP base dimension for scaling
     warmup_steps: int = 1000
