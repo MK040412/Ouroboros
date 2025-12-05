@@ -1,5 +1,7 @@
 """
-TPU v5e 16 Pod에서 256² 이미지로 XUT-Small 학습
+TPU v5e 32 Pod에서 256² 이미지로 XUT-Small 학습
+- 8 workers (hosts), 각 worker에 4개 TPU 칩
+- 총 32 TPU 코어
 Batch Size: 2048 (한 번에 처리)
 Dataset: KBlueLeaf/coyo11m-256px-ccrop-latent
 """
@@ -157,15 +159,15 @@ class DiffusionSchedule:
 
 
 # ============================================
-# Sharding Strategy (TPU Pod 16)
+# Sharding Strategy (TPU Pod 32)
 # ============================================
 @dataclass
 class ShardingRules:
-    """TPU Pod 16 분산 전략
+    """TPU Pod 32 분산 전략
 
-    TPU v5e-16 구성:
-    - 4 workers (hosts), 각 4개 TPU 칩
-    - 총 16 TPU 코어
+    TPU v5e-32 구성:
+    - 8 workers (hosts), 각 4개 TPU 칩
+    - 총 32 TPU 코어
     - Data parallelism across all devices
     """
     data_axis: str = "data"      # 데이터 병렬화 축
@@ -362,7 +364,7 @@ class PrefetchDataLoader:
 # ============================================
 def create_sharding_mesh(num_devices: int):
     """TPU 메시 생성"""
-    # v5e 16 pod: 16개 TPU 칩
+    # v5e 32 pod: 32개 TPU 칩 (8 workers × 4 chips)
     devices = mesh_utils.create_device_mesh((num_devices,))
     return Mesh(devices, axis_names=("batch",))
 
@@ -713,7 +715,7 @@ def main():
     logger = logging.getLogger(__name__)
     
     print("="*60)
-    print("TPU v5e 16 Pod Training (256² XUT-Small)")
+    print("TPU v5e 32 Pod Training (256² XUT-Small)")
     print("="*60)
     sys.stdout.flush()
     logger.info("Main function started")
@@ -815,7 +817,7 @@ def main():
                     "process_count": process_count,
                     "num_workers": 112,
                 },
-                name=f"xut-small-256-tpu-pod-16"
+                name=f"xut-small-256-tpu-pod-32"
             )
             wandb_enabled = True
             print(f"  ✓ Wandb initialized")

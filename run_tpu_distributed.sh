@@ -139,13 +139,13 @@ run_remote() {
   fi
   log "Coordinator IP: $COORDINATOR_IP"
 
-  # 3. 각 worker에 대해 실행 (Worker 1,2,3 먼저, Worker 0 마지막)
+  # 3. 각 worker에 대해 실행 (Worker 1,2,3,4,5,6,7 먼저, Worker 0 마지막)
   # Worker 0이 coordinator이므로 다른 worker들이 준비된 후 시작해야 함
   log "Step 3: Launching training on all workers..."
-  log "  Order: Workers 1,2,3 first, then Worker 0 (coordinator) last"
+  log "  Order: Workers 1,2,3,4,5,6,7 first, then Worker 0 (coordinator) last"
 
   # Worker 순서: 1, 2, 3, 0 (coordinator 마지막)
-  for WORKER_ID in 1 2 3 0; do
+  for WORKER_ID in 1 2 3 4 5 6 7 0; do
     log "Launching worker $WORKER_ID..."
 
     # 각 worker에서 실행할 명령
