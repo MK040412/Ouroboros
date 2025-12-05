@@ -1465,15 +1465,52 @@ class RAMPreloadSession:
                 traceback.print_exc()
                 sys.stdout.flush()
 
-        # 배열 통합
-        print(f"\n[RAMPreload] Consolidating arrays...")
+        # 배열 통합 (메모리 효율적 방식: pre-allocate + copy + free)
+        print(f"\n[RAMPreload] Consolidating arrays (memory-efficient)...")
+        print(f"  Total samples to consolidate: {self.total_samples:,}")
         sys.stdout.flush()
 
-        if all_latents_list:
-            self.all_latents = np.concatenate(all_latents_list, axis=0)
-            self.all_embeddings = np.concatenate(all_embeddings_list, axis=0)
+        if all_latents_list and self.total_samples > 0:
+            # 1. 첫 번째 배열에서 shape 정보 추출
+            latent_shape = all_latents_list[0].shape[1:]  # (3, 4, 32, 32)
+            embed_dim = all_embeddings_list[0].shape[1]   # 640
 
-            # 메모리 해제
+            # 2. 최종 배열 pre-allocate (원본 리스트 메모리 먼저 일부 해제)
+            # 예상 메모리: latents ~130GB, embeddings ~7GB
+            latent_bytes = self.total_samples * np.prod(latent_shape) * 4
+            embed_bytes = self.total_samples * embed_dim * 4
+            print(f"  Pre-allocating: latents ({self.total_samples}, {latent_shape}) = {latent_bytes/(1024**3):.1f}GB")
+            print(f"  Pre-allocating: embeddings ({self.total_samples}, {embed_dim}) = {embed_bytes/(1024**3):.1f}GB")
+            sys.stdout.flush()
+
+            # GC 실행하여 가능한 메모리 확보
+            gc.collect()
+
+            self.all_latents = np.empty((self.total_samples, *latent_shape), dtype=np.float32)
+            self.all_embeddings = np.empty((self.total_samples, embed_dim), dtype=np.float32)
+            print(f"  Pre-allocation successful")
+            sys.stdout.flush()
+
+            # 3. 청크 단위로 복사하면서 원본 즉시 해제
+            offset = 0
+            for i, (lat_chunk, emb_chunk) in enumerate(zip(all_latents_list, all_embeddings_list)):
+                chunk_size = lat_chunk.shape[0]
+                self.all_latents[offset:offset + chunk_size] = lat_chunk
+                self.all_embeddings[offset:offset + chunk_size] = emb_chunk
+                offset += chunk_size
+
+                # 원본 청크 즉시 해제
+                all_latents_list[i] = None
+                all_embeddings_list[i] = None
+
+                # 5개 청크마다 GC 실행
+                if (i + 1) % 5 == 0:
+                    gc.collect()
+
+            print(f"  Consolidation complete (offset={offset})")
+            sys.stdout.flush()
+
+            # 리스트 자체 해제
             del all_latents_list
             del all_embeddings_list
             gc.collect()
