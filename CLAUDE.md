@@ -77,6 +77,7 @@ Test config in `tests/conftest.py`:
 ## Running Environment
 
 - TPU v5e
-- tpuv5litepod-16 environment
+- tpuv5litepod-32 environment
+- 8 workers, 4 chips for each worker
 - 112 vCPU
 - 150GB RAM per worker (free memory is less)
