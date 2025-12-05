@@ -9,6 +9,8 @@ Dataset: KBlueLeaf/coyo11m-256px-ccrop-latent
 import os
 import sys
 import gc
+import signal
+import argparse
 import jax
 import jax.numpy as jnp
 from jax.experimental import mesh_utils
@@ -110,6 +112,156 @@ class TrainingConfig256:
     # GCS Checkpoint 설정
     checkpoint_gcs_bucket: str = "rdy-tpu-data-2025"
     checkpoint_gcs_prefix: str = "checkpoints/xut-small-256"  # gs://bucket/prefix/run_YYYYMMDD_HHMMSS/
+    checkpoint_every_n_steps: int = 500  # 스텝 단위 체크포인트 (Preemption 대비)
+    checkpoint_keep_last_n: int = 3  # 최근 N개 체크포인트만 유지
+
+
+# ============================================
+# Checkpoint Management (Resume 지원)
+# ============================================
+def find_latest_checkpoint(config: TrainingConfig256) -> Optional[dict]:
+    """GCS에서 가장 최근 체크포인트 찾기
+
+    Returns:
+        체크포인트 데이터 dict 또는 None
+    """
+    if jax.process_index() != 0:
+        # Process 0만 탐색, 결과는 broadcast
+        return None
+
+    try:
+        client = storage.Client()
+        bucket = client.bucket(config.checkpoint_gcs_bucket)
+        prefix = config.checkpoint_gcs_prefix + "/"
+
+        print(f"\n[Checkpoint] Searching for checkpoints in gs://{config.checkpoint_gcs_bucket}/{prefix}")
+        sys.stdout.flush()
+
+        # 모든 체크포인트 파일 나열
+        blobs = list(bucket.list_blobs(prefix=prefix))
+        ckpt_blobs = [b for b in blobs if b.name.endswith('.ckpt')]
+
+        if not ckpt_blobs:
+            print(f"  No checkpoints found")
+            return None
+
+        # 가장 최근 파일 찾기 (updated 시간 기준)
+        latest_blob = max(ckpt_blobs, key=lambda b: b.updated)
+        print(f"  Found {len(ckpt_blobs)} checkpoints")
+        print(f"  Latest: {latest_blob.name}")
+        print(f"  Updated: {latest_blob.updated}")
+        sys.stdout.flush()
+
+        # 다운로드 및 로드
+        ckpt_bytes = latest_blob.download_as_bytes()
+        ckpt_data = pickle.loads(ckpt_bytes)
+
+        print(f"  ✓ Loaded checkpoint: epoch={ckpt_data['epoch']}, step={ckpt_data['step']}, loss={ckpt_data['loss']:.6f}")
+        sys.stdout.flush()
+
+        return ckpt_data
+
+    except Exception as e:
+        print(f"  ✗ Failed to find/load checkpoint: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.stdout.flush()
+        return None
+
+
+def restore_from_checkpoint(model, optimizer, ckpt_data: dict, config: TrainingConfig256):
+    """체크포인트에서 모델과 옵티마이저 상태 복원
+
+    Returns:
+        (start_epoch, start_step, run_id)
+    """
+    print(f"\n[Restore] Restoring from checkpoint...")
+    sys.stdout.flush()
+
+    try:
+        # numpy -> JAX array 변환
+        def to_jax(x):
+            if isinstance(x, np.ndarray):
+                # bfloat16 변환 (config에 따라)
+                if config.use_bfloat16 and x.dtype == np.float32:
+                    return jnp.array(x, dtype=jnp.bfloat16)
+                return jnp.array(x)
+            return x
+
+        model_state_jax = jax.tree_util.tree_map(to_jax, ckpt_data['model_state'])
+        optimizer_state_jax = jax.tree_util.tree_map(to_jax, ckpt_data['optimizer_state'])
+
+        # 상태 복원
+        nnx.update(model, model_state_jax)
+        nnx.update(optimizer, optimizer_state_jax)
+
+        start_epoch = ckpt_data['epoch']
+        start_step = ckpt_data['step']
+        run_id = ckpt_data.get('run_id', None)
+
+        print(f"  ✓ Model and optimizer restored")
+        print(f"  Resuming from epoch={start_epoch}, step={start_step}")
+        if run_id:
+            print(f"  Run ID: {run_id}")
+        sys.stdout.flush()
+
+        return start_epoch, start_step, run_id
+
+    except Exception as e:
+        print(f"  ✗ Failed to restore: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.stdout.flush()
+        raise
+
+
+class GracefulKiller:
+    """SIGTERM/SIGINT 핸들러 (Preemption 대비 긴급 체크포인트)"""
+
+    def __init__(self):
+        self.kill_now = False
+        self.trainer = None
+        self.current_epoch = 0
+        self.current_step = 0
+        self.current_loss = 0.0
+
+        # 시그널 등록
+        signal.signal(signal.SIGTERM, self._handle_signal)
+        signal.signal(signal.SIGINT, self._handle_signal)
+
+    def _handle_signal(self, signum, frame):
+        sig_name = "SIGTERM" if signum == signal.SIGTERM else "SIGINT"
+        print(f"\n{'='*60}")
+        print(f"[SIGNAL] Received {sig_name} - Saving emergency checkpoint...")
+        print(f"{'='*60}")
+        sys.stdout.flush()
+
+        self.kill_now = True
+
+        # 긴급 체크포인트 저장
+        if self.trainer is not None:
+            try:
+                self.trainer.save_checkpoint(
+                    self.current_epoch,
+                    self.current_step,
+                    self.current_loss,
+                    emergency=True
+                )
+                print(f"  ✓ Emergency checkpoint saved")
+            except Exception as e:
+                print(f"  ✗ Emergency checkpoint failed: {e}")
+            sys.stdout.flush()
+
+    def register_trainer(self, trainer, epoch, step, loss):
+        """현재 학습 상태 등록 (주기적 호출)"""
+        self.trainer = trainer
+        self.current_epoch = epoch
+        self.current_step = step
+        self.current_loss = loss
+
+
+# Global killer instance
+_graceful_killer = GracefulKiller()
 
 
 # ============================================
@@ -507,16 +659,23 @@ class TPUTrainer:
         loss = _train_step_jit(self.model, self.optimizer, x_t, t_cond, noise, text_emb_3d)
         return loss, rng_key
     
-    def save_checkpoint(self, epoch: int, step: int, loss: float):
+    def save_checkpoint(self, epoch: int, step: int, loss: float, emergency: bool = False):
         """체크포인트를 GCS에 저장 (Process 0만)
 
-        저장 경로: gs://{bucket}/{prefix}/{run_id}/epoch_{epoch:03d}_step_{step:06d}.ckpt
+        저장 경로: gs://{bucket}/{prefix}/epoch_{epoch:03d}_step_{step:06d}.ckpt
+
+        Args:
+            epoch: 현재 에포크
+            step: 현재 스텝 (에포크 내)
+            loss: 현재 loss 값
+            emergency: True면 긴급 체크포인트 (SIGTERM 등)
         """
         # Process 0만 저장 (분산 학습에서 중복 저장 방지)
         if jax.process_index() != 0:
             return
 
-        checkpoint_name = f"epoch_{epoch:03d}_step_{step:06d}.ckpt"
+        prefix = "emergency_" if emergency else ""
+        checkpoint_name = f"{prefix}epoch_{epoch:03d}_step_{step:06d}.ckpt"
 
         try:
             # 모델 상태 추출 (nnx.Module -> state dict)
@@ -551,6 +710,7 @@ class TPUTrainer:
                 },
                 'run_id': self.run_id,
                 'timestamp': datetime.now().isoformat(),
+                'emergency': emergency,
             }
 
             # Pickle로 직렬화
@@ -564,13 +724,19 @@ class TPUTrainer:
                 gcs_path = f"{self.gcs_checkpoint_path}/{checkpoint_name}"
                 blob = self.gcs_bucket.blob(gcs_path)
                 blob.upload_from_string(checkpoint_bytes, content_type='application/octet-stream')
-                print(f"  ✓ Checkpoint saved to GCS: gs://{self.config.checkpoint_gcs_bucket}/{gcs_path}")
+                ckpt_type = "Emergency checkpoint" if emergency else "Checkpoint"
+                print(f"  ✓ {ckpt_type} saved: gs://{self.config.checkpoint_gcs_bucket}/{gcs_path}")
+
+                # 로테이션: 최근 N개만 유지 (emergency가 아닐 때만)
+                if not emergency:
+                    self._rotate_checkpoints()
 
                 # Wandb에 GCS 경로 로깅
-                if self.wandb_enabled:
+                if self.wandb_enabled and not emergency:
                     wandb.log({
                         "checkpoint_gcs_path": f"gs://{self.config.checkpoint_gcs_bucket}/{gcs_path}",
                         "checkpoint_epoch": epoch,
+                        "checkpoint_step": step,
                     })
             else:
                 # GCS 사용 불가 시 로컬 저장
@@ -583,6 +749,32 @@ class TPUTrainer:
             print(f"  ✗ Failed to save checkpoint: {e}")
             import traceback
             traceback.print_exc()
+
+    def _rotate_checkpoints(self):
+        """오래된 체크포인트 삭제 (최근 N개만 유지)"""
+        if self.gcs_bucket is None:
+            return
+
+        try:
+            # 체크포인트 목록 조회
+            blobs = list(self.gcs_bucket.list_blobs(prefix=self.gcs_checkpoint_path + "/"))
+            # emergency가 아닌 일반 체크포인트만 필터
+            ckpt_blobs = [b for b in blobs if b.name.endswith('.ckpt') and 'emergency_' not in b.name]
+
+            if len(ckpt_blobs) <= self.config.checkpoint_keep_last_n:
+                return
+
+            # 시간순 정렬 (오래된 것부터)
+            ckpt_blobs.sort(key=lambda b: b.updated)
+
+            # 삭제할 개수
+            to_delete = len(ckpt_blobs) - self.config.checkpoint_keep_last_n
+            for blob in ckpt_blobs[:to_delete]:
+                blob.delete()
+                print(f"  [Rotate] Deleted old checkpoint: {blob.name}")
+
+        except Exception as e:
+            print(f"  [Rotate] Warning: Failed to rotate checkpoints: {e}")
     
     def train_epoch(self, prefetch_loader: 'PrefetchDataLoader', epoch: int):
         """에포크 학습 (Sharded prefetch 파이프라인)"""
@@ -702,6 +894,15 @@ class TPUTrainer:
 
             losses.append(loss_val)
 
+            # SIGTERM 핸들러에 현재 상태 등록 (긴급 체크포인트용)
+            _graceful_killer.register_trainer(self, epoch, step, loss_val)
+
+            # Preemption 감지 시 즉시 종료
+            if _graceful_killer.kill_now:
+                print(f"\n[PREEMPT] Stopping training due to signal...")
+                sys.stdout.flush()
+                break
+
             # Wandb 로깅
             if self.wandb_enabled:
                 wandb.log({
@@ -710,15 +911,20 @@ class TPUTrainer:
                     "epoch": epoch + 1,
                     "step": step + 1,
                 }, step=global_step)
-            
+
             step += 1
-            
+
+            # 스텝 단위 체크포인트 저장
+            if step % self.config.checkpoint_every_n_steps == 0:
+                avg_loss = np.mean(losses[-100:]) if len(losses) >= 100 else np.mean(losses)
+                self.save_checkpoint(epoch, step, avg_loss)
+
             if step % 100 == 0:
                 avg_loss = np.mean(losses[-100:])
                 print(f"Epoch {epoch+1}/{self.config.num_epochs} "
                       f"Step {step}/{self.config.steps_per_epoch} "
                       f"Loss: {avg_loss:.6f} [Sharded]")
-            
+
             if step >= self.config.steps_per_epoch:
                 break
         
@@ -729,10 +935,20 @@ class TPUTrainer:
 # ============================================
 # Main
 # ============================================
+def parse_args():
+    """커맨드라인 인자 파싱"""
+    parser = argparse.ArgumentParser(description='TPU v5e 32 Pod Training (256² XUT-Small)')
+    parser.add_argument('--fresh', action='store_true',
+                        help='Start fresh training (ignore existing checkpoints)')
+    return parser.parse_args()
+
+
 def main():
-    import sys
     import logging
     import os as _os
+
+    # 커맨드라인 인자 파싱
+    args = parse_args()
 
     # Worker별 고유 로그 파일 (권한 문제 방지)
     worker_id = _os.environ.get('JAX_PROCESS_INDEX', '0')
@@ -1056,7 +1272,66 @@ def main():
         traceback.print_exc()
         sys.stdout.flush()
         return
-    
+
+    # 체크포인트에서 Resume (--fresh가 아닐 때)
+    start_epoch = 0
+    start_step = 0
+    resumed_run_id = None
+
+    if not args.fresh:
+        print("\n" + "="*60)
+        print("[Step 10.5] Checking for existing checkpoints...")
+        print("="*60)
+        sys.stdout.flush()
+
+        ckpt_data = find_latest_checkpoint(config)
+
+        # 분산 학습: Process 0의 결과를 다른 프로세스에 broadcast
+        if use_distributed:
+            from jax.experimental.multihost_utils import broadcast_one_to_all
+            # Process 0에서 찾은 체크포인트 데이터를 serialize해서 broadcast
+            if process_index == 0 and ckpt_data is not None:
+                ckpt_bytes = pickle.dumps(ckpt_data)
+                ckpt_size = len(ckpt_bytes)
+            else:
+                ckpt_bytes = b''
+                ckpt_size = 0
+
+            # 크기 먼저 broadcast
+            ckpt_size_arr = jnp.array([ckpt_size if process_index == 0 else 0])
+            ckpt_size_arr = broadcast_one_to_all(ckpt_size_arr)
+            ckpt_size = int(ckpt_size_arr[0])
+
+            if ckpt_size > 0:
+                # 체크포인트 데이터 broadcast
+                if process_index == 0:
+                    ckpt_np = np.frombuffer(ckpt_bytes, dtype=np.uint8)
+                else:
+                    ckpt_np = np.zeros(ckpt_size, dtype=np.uint8)
+
+                ckpt_jax = jnp.array(ckpt_np)
+                ckpt_jax = broadcast_one_to_all(ckpt_jax)
+                ckpt_bytes = bytes(np.array(ckpt_jax))
+                ckpt_data = pickle.loads(ckpt_bytes)
+
+        if ckpt_data is not None:
+            try:
+                start_epoch, start_step, resumed_run_id = restore_from_checkpoint(
+                    model, optimizer, ckpt_data, config
+                )
+                print(f"  ✓ Resumed from epoch={start_epoch}, step={start_step}")
+            except Exception as e:
+                print(f"  ✗ Resume failed, starting fresh: {e}")
+                start_epoch = 0
+                start_step = 0
+        else:
+            print(f"  No checkpoint found, starting fresh training")
+    else:
+        print("\n" + "="*60)
+        print("[Step 10.5] --fresh flag set, starting new training")
+        print("="*60)
+    sys.stdout.flush()
+
     # 스케줄
     print(f"\n[Step 11] Creating Diffusion Schedule...")
     sys.stdout.flush()
@@ -1074,25 +1349,32 @@ def main():
     print("[Step 12] Initializing TPUTrainer...")
     print("="*60)
     sys.stdout.flush()
-    
-    trainer = TPUTrainer(model, optimizer, schedule, config, wandb_enabled=wandb_enabled)
+
+    trainer = TPUTrainer(
+        model, optimizer, schedule, config,
+        wandb_enabled=wandb_enabled,
+        run_id=resumed_run_id  # 이전 run 재개 시 동일 run_id 사용
+    )
     print(f"  ✓ TPUTrainer initialized")
+    print(f"  Run ID: {trainer.run_id}")
     sys.stdout.flush()
-    
+
     print("\n" + "="*70)
     print("[Step 13] Training Starting")
     print("="*70)
+    print(f"  Start epoch: {start_epoch} (step: {start_step})")
     print(f"  Total epochs: {config.num_epochs}")
     print(f"  PT files per epoch: {len(data_session.pt_files)}")
     print(f"  Steps per epoch: {config.steps_per_epoch:,} ({data_session.total_samples:,} samples / {config.global_batch_size} batch)")
     print(f"  Global batch size: {config.global_batch_size}")
+    print(f"  Checkpoint every: {config.checkpoint_every_n_steps} steps")
     print(f"  Data mode: {'RAM Preload (network I/O free)' if config.use_ram_preload else 'GCS Streaming'}")
     sys.stdout.flush()
-    
+
     total_start = time.time()
-    
+
     # Epoch별로 모든 PT 파일 순회 (1 epoch = 모든 PT 파일 한 바퀴)
-    for epoch in range(config.num_epochs):
+    for epoch in range(start_epoch, config.num_epochs):
         print(f"\n{'='*70}")
         print(f"[Epoch {epoch+1}/{config.num_epochs}]")
         print(f"{'='*70}")
@@ -1193,11 +1475,24 @@ def main():
         trainer.save_checkpoint(epoch, config.steps_per_epoch, epoch_avg_loss)
         if process_index == 0 and wandb_enabled:
             wandb.log({"checkpoint_saved": epoch + 1})
-    
+
+        # Preemption 감지 시 루프 종료
+        if _graceful_killer.kill_now:
+            print(f"\n[PREEMPT] Training interrupted by signal, exiting...")
+            sys.stdout.flush()
+            break
+
     total_time = time.time() - total_start
-    print("\n" + "="*60)
-    print("✓ Training completed!")
-    print("="*60)
+
+    if _graceful_killer.kill_now:
+        print("\n" + "="*60)
+        print("⚠ Training interrupted (preemption)")
+        print("="*60)
+        print(f"  Last checkpoint saved. Resume with: ./run_tpu_distributed.sh")
+    else:
+        print("\n" + "="*60)
+        print("✓ Training completed!")
+        print("="*60)
     print(f"Total training time: {total_time/3600:.1f}h")
 
     # 데이터 세션 종료
