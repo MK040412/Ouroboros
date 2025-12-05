@@ -672,21 +672,28 @@ class TPUTrainer:
         loss = _train_step_jit(self.model, self.optimizer, x_t, t_cond, velocity_target, text_emb_3d)
         return loss, rng_key
     
-    def save_checkpoint(self, epoch: int, step: int, loss: float):
-        """체크포인트를 GCS에 저장 (Process 0만, 에포크 단위)
+    def save_checkpoint(self, epoch: int, step: int, loss: float, is_step_checkpoint: bool = False):
+        """체크포인트를 GCS에 저장 (Process 0만)
 
-        저장 경로: gs://{bucket}/{prefix}/epoch_{epoch:03d}.ckpt
+        저장 경로:
+          - Epoch: gs://{bucket}/{prefix}/epoch_{epoch:03d}.ckpt
+          - Step:  gs://{bucket}/{prefix}/step_{global_step:06d}.ckpt
 
         Args:
             epoch: 현재 에포크
             step: 현재 스텝 (에포크 내)
             loss: 현재 loss 값
+            is_step_checkpoint: True면 step 체크포인트, False면 epoch 체크포인트
         """
         # Process 0만 저장 (분산 학습에서 중복 저장 방지)
         if jax.process_index() != 0:
             return
 
-        checkpoint_name = f"epoch_{epoch:03d}.ckpt"
+        if is_step_checkpoint:
+            global_step = epoch * self.config.steps_per_epoch + step
+            checkpoint_name = f"step_{global_step:06d}.ckpt"
+        else:
+            checkpoint_name = f"epoch_{epoch:03d}.ckpt"
 
         try:
             # 모델 상태 추출 (nnx.Module -> state dict)
@@ -736,8 +743,9 @@ class TPUTrainer:
                 blob.upload_from_string(checkpoint_bytes, content_type='application/octet-stream')
                 print(f"  ✓ Checkpoint saved: gs://{self.config.checkpoint_gcs_bucket}/{gcs_path}")
 
-                # 로테이션: 최근 N개만 유지
-                self._rotate_checkpoints()
+                # 로테이션: step 체크포인트만 최근 N개 유지 (epoch 체크포인트는 보존)
+                if is_step_checkpoint:
+                    self._rotate_step_checkpoints()
 
                 # Wandb에 GCS 경로 로깅
                 if self.wandb_enabled:
@@ -757,36 +765,54 @@ class TPUTrainer:
             import traceback
             traceback.print_exc()
 
-    def _rotate_checkpoints(self):
-        """오래된 체크포인트 삭제 (최근 N개만 유지)"""
+    def _rotate_step_checkpoints(self):
+        """오래된 step 체크포인트 삭제 (최근 N개만 유지, epoch 체크포인트는 보존)"""
         if self.gcs_bucket is None:
             return
 
         try:
             # 체크포인트 목록 조회
             blobs = list(self.gcs_bucket.list_blobs(prefix=self.gcs_checkpoint_path + "/"))
-            ckpt_blobs = [b for b in blobs if b.name.endswith('.ckpt')]
+            # step 체크포인트만 필터 (epoch 체크포인트 제외)
+            step_ckpt_blobs = [b for b in blobs if b.name.endswith('.ckpt') and '/step_' in b.name]
 
-            if len(ckpt_blobs) <= self.config.checkpoint_keep_last_n:
+            if len(step_ckpt_blobs) <= self.config.checkpoint_keep_last_n:
                 return
 
             # 시간순 정렬 (오래된 것부터)
-            ckpt_blobs.sort(key=lambda b: b.updated)
+            step_ckpt_blobs.sort(key=lambda b: b.updated)
 
             # 삭제할 개수
-            to_delete = len(ckpt_blobs) - self.config.checkpoint_keep_last_n
-            for blob in ckpt_blobs[:to_delete]:
+            to_delete = len(step_ckpt_blobs) - self.config.checkpoint_keep_last_n
+            for blob in step_ckpt_blobs[:to_delete]:
                 blob.delete()
-                print(f"  [Rotate] Deleted old checkpoint: {blob.name}")
+                print(f"  [Rotate] Deleted old step checkpoint: {blob.name}")
 
         except Exception as e:
-            print(f"  [Rotate] Warning: Failed to rotate checkpoints: {e}")
+            print(f"  [Rotate] Warning: Failed to rotate step checkpoints: {e}")
     
-    def train_epoch(self, prefetch_loader: 'PrefetchDataLoader', epoch: int):
-        """에포크 학습 (Sharded prefetch 파이프라인)"""
+    def train_epoch(self, prefetch_loader: 'PrefetchDataLoader', epoch: int, start_step: int = 0):
+        """에포크 학습 (Sharded prefetch 파이프라인)
+
+        Args:
+            prefetch_loader: 데이터 로더
+            epoch: 현재 에포크 번호
+            start_step: 시작 스텝 (resume 시 사용, 이전 스텝은 건너뜀)
+        """
         losses = []
         rng_key = jax.random.PRNGKey(epoch)
         step = 0
+        skipped_steps = 0
+        last_log_time = time.time()  # 100 step 시간 측정용
+
+        # Loss 로그 파일 (Worker 0만)
+        loss_log_file = None
+        if jax.process_index() == 0:
+            loss_log_path = Path("/tmp/loss_log.csv")
+            write_header = not loss_log_path.exists()
+            loss_log_file = open(loss_log_path, "a")
+            if write_header:
+                loss_log_file.write("timestamp,epoch,step,global_step,loss,lr\n")
 
         # Sharding spec: 배치는 'data' 축, 나머지는 replica
         batch_sharding = self.sharding_rules.named_sharding(
@@ -803,6 +829,18 @@ class TPUTrainer:
         num_local_devices = len(local_devices)
 
         for batch_latents, batch_embeddings in prefetch_loader.get_batches():
+            # Resume: start_step 이전 배치 건너뛰기
+            if step < start_step:
+                step += 1
+                skipped_steps += 1
+                if skipped_steps % 500 == 0:
+                    print(f"  [Resume] Skipping steps... {skipped_steps}/{start_step}")
+                    sys.stdout.flush()
+                continue
+            elif skipped_steps > 0 and step == start_step:
+                print(f"  [Resume] Skipped {skipped_steps} steps, resuming from step {step}")
+                sys.stdout.flush()
+
             local_batch_size = batch_latents.shape[0]
             per_device_batch = local_batch_size // num_local_devices
 
@@ -925,13 +963,35 @@ class TPUTrainer:
 
             if step % 100 == 0:
                 avg_loss = np.mean(losses[-100:])
+                current_time = time.time()
+                elapsed = current_time - last_log_time
+                steps_per_sec = 100 / elapsed if elapsed > 0 else 0
+                last_log_time = current_time
+
                 print(f"Epoch {epoch+1}/{self.config.num_epochs} "
                       f"Step {step}/{self.config.steps_per_epoch} "
-                      f"Loss: {avg_loss:.6f} [Sharded]")
+                      f"Loss: {avg_loss:.6f} "
+                      f"[{elapsed:.1f}s, {steps_per_sec:.2f} step/s]")
+
+                # Worker 0: loss 로그 파일에 기록
+                if loss_log_file is not None:
+                    timestamp = datetime.now().isoformat()
+                    lr = float(self.lr_schedule(global_step))
+                    loss_log_file.write(f"{timestamp},{epoch+1},{step},{global_step},{avg_loss:.6f},{lr:.8f}\n")
+                    loss_log_file.flush()
+
+            # 1000 step마다 체크포인트 저장 (Preemption 대비)
+            if step % 1000 == 0 and step > 0:
+                avg_loss_1k = np.mean(losses[-1000:]) if len(losses) >= 1000 else np.mean(losses)
+                self.save_checkpoint(epoch, step, avg_loss_1k, is_step_checkpoint=True)
 
             if step >= self.config.steps_per_epoch:
                 break
-        
+
+        # Loss 로그 파일 닫기
+        if loss_log_file is not None:
+            loss_log_file.close()
+
         epoch_avg_loss = np.mean(losses) if losses else 0.0
         return losses, epoch_avg_loss
 
@@ -1427,7 +1487,9 @@ def main():
         total_batches_processed = 0
 
         try:
-            losses, epoch_avg_loss = trainer.train_epoch(epoch_loader, epoch)
+            # Resume: 첫 epoch이고 start_step > 0이면 해당 step부터 시작
+            epoch_start_step = start_step if epoch == start_epoch else 0
+            losses, epoch_avg_loss = trainer.train_epoch(epoch_loader, epoch, epoch_start_step)
             epoch_losses.extend(losses)
             total_batches_processed += len(losses)
 
