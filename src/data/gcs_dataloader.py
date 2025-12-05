@@ -870,12 +870,14 @@ class EpochDataLoader:
         # Note: ProcessPoolExecutor + spawn은 TPU 환경에서 초기화 지연 문제 발생
         # ThreadPoolExecutor 사용 - torch.load는 C 확장이라 GIL 영향 적음
         self.load_executor = ThreadPoolExecutor(max_workers=num_load_workers)
-        self.loaded_pt_queue: queue.Queue[Tuple[int, dict]] = queue.Queue(maxsize=num_load_workers + 1)
+        # PT 로드 결과 큐 (블록킹 방지를 위해 여유있게 설정)
+        self.loaded_pt_queue: queue.Queue[Tuple[int, dict]] = queue.Queue(maxsize=prefetch_ahead + num_load_workers)
 
         # === Layer 3: 배치 샘플링 ===
         self.batch_executor = ThreadPoolExecutor(max_workers=num_workers)
+        # 배치 큐 (TPU 학습이 느릴 때도 블록되지 않도록 여유있게 설정)
         self.batch_queue: queue.Queue[Optional[Tuple[np.ndarray, np.ndarray]]] = queue.Queue(
-            maxsize=prefetch_ahead * 2
+            maxsize=prefetch_ahead * 4
         )
 
         # === Lock-free 배치 버퍼 (GIL 최적화) ===
