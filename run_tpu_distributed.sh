@@ -238,10 +238,10 @@ EOF
     fi
 
     # Worker 0 (coordinator)이 마지막에 시작하므로, 그 전에 다른 worker들이 준비되도록 대기
-    if [[ $WORKER_ID -eq 3 ]]; then
-      # Worker 1,2,3 시작 후, Worker 0 시작 전에 충분히 대기
+    if [[ $WORKER_ID -eq 7 ]]; then
+      # Worker 1-7 시작 후, Worker 0 시작 전에 충분히 대기
       # (git pull + pip install + python 시작 시간 고려)
-      log "Waiting 90s for workers 1,2,3 to be ready before starting coordinator..."
+      log "Waiting 90s for workers 1-7 to be ready before starting coordinator..."
       sleep 90
     fi
   done
