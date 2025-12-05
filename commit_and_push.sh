@@ -41,7 +41,7 @@ if git -C "$REPO_DIR" diff --cached --quiet; then
   echo "No changes to commit."
   exit 0
 fi
-
+ 
 git -C "$REPO_DIR" commit -m "$COMMIT_MSG"
 
 # If GitHub CLI is installed, ensure you're logged in.
