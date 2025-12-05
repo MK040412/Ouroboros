@@ -57,10 +57,7 @@ export JAX_COORDINATOR_ADDRESS="${COORDINATOR_IP}:${COORDINATOR_PORT}"
 export JAX_COORDINATOR_PORT="${COORDINATOR_PORT}"
 export JAX_NUM_PROCESSES="${NUM_WORKERS}"
 export JAX_PROCESS_INDEX=0
-export JAX_LOCAL_DEVICE_COUNT="${CHIPS_PER_WORKER}"
-# TPU v5e-32 topology: 8 hosts × 4 chips = 32 chips
-export TPU_CHIPS_PER_HOST_BOUNDS="2,2,1"
-export TPU_HOST_BOUNDS="4,2,1"
+# TPU topology는 JAX가 자동 감지하도록 함
 export PYTHONPATH=~/ouroboros/src:$PYTHONPATH
 export PYTHONUNBUFFERED=1
 
@@ -87,9 +84,6 @@ for WORKER_ID in $(seq 1 $((NUM_WORKERS - 1))); do
       export JAX_COORDINATOR_PORT=${COORDINATOR_PORT} && \
       export JAX_NUM_PROCESSES=${NUM_WORKERS} && \
       export JAX_PROCESS_INDEX=${WORKER_ID} && \
-      export JAX_LOCAL_DEVICE_COUNT=${CHIPS_PER_WORKER} && \
-      export TPU_CHIPS_PER_HOST_BOUNDS=2,2,1 && \
-      export TPU_HOST_BOUNDS=4,2,1 && \
       export PYTHONPATH=~/ouroboros/src:\$PYTHONPATH && \
       export PYTHONUNBUFFERED=1 && \
       nohup python3.11 -u train_tpu_256.py > /tmp/train_worker_$WORKER_ID.log 2>&1 &" &
