@@ -139,20 +139,22 @@ run_remote() {
   fi
   log "Coordinator IP: $COORDINATOR_IP"
 
-  # 3. 모든 worker 정리 및 코드 동기화 (병렬)
-  log "Step 3: Cleaning up and syncing code on all workers..."
+  # 3. 모든 worker 정리 (순차적으로 - SSH 과부하 방지)
+  log "Step 3: Cleaning up all workers..."
   for WORKER_ID in $(seq 0 $((NUM_WORKERS - 1))); do
+    log "  Cleaning worker $WORKER_ID..."
     gcloud compute tpus tpu-vm ssh "$INSTANCE" \
       --zone="$ZONE" \
       --worker="$WORKER_ID" \
-      --command="pkill -9 -f 'python.*train_tpu' 2>/dev/null || true; sudo rm -f /tmp/libtpu_lockfile 2>/dev/null || true" &
+      --command="pkill -9 -f 'python.*train_tpu' 2>/dev/null || true; sudo rm -f /tmp/libtpu_lockfile 2>/dev/null || true" || true
+    sleep 1
   done
-  wait
   log "  Cleanup done"
 
-  # 4. 코드 동기화 (병렬)
+  # 4. 코드 동기화 (순차적으로 - SSH 과부하 방지)
   log "Step 4: Syncing code on all workers..."
   for WORKER_ID in $(seq 0 $((NUM_WORKERS - 1))); do
+    log "  Syncing worker $WORKER_ID..."
     read -r -d '' SYNC_CMD <<EOF || true
 set -e
 DEST_DIR=~/ouroboros
@@ -177,9 +179,9 @@ EOF
     gcloud compute tpus tpu-vm ssh "$INSTANCE" \
       --zone="$ZONE" \
       --worker="$WORKER_ID" \
-      --command="bash -c '$SYNC_CMD'" &
+      --command="bash -c '$SYNC_CMD'" || log "  Warning: Worker $WORKER_ID sync failed"
+    sleep 1
   done
-  wait
   log "  Code synced on all workers"
 
   # 5. Worker 0 (coordinator) 먼저 시작
@@ -217,7 +219,7 @@ EOF
   log "  Waiting 30s for coordinator to start listening..."
   sleep 30
 
-  # 6. Worker 1-7 시작 (병렬)
+  # 6. Worker 1-7 시작 (순차적으로 - SSH 과부하 방지)
   log "Step 6: Starting workers 1-7..."
   for WORKER_ID in $(seq 1 $((NUM_WORKERS - 1))); do
     log "  Launching worker $WORKER_ID..."
@@ -248,9 +250,9 @@ EOF
     gcloud compute tpus tpu-vm ssh "$INSTANCE" \
       --zone="$ZONE" \
       --worker="$WORKER_ID" \
-      --command="bash -c '$WORKER_CMD'" &
+      --command="bash -c '$WORKER_CMD'" || log "  Warning: Worker $WORKER_ID start failed"
+    sleep 2
   done
-  wait
 
   log "All workers launched!"
   log ""
