@@ -607,6 +607,30 @@ class TPUTrainer:
             local_batch_size = batch_latents.shape[0]
             per_device_batch = local_batch_size // num_local_devices
 
+            # === 데이터 검증 (NaN/Inf 체크) ===
+            if step < 10 or step % 500 == 0:
+                # NumPy 배열일 때만 체크 (JAX array 변환 전)
+                latent_np = np.asarray(batch_latents)
+                emb_np = np.asarray(batch_embeddings)
+
+                latent_nan = np.isnan(latent_np).sum()
+                latent_inf = np.isinf(latent_np).sum()
+                emb_nan = np.isnan(emb_np).sum()
+                emb_inf = np.isinf(emb_np).sum()
+
+                if latent_nan > 0 or latent_inf > 0 or emb_nan > 0 or emb_inf > 0:
+                    print(f"[DATA WARNING] Step {step}: "
+                          f"latent NaN={latent_nan}, Inf={latent_inf}, "
+                          f"emb NaN={emb_nan}, Inf={emb_inf}")
+                    print(f"  latent range: [{latent_np.min():.4f}, {latent_np.max():.4f}]")
+                    print(f"  emb range: [{emb_np.min():.4f}, {emb_np.max():.4f}]")
+                    sys.stdout.flush()
+                elif step < 10:
+                    print(f"[DATA OK] Step {step}: "
+                          f"latent range=[{latent_np.min():.4f}, {latent_np.max():.4f}], "
+                          f"emb range=[{emb_np.min():.4f}, {emb_np.max():.4f}]")
+                    sys.stdout.flush()
+
             # Multi-host: 각 worker의 local 데이터를 global array로 변환
             # 각 local device에 데이터 조각 배치
             latent_arrays = [
@@ -656,10 +680,26 @@ class TPUTrainer:
             
             # 학습 스텝 (Sharded execution)
             global_step = epoch * self.config.steps_per_epoch + step
-            loss, rng_key = self.train_step(x_t, timesteps, noise, batch_embeddings, 
+            loss, rng_key = self.train_step(x_t, timesteps, noise, batch_embeddings,
                                             global_step, rng_key)
-            
-            losses.append(float(loss))
+
+            loss_val = float(loss)
+
+            # === Loss 검증 (NaN/Inf/폭발 체크) ===
+            if np.isnan(loss_val) or np.isinf(loss_val):
+                print(f"[LOSS ERROR] Step {step}: loss={loss_val} (NaN or Inf detected!)")
+                print(f"  x_t range: [{float(x_t.min()):.4f}, {float(x_t.max()):.4f}]")
+                print(f"  noise range: [{float(noise.min()):.4f}, {float(noise.max()):.4f}]")
+                print(f"  timesteps: min={int(timesteps.min())}, max={int(timesteps.max())}")
+                sys.stdout.flush()
+            elif loss_val > 1e6 and step > 100:  # warmup 이후 loss 폭발 감지
+                print(f"[LOSS WARNING] Step {step}: loss={loss_val:.2e} (explosion detected!)")
+                print(f"  x_t range: [{float(x_t.min()):.4f}, {float(x_t.max()):.4f}]")
+                print(f"  batch_embeddings range: [{float(batch_embeddings.min()):.4f}, {float(batch_embeddings.max()):.4f}]")
+                print(f"  learning_rate: {self.lr_schedule(global_step):.8f}")
+                sys.stdout.flush()
+
+            losses.append(loss_val)
 
             # Wandb 로깅
             if self.wandb_enabled:
