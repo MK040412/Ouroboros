@@ -3,7 +3,7 @@
 # Usage: ./gcp_show_log.sh --worker=0
 
 # 기본값
-WORKER=0
+WORKER=all
 TPU_NAME="ouroboros"
 ZONE="europe-west4-b"
 FOLLOW=false

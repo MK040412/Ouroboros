@@ -3,13 +3,13 @@ set -euo pipefail
 
 # =============================================================================
 # Pre-compute Embeddings 진행 상황 모니터링
-# - 4 Workers × 4 TPU chips (pmap 병렬화)
+# - 8 Workers × 4 TPU chips (pmap 병렬화)
 # - Output: gs://rdy-tpu-data-2025/.../latents-3crop-emb/
 # =============================================================================
 
 ZONE="europe-west4-b"
 INSTANCE="ouroboros"
-NUM_WORKERS=4
+NUM_WORKERS=8
 TPU_CHIPS_PER_WORKER=4
 BATCH_SIZE=2048
 

@@ -49,7 +49,7 @@ class TrainingConfig256:
     """256² 스테이지 학습 설정"""
     # 배치 및 데이터
     global_batch_size: int = 1024      # OOM 방지: 2048 → 1024
-    num_devices: int = 16              # TPU v5e pod size (또는 112 for TPU v5e 256)
+    num_devices: int = 32              # TPU v5e pod size (또는 112 for TPU v5e 256)
     batch_size_per_device: int = 64    # OOM 방지: 128 → 64
 
     # dtype (TPU bfloat16 최적화)
