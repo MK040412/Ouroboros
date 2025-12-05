@@ -33,8 +33,25 @@ import threading
 import tempfile
 from datetime import datetime
 from google.cloud import storage
+from google.oauth2 import service_account
 import pickle
 import io
+
+# GCS 서비스 계정 키 경로 (TPU VM 스코프 제한 우회용)
+GCS_SA_KEY_PATH = Path.home() / "gcs-sa-key.json"
+
+
+def get_gcs_client():
+    """GCS 클라이언트 생성 (서비스 계정 키 사용)"""
+    if GCS_SA_KEY_PATH.exists():
+        credentials = service_account.Credentials.from_service_account_file(
+            str(GCS_SA_KEY_PATH),
+            scopes=["https://www.googleapis.com/auth/cloud-platform"]
+        )
+        return storage.Client(credentials=credentials)
+    else:
+        # 키 파일 없으면 기본 인증 사용
+        return storage.Client()
 
 from src.xut.xut_small import create_xut_small
 from src.embeddings import get_embedding_provider
@@ -124,7 +141,7 @@ def find_latest_checkpoint(config: TrainingConfig256) -> Optional[dict]:
         return None
 
     try:
-        client = storage.Client()
+        client = get_gcs_client()
         bucket = client.bucket(config.checkpoint_gcs_bucket)
         prefix = config.checkpoint_gcs_prefix + "/"
 
@@ -592,7 +609,7 @@ class TPUTrainer:
         self.gcs_bucket = None
         if jax.process_index() == 0:
             try:
-                self.gcs_client = storage.Client()
+                self.gcs_client = get_gcs_client()
                 self.gcs_bucket = self.gcs_client.bucket(config.checkpoint_gcs_bucket)
                 print(f"\n[GCS Checkpoint Setup]")
                 print(f"  Bucket: gs://{config.checkpoint_gcs_bucket}")
