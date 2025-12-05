@@ -5,6 +5,11 @@ import jax.numpy as jnp
 from flax import nnx
 from flax.nnx import RMSNorm
 
+# Compatibility shim for older Flax versions without nnx.List
+if not hasattr(nnx, 'List'):
+    # Use tuple as fallback (pytree compatible)
+    nnx.List = lambda x: tuple(x)
+
 from .modules.transformer import TransformerBlock
 from .modules.patch import PatchEmbed, UnPatch
 from .modules.axial_rope import make_axial_pos
