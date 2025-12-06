@@ -369,114 +369,112 @@ class ImageNetTPUTrainer:
         local_devices = jax.local_devices()
         num_local_devices = len(local_devices)
 
-        # Mesh 컨텍스트 내에서 전체 epoch 실행 (모든 32개 TPU 코어 활용)
-        with jax.sharding.Mesh(self.mesh.devices, self.mesh.axis_names):
-            for batch_latents, batch_embeddings in epoch_loader.get_batches():
-                if step < start_step:
-                    step += 1
-                    continue
-
-                local_batch_size = batch_latents.shape[0]
-                per_device_batch = local_batch_size // num_local_devices
-
-                # Latents come as NHWC (B, 32, 32, 4) from ImageNet loader (VAE output)
-                emb_dim = batch_embeddings.shape[1]
-
-                # Convert to numpy and slice for each device
-                batch_latents_np = np.asarray(batch_latents)
-                batch_embeddings_np = np.asarray(batch_embeddings)
-
-                # Device placement
-                latent_arrays = [
-                    jax.device_put(
-                        batch_latents_np[i*per_device_batch:(i+1)*per_device_batch],
-                        d
-                    ) for i, d in enumerate(local_devices)
-                ]
-                emb_arrays = [
-                    jax.device_put(
-                        batch_embeddings_np[i*per_device_batch:(i+1)*per_device_batch],
-                        d
-                    ) for i, d in enumerate(local_devices)
-                ]
-
-                # Global arrays - NHWC format (B, 32, 32, 4) - model expects NHWC
-                global_batch_size = self.config.global_batch_size
-                batch_latents = jax.make_array_from_single_device_arrays(
-                    (global_batch_size, 32, 32, 4),
-                    batch_sharding,
-                    latent_arrays
-                )
-                batch_embeddings = jax.make_array_from_single_device_arrays(
-                    (global_batch_size, emb_dim),
-                    emb_sharding,
-                    emb_arrays
-                )
-
-                batch_size = global_batch_size
-
-                # Sample timesteps
-                rng_key, subkey = jax.random.split(rng_key)
-                t = self.schedule.sample_timesteps(subkey, batch_size)
-
-                # Sample noise
-                rng_key, subkey = jax.random.split(rng_key)
-                compute_dtype = jnp.bfloat16 if self.config.use_bfloat16 else jnp.float32
-                x_1 = jax.random.normal(subkey, batch_latents.shape, dtype=compute_dtype)
-
-                # x_0 = latents (already scaled by VAE loader)
-                x_0 = batch_latents.astype(compute_dtype)
-                batch_embeddings = batch_embeddings.astype(compute_dtype)
-
-                # Forward diffusion
-                x_t = self.schedule.forward(x_0, x_1, t)
-                velocity_target = self.schedule.get_velocity(x_0, x_1)
-
-                # Train step
-                global_step = epoch * self.config.steps_per_epoch + step
-                loss, rng_key = self.train_step(x_t, t, velocity_target, batch_embeddings, rng_key)
-
-                loss_val = float(loss)
-                losses.append(loss_val)
-
-                _graceful_killer.register_state(epoch, step)
-
-                if _graceful_killer.kill_now:
-                    break
-
-                if self.wandb_enabled:
-                    wandb.log({
-                        "loss": loss_val,
-                        "learning_rate": self.lr_schedule(global_step),
-                        "epoch": epoch + 1,
-                        "step": step + 1,
-                    }, step=global_step)
-
+        for batch_latents, batch_embeddings in epoch_loader.get_batches():
+            if step < start_step:
                 step += 1
+                continue
 
-                if step % 100 == 0:
-                    avg_loss = np.mean(losses[-100:])
-                    current_time = time.time()
-                    elapsed = current_time - last_log_time
-                    steps_per_sec = 100 / elapsed if elapsed > 0 else 0
-                    last_log_time = current_time
+            local_batch_size = batch_latents.shape[0]
+            per_device_batch = local_batch_size // num_local_devices
 
-                    print(f"Epoch {epoch+1}/{self.config.num_epochs} "
-                          f"Step {step}/{self.config.steps_per_epoch} "
-                          f"Loss: {avg_loss:.6f} [{elapsed:.1f}s, {steps_per_sec:.2f} step/s]")
+            # Latents come as NHWC (B, 32, 32, 4) from ImageNet loader (VAE output)
+            emb_dim = batch_embeddings.shape[1]
 
-                    if loss_log_file is not None:
-                        timestamp = datetime.now().isoformat()
-                        lr = float(self.lr_schedule(global_step))
-                        loss_log_file.write(f"{timestamp},{epoch+1},{step},{global_step},{avg_loss:.6f},{lr:.8f}\n")
-                        loss_log_file.flush()
+            # Convert to numpy and slice for each device
+            batch_latents_np = np.asarray(batch_latents)
+            batch_embeddings_np = np.asarray(batch_embeddings)
 
-                if step % 1000 == 0 and step > 0:
-                    avg_loss_1k = np.mean(losses[-1000:]) if len(losses) >= 1000 else np.mean(losses)
-                    self.save_checkpoint(epoch, step, avg_loss_1k, is_step_checkpoint=True)
+            # Device placement
+            latent_arrays = [
+                jax.device_put(
+                    batch_latents_np[i*per_device_batch:(i+1)*per_device_batch],
+                    d
+                ) for i, d in enumerate(local_devices)
+            ]
+            emb_arrays = [
+                jax.device_put(
+                    batch_embeddings_np[i*per_device_batch:(i+1)*per_device_batch],
+                    d
+                ) for i, d in enumerate(local_devices)
+            ]
 
-                if step >= self.config.steps_per_epoch:
-                    break
+            # Global arrays - NHWC format (B, 32, 32, 4) - model expects NHWC
+            global_batch_size = self.config.global_batch_size
+            batch_latents = jax.make_array_from_single_device_arrays(
+                (global_batch_size, 32, 32, 4),
+                batch_sharding,
+                latent_arrays
+            )
+            batch_embeddings = jax.make_array_from_single_device_arrays(
+                (global_batch_size, emb_dim),
+                emb_sharding,
+                emb_arrays
+            )
+
+            batch_size = global_batch_size
+
+            # Sample timesteps
+            rng_key, subkey = jax.random.split(rng_key)
+            t = self.schedule.sample_timesteps(subkey, batch_size)
+
+            # Sample noise
+            rng_key, subkey = jax.random.split(rng_key)
+            compute_dtype = jnp.bfloat16 if self.config.use_bfloat16 else jnp.float32
+            x_1 = jax.random.normal(subkey, batch_latents.shape, dtype=compute_dtype)
+
+            # x_0 = latents (already scaled by VAE loader)
+            x_0 = batch_latents.astype(compute_dtype)
+            batch_embeddings = batch_embeddings.astype(compute_dtype)
+
+            # Forward diffusion
+            x_t = self.schedule.forward(x_0, x_1, t)
+            velocity_target = self.schedule.get_velocity(x_0, x_1)
+
+            # Train step
+            global_step = epoch * self.config.steps_per_epoch + step
+            loss, rng_key = self.train_step(x_t, t, velocity_target, batch_embeddings, rng_key)
+
+            loss_val = float(loss)
+            losses.append(loss_val)
+
+            _graceful_killer.register_state(epoch, step)
+
+            if _graceful_killer.kill_now:
+                break
+
+            if self.wandb_enabled:
+                wandb.log({
+                    "loss": loss_val,
+                    "learning_rate": self.lr_schedule(global_step),
+                    "epoch": epoch + 1,
+                    "step": step + 1,
+                }, step=global_step)
+
+            step += 1
+
+            if step % 100 == 0:
+                avg_loss = np.mean(losses[-100:])
+                current_time = time.time()
+                elapsed = current_time - last_log_time
+                steps_per_sec = 100 / elapsed if elapsed > 0 else 0
+                last_log_time = current_time
+
+                print(f"Epoch {epoch+1}/{self.config.num_epochs} "
+                      f"Step {step}/{self.config.steps_per_epoch} "
+                      f"Loss: {avg_loss:.6f} [{elapsed:.1f}s, {steps_per_sec:.2f} step/s]")
+
+                if loss_log_file is not None:
+                    timestamp = datetime.now().isoformat()
+                    lr = float(self.lr_schedule(global_step))
+                    loss_log_file.write(f"{timestamp},{epoch+1},{step},{global_step},{avg_loss:.6f},{lr:.8f}\n")
+                    loss_log_file.flush()
+
+            if step % 1000 == 0 and step > 0:
+                avg_loss_1k = np.mean(losses[-1000:]) if len(losses) >= 1000 else np.mean(losses)
+                self.save_checkpoint(epoch, step, avg_loss_1k, is_step_checkpoint=True)
+
+            if step >= self.config.steps_per_epoch:
+                break
 
         if loss_log_file is not None:
             loss_log_file.close()
