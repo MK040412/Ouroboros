@@ -27,8 +27,6 @@ from PIL import Image
 import pyarrow.parquet as pq
 from google.cloud import storage
 
-from src.embeddings import GemmaEmbeddingProvider
-
 # ImageNet class labels (synset -> label mapping)
 IMAGENET_LABELS: Optional[Dict[int, str]] = None
 
@@ -277,33 +275,43 @@ class ImageNetParquetLoader:
             return np.zeros((self.image_size, self.image_size, 3), dtype=np.float32)
 
     def _compute_class_embeddings(self) -> Dict[int, np.ndarray]:
-        """Compute text embeddings for all class names using Gemma-3"""
+        """Load precomputed class embeddings from GCS"""
         if self.class_embeddings is not None:
             return self.class_embeddings
 
-        print(f"[ImageNet] Computing class embeddings with Gemma-3...")
+        # GCS에서 사전 계산된 임베딩 다운로드
+        embeddings_blob_path = "imagenet-1k/imagenet_class_embeddings.npy"
+        embeddings_gcs_path = f"gs://{self.bucket_name}/{embeddings_blob_path}"
+        print(f"[ImageNet] Loading precomputed embeddings from {embeddings_gcs_path}...")
 
-        # Create embedding provider
-        provider = GemmaEmbeddingProvider()
+        local_path = "/tmp/imagenet_class_embeddings.npy"
 
-        # Get class labels for all 1000 classes
-        class_texts = []
-        for class_idx in range(1000):
-            label = self.labels.get(class_idx, f"class_{class_idx}")
-            class_texts.append(label)
+        try:
+            blob = self.bucket.blob(embeddings_blob_path)
+            blob.download_to_filename(local_path)
+            embeddings = np.load(local_path)  # (1000, 640)
 
-        # Compute embeddings in batch
-        embeddings = provider.batch_encode(class_texts, normalize=True)
+            # Dict로 변환
+            self.class_embeddings = {}
+            for class_idx in range(min(1000, embeddings.shape[0])):
+                self.class_embeddings[class_idx] = embeddings[class_idx]
 
-        # Cache as dict
-        self.class_embeddings = {}
-        for class_idx in range(1000):
-            self.class_embeddings[class_idx] = embeddings[class_idx]
+            # Update embedding_dim based on actual embeddings
+            self.embedding_dim = embeddings.shape[1]
 
-        # Update embedding_dim based on actual embeddings
-        self.embedding_dim = embeddings.shape[1]
+            print(f"[ImageNet] Loaded {len(self.class_embeddings)} class embeddings (dim={self.embedding_dim})")
 
-        print(f"[ImageNet] Computed {len(self.class_embeddings)} class embeddings (dim={self.embedding_dim})")
+        except Exception as e:
+            print(f"[ImageNet] Failed to load precomputed embeddings: {e}")
+            print("[ImageNet] Using random embeddings as fallback")
+
+            # Fallback: 랜덤 임베딩
+            self.class_embeddings = {}
+            for class_idx in range(1000):
+                emb = np.random.randn(self.embedding_dim).astype(np.float32)
+                emb = emb / np.maximum(np.linalg.norm(emb), 1e-8)
+                self.class_embeddings[class_idx] = emb
+
         return self.class_embeddings
 
     def _get_embeddings_batch(self, class_indices: List[int]) -> np.ndarray:
