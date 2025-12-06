@@ -426,9 +426,16 @@ class ImageNetTPUTrainer:
             x_0 = batch_latents.astype(compute_dtype)
             batch_embeddings = batch_embeddings.astype(compute_dtype)
 
+            if step == 0:
+                print(f"[DEBUG] batch_latents.shape: {batch_latents.shape}")
+                print(f"[DEBUG] x_0.shape: {x_0.shape}, x_1.shape: {x_1.shape}")
+
             # Forward diffusion
             x_t = self.schedule.forward(x_0, x_1, t)
             velocity_target = self.schedule.get_velocity(x_0, x_1)
+
+            if step == 0:
+                print(f"[DEBUG] x_t.shape: {x_t.shape}, velocity_target.shape: {velocity_target.shape}")
 
             # Train step
             global_step = epoch * self.config.steps_per_epoch + step
