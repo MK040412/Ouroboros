@@ -114,6 +114,7 @@ class UnPatch(nnx.Module):
             x = jnp.where(loss_mask, x, lax.stop_gradient(x))
 
         x = x.reshape(b, h, w, p, q, self.out_channels)
-        x = x.transpose(0, 5, 1, 3, 2, 4)
-        x = x.reshape(b, self.out_channels, h * p, w * q)
+        # Output NHWC (B, H, W, C) to match input format
+        x = x.transpose(0, 1, 3, 2, 4, 5)  # (B, H, P, W, Q, C)
+        x = x.reshape(b, h * p, w * q, self.out_channels)
         return x
