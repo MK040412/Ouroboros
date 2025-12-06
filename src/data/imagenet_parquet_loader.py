@@ -26,6 +26,17 @@ import jax.numpy as jnp
 from PIL import Image
 import pyarrow.parquet as pq
 from google.cloud import storage
+import cv2
+
+# TurboJPEG for fast decoding (optional, falls back to PIL)
+try:
+    from turbojpeg import TurboJPEG
+    TURBOJPEG = TurboJPEG()
+    USE_TURBOJPEG = True
+except ImportError:
+    TURBOJPEG = None
+    USE_TURBOJPEG = False
+    print("[ImageNet] TurboJPEG not available, using PIL (slower)")
 
 # ImageNet class labels (synset -> label mapping)
 IMAGENET_LABELS: Optional[Dict[int, str]] = None
@@ -253,22 +264,40 @@ class ImageNetParquetLoader:
             return pq.ParquetFile(gcs_path)
 
     def _decode_image(self, image_bytes: bytes) -> np.ndarray:
-        """Decode JPEG bytes to numpy array"""
+        """Decode JPEG bytes to numpy array using TurboJPEG (fast) or PIL (fallback)"""
         try:
-            img = Image.open(io.BytesIO(image_bytes)).convert('RGB')
+            if USE_TURBOJPEG and TURBOJPEG is not None:
+                # TurboJPEG: 2-4x faster than PIL
+                img = TURBOJPEG.decode(image_bytes)  # BGR format
+                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
-            # Center crop to square
-            w, h = img.size
-            min_dim = min(w, h)
-            left = (w - min_dim) // 2
-            top = (h - min_dim) // 2
-            img = img.crop((left, top, left + min_dim, top + min_dim))
+                # Center crop to square
+                h, w = img.shape[:2]
+                min_dim = min(w, h)
+                left = (w - min_dim) // 2
+                top = (h - min_dim) // 2
+                img = img[top:top+min_dim, left:left+min_dim]
 
-            # Resize to target size
-            img = img.resize((self.image_size, self.image_size), Image.LANCZOS)
+                # Resize (cv2 is faster than PIL)
+                img = cv2.resize(img, (self.image_size, self.image_size),
+                                interpolation=cv2.INTER_AREA)
 
-            # Convert to float32 [0, 1]
-            return np.array(img, dtype=np.float32) / 255.0
+                return img.astype(np.float32) / 255.0
+            else:
+                # PIL fallback
+                img = Image.open(io.BytesIO(image_bytes)).convert('RGB')
+
+                # Center crop to square
+                w, h = img.size
+                min_dim = min(w, h)
+                left = (w - min_dim) // 2
+                top = (h - min_dim) // 2
+                img = img.crop((left, top, left + min_dim, top + min_dim))
+
+                # Resize to target size
+                img = img.resize((self.image_size, self.image_size), Image.LANCZOS)
+
+                return np.array(img, dtype=np.float32) / 255.0
 
         except Exception as e:
             print(f"[ImageNet] Image decode error: {e}")
@@ -459,32 +488,40 @@ class ImageNetParquetEpochLoader:
 
 
 # =============================================================================
-# RAM Preload variant (load all parquet to RAM at startup)
+# RAM Preload variant with Latent Caching
 # =============================================================================
 class ImageNetParquetRAMLoader(ImageNetParquetLoader):
-    """Load all ImageNet parquet files to RAM at startup
+    """Load all ImageNet and precompute VAE latents at startup
 
-    Memory usage: ~140GB for full ImageNet (JPEG bytes)
-    Use when: Workers have enough RAM and want zero GCS latency during training
+    Memory usage: ~20GB for latents (vs ~140GB for JPEG bytes)
+    Workflow:
+    1. Load JPEG bytes from parquet files
+    2. Decode + VAE encode in batches
+    3. Store latents in RAM (discard JPEG bytes)
+    4. Training: just sample latents (no decode/VAE needed)
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, latent_batch_size: int = 64, **kwargs):
         super().__init__(*args, **kwargs)
 
-        # RAM storage
-        self.all_images: List[bytes] = []
+        self.latent_batch_size = latent_batch_size
+
+        # RAM storage for precomputed latents
+        self.all_latents: Optional[np.ndarray] = None  # (N, 32, 32, 4) float16
         self.all_labels: List[int] = []
 
-        # Preload all data
-        self._preload_all()
+        # Preload and precompute
+        self._preload_and_encode()
 
-    def _preload_all(self):
-        """Load all parquet files to RAM"""
+    def _preload_and_encode(self):
+        """Load parquet files and precompute VAE latents"""
         import sys
 
-        print(f"\n[RAMPreload] Loading {len(self.parquet_files)} parquet files to RAM...")
+        # Step 1: Load all JPEG bytes and labels
+        print(f"\n[RAMPreload] Step 1: Loading {len(self.parquet_files)} parquet files...")
         sys.stdout.flush()
 
+        all_image_bytes: List[bytes] = []
         start_time = time.time()
 
         for i, parquet_path in enumerate(self.parquet_files):
@@ -497,42 +534,82 @@ class ImageNetParquetRAMLoader(ImageNetParquetLoader):
             data = table.to_pydict()
 
             for img, label in zip(data['image'], data['label']):
-                self.all_images.append(img['bytes'])
+                all_image_bytes.append(img['bytes'])
                 self.all_labels.append(label)
 
-        elapsed = time.time() - start_time
-        print(f"[RAMPreload] Loaded {len(self.all_images):,} samples in {elapsed:.1f}s")
+        load_time = time.time() - start_time
+        total_samples = len(all_image_bytes)
+        print(f"[RAMPreload] Loaded {total_samples:,} samples in {load_time:.1f}s")
 
-        # Update total samples
-        self.total_samples = len(self.all_images)
+        # Step 2: Precompute VAE latents
+        if not self.use_vae or self.vae is None:
+            print("[RAMPreload] VAE not enabled, skipping latent precomputation")
+            self.all_latents = None
+            self.all_image_bytes = all_image_bytes
+            self.total_samples = total_samples
+            return
+
+        print(f"\n[RAMPreload] Step 2: Precomputing VAE latents...")
+        print(f"  Batch size: {self.latent_batch_size}, Total batches: {(total_samples + self.latent_batch_size - 1) // self.latent_batch_size}")
+        sys.stdout.flush()
+
+        # Allocate latent array (NHWC format: N, 32, 32, 4)
+        latent_h = self.image_size // 8  # 256 -> 32
+        latent_w = self.image_size // 8
+        self.all_latents = np.zeros((total_samples, latent_h, latent_w, 4), dtype=np.float16)
+
+        encode_start = time.time()
+        num_batches = (total_samples + self.latent_batch_size - 1) // self.latent_batch_size
+
+        for batch_idx in range(num_batches):
+            start_idx = batch_idx * self.latent_batch_size
+            end_idx = min(start_idx + self.latent_batch_size, total_samples)
+            batch_bytes = all_image_bytes[start_idx:end_idx]
+
+            # Decode images in parallel (using TurboJPEG if available)
+            with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
+                images = list(executor.map(self._decode_image, batch_bytes))
+
+            images = np.stack(images, axis=0)
+
+            # VAE encode
+            images_jax = jnp.array(images)
+            latents = self.vae.encode(images_jax)
+
+            # Store as float16 to save memory
+            self.all_latents[start_idx:end_idx] = np.array(latents, dtype=np.float16)
+
+            if (batch_idx + 1) % 100 == 0 or batch_idx == num_batches - 1:
+                elapsed = time.time() - encode_start
+                samples_done = end_idx
+                samples_per_sec = samples_done / elapsed
+                eta = (total_samples - samples_done) / samples_per_sec if samples_per_sec > 0 else 0
+                print(f"  Encoded {samples_done:,}/{total_samples:,} ({100*samples_done/total_samples:.1f}%) - {samples_per_sec:.1f} samples/s - ETA: {eta/60:.1f}m")
+                sys.stdout.flush()
+
+        encode_time = time.time() - encode_start
+        latent_memory_gb = self.all_latents.nbytes / (1024**3)
+        print(f"[RAMPreload] Latent encoding done in {encode_time/60:.1f}m")
+        print(f"[RAMPreload] Latent memory: {latent_memory_gb:.2f} GB")
+
+        # Free JPEG bytes to save memory
+        del all_image_bytes
+
+        self.total_samples = total_samples
 
     def get_batch(self, rng_key: jax.Array) -> Tuple[jnp.ndarray, jnp.ndarray]:
-        """Get batch from RAM"""
+        """Get batch from precomputed latents (fast!)"""
         # Random sample indices
         indices = np.array(jax.random.randint(rng_key, (self.batch_size,), 0, self.total_samples))
 
-        # Get image bytes and labels
-        image_bytes_list = [self.all_images[i] for i in indices]
-        class_indices = [self.all_labels[i] for i in indices]
-
-        # Decode images in parallel
-        with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
-            images = list(executor.map(self._decode_image, image_bytes_list))
-
-        images = np.stack(images, axis=0)
-
-        # Encode with VAE
-        if self.use_vae and self.vae is not None:
-            images_jax = jnp.array(images)
-            latents = self.vae.encode(images_jax)
-        else:
-            latents = jnp.array(images)
+        # Get precomputed latents (no decode, no VAE!)
+        latents = self.all_latents[indices].astype(np.float32)
 
         # Get class embeddings
+        class_indices = [self.all_labels[i] for i in indices]
         embeddings = self._get_embeddings_batch(class_indices)
-        embeddings = jnp.array(embeddings, dtype=jnp.bfloat16)
 
-        return latents, embeddings
+        return jnp.array(latents), jnp.array(embeddings, dtype=jnp.bfloat16)
 
 
 if __name__ == "__main__":
