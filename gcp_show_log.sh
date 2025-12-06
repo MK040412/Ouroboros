@@ -33,7 +33,7 @@ for arg in "$@"; do
     esac
 done
 
-LOG_FILE="/tmp/train_worker_${WORKER}.log"
+LOG_FILE="/tmp/imagenet_train_worker_${WORKER}.log"
 
 echo "=== TPU Worker ${WORKER} Log ==="
 echo "TPU: ${TPU_NAME}, Zone: ${ZONE}"
