@@ -70,6 +70,7 @@ sudo fuser -k /dev/vfio/0 2>/dev/null || true; \
 sudo rm -f /tmp/libtpu_lockfile 2>/dev/null || true; \
 sudo rm -rf /tmp/gcs_cache_worker_* 2>/dev/null || true; \
 sudo rm -rf /tmp/precompute_* 2>/dev/null || true; \
+find ~/ouroboros -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true; \
 echo 'TPU released and cache cleared'"
     ;;
   "quick")
