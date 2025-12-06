@@ -116,6 +116,7 @@ class FlaxVAEEncoder:
         self.vae, self.vae_params = FlaxAutoencoderKL.from_pretrained(
             self.model_id,
             dtype=self.dtype,
+            from_pt=True,
         )
 
         # JIT compile encode function
