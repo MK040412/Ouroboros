@@ -18,6 +18,7 @@ os.environ["TPU_HOST_BOUNDS"] = "1,1,1"
 
 import gc
 import sys
+import subprocess
 import numpy as np
 from pathlib import Path
 from typing import Dict, List
@@ -268,7 +269,7 @@ class ImageNetEmbeddingComputer:
         return all_embeddings
 
     def save_to_gcs(self, embeddings: np.ndarray):
-        """GCS에 임베딩 저장 (Worker 0만)"""
+        """GCS에 임베딩 저장 (Worker 0만) - gsutil 사용"""
         if not self.is_main:
             print(f"\n[3/3] Worker {self.worker_id}: Skipping save (not main worker)")
             sys.stdout.flush()
@@ -282,14 +283,26 @@ class ImageNetEmbeddingComputer:
         np.save(local_path, embeddings)
         print(f"  Saved locally: {local_path}")
 
-        # GCS 업로드
-        blob = self.bucket.blob(self.config.output_path)
-        blob.upload_from_filename(local_path)
-        print(f"  Uploaded to: gs://{self.config.gcs_bucket}/{self.config.output_path}")
-
         # 파일 크기 확인
         file_size = os.path.getsize(local_path) / 1024
         print(f"  File size: {file_size:.1f} KB")
+
+        # gsutil로 GCS 업로드
+        gcs_path = f"gs://{self.config.gcs_bucket}/{self.config.output_path}"
+        print(f"  Uploading with gsutil to: {gcs_path}")
+        sys.stdout.flush()
+
+        result = subprocess.run(
+            ["gsutil", "cp", local_path, gcs_path],
+            capture_output=True,
+            text=True
+        )
+
+        if result.returncode == 0:
+            print(f"  Upload successful!")
+        else:
+            print(f"  Upload failed: {result.stderr}")
+
         sys.stdout.flush()
 
     def run(self):
