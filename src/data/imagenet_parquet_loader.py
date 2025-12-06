@@ -415,14 +415,26 @@ class ImageNetParquetEpochLoader:
             try:
                 rng_key, subkey = jax.random.split(rng_key)
                 latents, embeddings = self.dataset.get_batch(subkey)
-                self.prefetch_queue.put((latents, embeddings), timeout=120)
+                # Block until queue has space (check stop_event periodically)
+                while not self.stop_event.is_set():
+                    try:
+                        self.prefetch_queue.put((latents, embeddings), timeout=10)
+                        break
+                    except queue.Full:
+                        continue  # Retry until queue has space
             except Exception as e:
                 print(f"[Prefetch] Error at step {step}: {e}")
                 import traceback
                 traceback.print_exc()
                 break
 
-        self.prefetch_queue.put(None)
+        # Signal end of data
+        while not self.stop_event.is_set():
+            try:
+                self.prefetch_queue.put(None, timeout=10)
+                break
+            except queue.Full:
+                continue
 
     def get_batches(self) -> Iterator[Tuple[jnp.ndarray, jnp.ndarray]]:
         """Iterate over batches"""
