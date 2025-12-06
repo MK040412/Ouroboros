@@ -210,7 +210,7 @@ class ImageNetParquetLoader:
 
         # Load class labels
         self.labels = load_imagenet_labels_from_gcs(
-            f"gs://{self.bucket_name}/{self.prefix.rstrip('data/')}classes.py"
+            f"gs://{self.bucket_name}/{self.prefix.rstrip('data/')}/classes.py"
         )
 
         # VAE encoder (lazy loaded)
