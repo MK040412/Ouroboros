@@ -113,7 +113,7 @@ fi
 
 # Python 패키지 설치 (조용히)
 python3.11 -m pip install --user -q jax[tpu] -f https://storage.googleapis.com/jax-releases/libtpu_releases.html 2>/dev/null || true
-python3.11 -m pip install --user -q flax optax chex Pillow PyYAML wandb pyarrow torch transformers google-cloud-storage diffusers 2>/dev/null || true
+python3.11 -m pip install --user -q flax optax chex Pillow PyYAML wandb pyarrow torch transformers google-cloud-storage diffusers gemma 2>/dev/null || true
 echo "Worker \$(hostname) synced"
 EOF
   gcloud compute tpus tpu-vm ssh "$INSTANCE" \
