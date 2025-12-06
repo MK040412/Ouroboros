@@ -80,7 +80,7 @@ class FlaxVAEEncoder:
     """
 
     def __init__(self,
-                 model_id: str = "",
+                 model_id: str = "KMK040412/sdxl-vae-flax-msgpack",
                  dtype: jnp.dtype = jnp.bfloat16,
                  scaling_factor: float = 0.13025):
         """
@@ -186,7 +186,7 @@ class ImageNetRAMLoader:
                  data_dir: str,
                  batch_size: int = 64,
                  image_size: int = 256,
-                 vae_model_id: str = "",
+                 vae_model_id: str = "KMK040412/sdxl-vae-flax-msgpack",
                  embedding_dim: int = 640,
                  num_workers: int = 8,
                  prefetch_batches: int = 4,

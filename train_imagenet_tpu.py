@@ -96,7 +96,7 @@ class TrainingConfigImageNet:
     tread_selection_rate: float = 0.5
 
     # VAE 설정
-    vae_model_id: str = ""
+    vae_model_id: str = "KMK040412/sdxl-vae-flax-msgpack"
     vae_scaling_factor: float = 0.13025
     image_size: int = 256
 
