@@ -171,10 +171,12 @@ class ShardingRules:
 # ============================================
 @nnx.jit
 def _train_step_jit(model, optimizer, x_t, t, velocity_target, text_emb):
-    """JIT compiled training step for Rectified Flow"""
+    """JIT compiled training step for Rectified Flow
+
+    All tensors are in NCHW format: (B, 4, 32, 32)
+    """
     def loss_fn(model):
-        pred_v_nchw = model(x_t, t, ctx=text_emb, deterministic=False)
-        pred_v = jnp.transpose(pred_v_nchw, (0, 2, 3, 1))
+        pred_v = model(x_t, t, ctx=text_emb, deterministic=False)
         return jnp.mean((pred_v - velocity_target) ** 2)
 
     loss, grads = nnx.value_and_grad(loss_fn)(model)
@@ -375,10 +377,15 @@ class ImageNetTPUTrainer:
             local_batch_size = batch_latents.shape[0]
             per_device_batch = local_batch_size // num_local_devices
 
+            # Latents come as NHWC (B, 32, 32, 4) from ImageNet loader
+            # Convert to NCHW (B, 4, 32, 32) for sharding and model
+            batch_latents_nchw = np.transpose(np.array(batch_latents), (0, 3, 1, 2))
+            emb_dim = batch_embeddings.shape[1]
+
             # Device placement
             latent_arrays = [
                 jax.device_put(
-                    batch_latents[i*per_device_batch:(i+1)*per_device_batch],
+                    batch_latents_nchw[i*per_device_batch:(i+1)*per_device_batch],
                     d
                 ) for i, d in enumerate(local_devices)
             ]
@@ -389,16 +396,15 @@ class ImageNetTPUTrainer:
                 ) for i, d in enumerate(local_devices)
             ]
 
-            # Global arrays
+            # Global arrays - NCHW format (B, 4, 32, 32)
             global_batch_size = self.config.global_batch_size
-            # Latents are already NHWC from ImageNet loader
             batch_latents = jax.make_array_from_single_device_arrays(
-                (global_batch_size, 32, 32, 4),
+                (global_batch_size, 4, 32, 32),
                 batch_sharding,
                 latent_arrays
             )
             batch_embeddings = jax.make_array_from_single_device_arrays(
-                (global_batch_size, batch_embeddings.shape[1]),
+                (global_batch_size, emb_dim),
                 emb_sharding,
                 emb_arrays
             )
