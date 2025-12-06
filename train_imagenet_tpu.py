@@ -173,7 +173,7 @@ class ShardingRules:
 def _train_step_jit(model, optimizer, x_t, t, velocity_target, text_emb):
     """JIT compiled training step for Rectified Flow
 
-    All tensors are in NCHW format: (B, 4, 32, 32)
+    All tensors are in NHWC format: (B, 32, 32, 4)
     """
     def loss_fn(model):
         pred_v = model(x_t, t, ctx=text_emb, deterministic=False)
@@ -377,7 +377,7 @@ class ImageNetTPUTrainer:
             local_batch_size = batch_latents.shape[0]
             per_device_batch = local_batch_size // num_local_devices
 
-            # Latents come as NCHW (B, 4, 32, 32) from ImageNet loader (VAE output)
+            # Latents come as NHWC (B, 32, 32, 4) from ImageNet loader (VAE output)
             emb_dim = batch_embeddings.shape[1]
 
             # Convert to numpy and slice for each device
@@ -398,10 +398,10 @@ class ImageNetTPUTrainer:
                 ) for i, d in enumerate(local_devices)
             ]
 
-            # Global arrays - NCHW format (B, 4, 32, 32)
+            # Global arrays - NHWC format (B, 32, 32, 4) - model expects NHWC
             global_batch_size = self.config.global_batch_size
             batch_latents = jax.make_array_from_single_device_arrays(
-                (global_batch_size, 4, 32, 32),
+                (global_batch_size, 32, 32, 4),
                 batch_sharding,
                 latent_arrays
             )
