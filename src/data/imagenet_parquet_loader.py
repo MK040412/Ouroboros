@@ -93,7 +93,7 @@ def load_imagenet_labels_from_gcs(gcs_path: str = "gs://rdy-tpu-data-2025/imagen
 
 
 class FlaxVAEEncoder:
-    """JAX/Flax VAE encoder wrapper for TPU"""
+    """JAX/Flax VAE encoder wrapper for TPU with parallel encoding on all local devices"""
 
     def __init__(self,
                  model_id: str = "KMK040412/sdxl-vae-flax-msgpack",
@@ -105,10 +105,11 @@ class FlaxVAEEncoder:
 
         self.vae = None
         self.vae_params = None
-        self._encode_fn = None
+        self._encode_pmap = None
+        self.num_devices = jax.local_device_count()  # 워커당 로컬 디바이스 수 (4개)
 
     def _load_model(self):
-        """Load FlaxAutoencoderKL model"""
+        """Load FlaxAutoencoderKL model and setup pmap for parallel encoding"""
         if self.vae is not None:
             return
 
@@ -121,46 +122,67 @@ class FlaxVAEEncoder:
             )
 
         print(f"[VAE] Loading FlaxAutoencoderKL from {self.model_id}...")
-
-        # Get local TPU device for this process
-        local_devices = jax.local_devices()
-        tpu_device = local_devices[0] if local_devices else None
+        print(f"[VAE] Parallel encoding on {self.num_devices} local devices")
 
         self.vae, self.vae_params = FlaxAutoencoderKL.from_pretrained(
             self.model_id,
             dtype=self.dtype,
         )
 
-        # Move params to local TPU
-        if tpu_device is not None:
-            print(f"[VAE] Moving params to {tpu_device}...")
-            self.vae_params = jax.device_put(self.vae_params, tpu_device)
-        else:
-            print(f"[VAE] Warning: No local device found")
+        # 파라미터를 모든 로컬 디바이스에 복제
+        local_devices = jax.local_devices()
+        print(f"[VAE] Replicating params to {len(local_devices)} devices...")
+        self.vae_params = jax.device_put_replicated(self.vae_params, local_devices)
 
-        @jax.jit
-        def encode_fn(params, images):
-            """Encode images to latents (B, H, W, C) -> (B, H//8, W//8, 4) NHWC"""
+        # pmap용 encode 함수 정의
+        vae = self.vae
+        scaling_factor = self.scaling_factor
+
+        def encode_single(params, images):
+            """Encode images on single device: (B, H, W, C) -> (B, H//8, W//8, 4)"""
+            # [0,1] -> [-1,1] 정규화
+            images = images * 2.0 - 1.0
             images_nchw = jnp.transpose(images, (0, 3, 1, 2))
-            latent_dist = self.vae.apply(
+            latent_dist = vae.apply(
                 {"params": params},
                 images_nchw,
-                method=self.vae.encode
+                method=vae.encode
             )
             latents = latent_dist.latent_dist.mode()
-            # FlaxAutoencoderKL returns NHWC, keep it as is
-            latents = latents * self.scaling_factor
+            latents = latents * scaling_factor
             return latents
 
-        self._encode_fn = encode_fn
-        print(f"[VAE] Model loaded and JIT compiled")
+        # pmap으로 병렬화 (각 디바이스에서 다른 배치 처리)
+        self._encode_pmap = jax.pmap(encode_single, in_axes=(0, 0))
+        print(f"[VAE] pmap compiled for {self.num_devices} devices")
 
     def encode(self, images: jnp.ndarray) -> jnp.ndarray:
-        """Encode images to latents"""
+        """Encode images to latents using all local devices in parallel"""
         self._load_model()
-        images = images * 2.0 - 1.0  # [0,1] -> [-1,1]
+
+        batch_size = images.shape[0]
+        original_batch_size = batch_size
+
+        # 배치 크기가 디바이스 수로 나눠지도록 패딩
+        if batch_size % self.num_devices != 0:
+            pad_size = self.num_devices - (batch_size % self.num_devices)
+            images = jnp.pad(images, ((0, pad_size), (0, 0), (0, 0), (0, 0)))
+            batch_size = images.shape[0]
+
+        per_device = batch_size // self.num_devices
         images = images.astype(self.dtype)
-        return self._encode_fn(self.vae_params, images)
+
+        # pmap용 reshape: (num_devices, per_device, H, W, C)
+        images_reshaped = images.reshape(self.num_devices, per_device, *images.shape[1:])
+
+        # 병렬 인코딩 (모든 로컬 디바이스에서 동시 실행)
+        latents = self._encode_pmap(self.vae_params, images_reshaped)
+
+        # 결과 flatten: (num_devices, per_device, h, w, 4) -> (batch, h, w, 4)
+        latents = latents.reshape(-1, *latents.shape[2:])
+
+        # 패딩 제거
+        return latents[:original_batch_size]
 
 
 class ImageNetParquetLoader:
@@ -561,7 +583,15 @@ class ImageNetParquetRAMLoader(ImageNetParquetLoader):
             return
 
         print(f"\n[RAMPreload] Step 2: Precomputing VAE latents...")
-        print(f"  Batch size: {self.latent_batch_size}, Total batches: {(total_samples + self.latent_batch_size - 1) // self.latent_batch_size}")
+
+        # 배치 크기를 디바이스 수의 배수로 조정 (pmap 병렬화 최적화)
+        num_devices = self.vae.num_devices
+        effective_batch_size = max(
+            (self.latent_batch_size // num_devices) * num_devices,
+            num_devices
+        )
+        print(f"  Effective batch size: {effective_batch_size} (aligned to {num_devices} devices)")
+        print(f"  Total batches: {(total_samples + effective_batch_size - 1) // effective_batch_size}")
         sys.stdout.flush()
 
         # Allocate latent array (NHWC format: N, 32, 32, 4)
@@ -570,11 +600,11 @@ class ImageNetParquetRAMLoader(ImageNetParquetLoader):
         self.all_latents = np.zeros((total_samples, latent_h, latent_w, 4), dtype=np.float16)
 
         encode_start = time.time()
-        num_batches = (total_samples + self.latent_batch_size - 1) // self.latent_batch_size
+        num_batches = (total_samples + effective_batch_size - 1) // effective_batch_size
 
         for batch_idx in range(num_batches):
-            start_idx = batch_idx * self.latent_batch_size
-            end_idx = min(start_idx + self.latent_batch_size, total_samples)
+            start_idx = batch_idx * effective_batch_size
+            end_idx = min(start_idx + effective_batch_size, total_samples)
             batch_bytes = all_image_bytes[start_idx:end_idx]
 
             # First batch: detailed progress
