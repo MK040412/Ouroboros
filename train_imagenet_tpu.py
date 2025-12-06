@@ -377,21 +377,23 @@ class ImageNetTPUTrainer:
             local_batch_size = batch_latents.shape[0]
             per_device_batch = local_batch_size // num_local_devices
 
-            # Latents come as NHWC (B, 32, 32, 4) from ImageNet loader
-            # Convert to NCHW (B, 4, 32, 32) for sharding and model
-            batch_latents_nchw = np.transpose(np.array(batch_latents), (0, 3, 1, 2))
+            # Latents come as NCHW (B, 4, 32, 32) from ImageNet loader (VAE output)
             emb_dim = batch_embeddings.shape[1]
+
+            # Convert to numpy and slice for each device
+            batch_latents_np = np.asarray(batch_latents)
+            batch_embeddings_np = np.asarray(batch_embeddings)
 
             # Device placement
             latent_arrays = [
                 jax.device_put(
-                    batch_latents_nchw[i*per_device_batch:(i+1)*per_device_batch],
+                    batch_latents_np[i*per_device_batch:(i+1)*per_device_batch],
                     d
                 ) for i, d in enumerate(local_devices)
             ]
             emb_arrays = [
                 jax.device_put(
-                    batch_embeddings[i*per_device_batch:(i+1)*per_device_batch],
+                    batch_embeddings_np[i*per_device_batch:(i+1)*per_device_batch],
                     d
                 ) for i, d in enumerate(local_devices)
             ]
