@@ -87,7 +87,7 @@ class FlaxVAEEncoder:
     """JAX/Flax VAE encoder wrapper for TPU"""
 
     def __init__(self,
-                 model_id: str = "stabilityai/sdxl-vae",
+                 model_id: str = "",
                  dtype: jnp.dtype = jnp.bfloat16,
                  scaling_factor: float = 0.13025):
         self.model_id = model_id
@@ -150,7 +150,7 @@ class ImageNetParquetLoader:
                  gcs_bucket: str = "gs://rdy-tpu-data-2025/imagenet-1k/data/",
                  batch_size: int = 64,
                  image_size: int = 256,
-                 vae_model_id: str = "stabilityai/sdxl-vae",
+                 vae_model_id: str = "",
                  embedding_dim: int = 640,
                  num_workers: int = 8,
                  shard_data: bool = True,

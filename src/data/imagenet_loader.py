@@ -80,7 +80,7 @@ class FlaxVAEEncoder:
     """
 
     def __init__(self,
-                 model_id: str = "stabilityai/sdxl-vae",
+                 model_id: str = "",
                  dtype: jnp.dtype = jnp.bfloat16,
                  scaling_factor: float = 0.13025):
         """
@@ -115,8 +115,7 @@ class FlaxVAEEncoder:
 
         self.vae, self.vae_params = FlaxAutoencoderKL.from_pretrained(
             self.model_id,
-            dtype=self.dtype,
-            from_pt=True,
+            dtype=self.dtype
         )
 
         # JIT compile encode function
@@ -187,7 +186,7 @@ class ImageNetRAMLoader:
                  data_dir: str,
                  batch_size: int = 64,
                  image_size: int = 256,
-                 vae_model_id: str = "stabilityai/sdxl-vae",
+                 vae_model_id: str = "",
                  embedding_dim: int = 640,
                  num_workers: int = 8,
                  prefetch_batches: int = 4,
