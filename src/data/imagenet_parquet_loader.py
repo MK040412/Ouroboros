@@ -122,18 +122,21 @@ class FlaxVAEEncoder:
 
         print(f"[VAE] Loading FlaxAutoencoderKL from {self.model_id}...")
 
+        # Get local TPU device for this process
+        local_devices = jax.local_devices()
+        tpu_device = local_devices[0] if local_devices else None
+
         self.vae, self.vae_params = FlaxAutoencoderKL.from_pretrained(
             self.model_id,
             dtype=self.dtype,
         )
 
-        # Move params to TPU
-        tpu_devices = jax.devices('tpu')
-        if tpu_devices:
-            print(f"[VAE] Moving params to TPU ({len(tpu_devices)} devices)...")
-            self.vae_params = jax.device_put(self.vae_params, tpu_devices[0])
+        # Move params to local TPU
+        if tpu_device is not None:
+            print(f"[VAE] Moving params to {tpu_device}...")
+            self.vae_params = jax.device_put(self.vae_params, tpu_device)
         else:
-            print(f"[VAE] Warning: No TPU found, using CPU")
+            print(f"[VAE] Warning: No local device found")
 
         @jax.jit
         def encode_fn(params, images):
