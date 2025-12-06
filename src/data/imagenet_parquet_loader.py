@@ -118,7 +118,7 @@ class FlaxVAEEncoder:
 
         @jax.jit
         def encode_fn(params, images):
-            """Encode images to latents (B, H, W, C) -> (B, 4, H//8, W//8) NCHW"""
+            """Encode images to latents (B, H, W, C) -> (B, H//8, W//8, 4) NHWC"""
             images_nchw = jnp.transpose(images, (0, 3, 1, 2))
             latent_dist = self.vae.apply(
                 {"params": params},
@@ -126,8 +126,7 @@ class FlaxVAEEncoder:
                 method=self.vae.encode
             )
             latents = latent_dist.latent_dist.mode()
-            # FlaxAutoencoderKL returns NHWC, convert to NCHW
-            latents = jnp.transpose(latents, (0, 3, 1, 2))
+            # FlaxAutoencoderKL returns NHWC, keep it as is
             latents = latents * self.scaling_factor
             return latents
 
