@@ -100,6 +100,9 @@ class TrainingConfigImageNet:
     vae_scaling_factor: float = 0.13025
     image_size: int = 256
 
+    # Precomputed embeddings (사전 계산된 클래스 임베딩)
+    precomputed_embeddings_path: str = "gs://rdy-tpu-data-2025/imagenet-1k/imagenet_class_embeddings.npy"
+
     # Data loading
     num_data_workers: int = 8
     prefetch_batches: int = 4
