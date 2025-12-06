@@ -566,23 +566,41 @@ class ImageNetParquetRAMLoader(ImageNetParquetLoader):
             end_idx = min(start_idx + self.latent_batch_size, total_samples)
             batch_bytes = all_image_bytes[start_idx:end_idx]
 
+            # First batch: detailed progress
+            if batch_idx == 0:
+                print(f"  [Batch 0] Decoding {len(batch_bytes)} images...")
+                sys.stdout.flush()
+
             # Decode images in parallel (using TurboJPEG if available)
             with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
                 images = list(executor.map(self._decode_image, batch_bytes))
 
+            if batch_idx == 0:
+                print(f"  [Batch 0] Decoding done, stacking...")
+                sys.stdout.flush()
+
             images = np.stack(images, axis=0)
+
+            if batch_idx == 0:
+                print(f"  [Batch 0] VAE encoding (JIT compiling, may take a few minutes)...")
+                sys.stdout.flush()
 
             # VAE encode
             images_jax = jnp.array(images)
             latents = self.vae.encode(images_jax)
 
+            if batch_idx == 0:
+                print(f"  [Batch 0] VAE done!")
+                sys.stdout.flush()
+
             # Store as float16 to save memory
             self.all_latents[start_idx:end_idx] = np.array(latents, dtype=np.float16)
 
-            if (batch_idx + 1) % 100 == 0 or batch_idx == num_batches - 1:
+            # Progress every 50 batches or at end
+            if batch_idx == 0 or (batch_idx + 1) % 50 == 0 or batch_idx == num_batches - 1:
                 elapsed = time.time() - encode_start
                 samples_done = end_idx
-                samples_per_sec = samples_done / elapsed
+                samples_per_sec = samples_done / elapsed if elapsed > 0 else 0
                 eta = (total_samples - samples_done) / samples_per_sec if samples_per_sec > 0 else 0
                 print(f"  Encoded {samples_done:,}/{total_samples:,} ({100*samples_done/total_samples:.1f}%) - {samples_per_sec:.1f} samples/s - ETA: {eta/60:.1f}m")
                 sys.stdout.flush()
