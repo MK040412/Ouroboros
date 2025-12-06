@@ -77,7 +77,7 @@ class TrainingConfigImageNet:
     use_bfloat16: bool = True
 
     # 학습
-    num_epochs: int = 100
+    num_epochs: int = 1000
     steps_per_epoch: Optional[int] = 1250  # ~1.28M / 1024 = 1250 steps
     learning_rate: float = 0.5
     mup_base_dim: int = 1
@@ -565,7 +565,7 @@ def main():
 
     LoaderClass = ImageNetParquetRAMLoader if config.use_ram_preload else ImageNetParquetLoader
 
-    data_loader = LoaderClass(
+    loader_kwargs = dict(
         gcs_bucket=config.imagenet_gcs_path,
         batch_size=local_batch_size,
         image_size=config.image_size,
@@ -575,6 +575,12 @@ def main():
         shard_data=True,
         use_vae=True,
     )
+
+    # RAMLoader uses larger batch for VAE precomputation (single device, larger batch = faster)
+    if config.use_ram_preload:
+        loader_kwargs['latent_batch_size'] = 256
+
+    data_loader = LoaderClass(**loader_kwargs)
 
     # Calculate steps if not set
     if config.steps_per_epoch is None:

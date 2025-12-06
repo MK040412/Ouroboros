@@ -12,6 +12,7 @@ Features:
 
 import os
 import sys
+import gc
 import pickle
 import argparse
 from pathlib import Path
@@ -284,12 +285,13 @@ def restore_model(model, ckpt_data: dict, use_bfloat16: bool = False):
 # ===========================================
 # Text Embedding
 # ===========================================
-def get_text_embedding(text: str, embedding_dim: int = 640) -> np.ndarray:
-    """Get text embedding using Gemma-3 270M
+def get_text_embedding(text: str, embedding_dim: int = 640, device_type: str = 'gpu') -> np.ndarray:
+    """Get text embedding using Gemma-3 270M on GPU, then release memory
 
     Args:
         text: Input text prompt
         embedding_dim: Expected embedding dimension
+        device_type: 'gpu' or 'cpu'
 
     Returns:
         (1, D) numpy array of text embedding
@@ -297,7 +299,7 @@ def get_text_embedding(text: str, embedding_dim: int = 640) -> np.ndarray:
     try:
         from gemma import gm
 
-        print(f"[Embedding] Loading Gemma-3 270M...")
+        print(f"[Embedding] Loading Gemma-3 270M on {device_type.upper()}...")
         model = gm.nn.Gemma3_270M()
         params = gm.ckpts.load_params(gm.ckpts.CheckpointPath.GEMMA3_270M_PT)
         tokenizer = gm.text.Gemma3Tokenizer()
@@ -349,7 +351,16 @@ def get_text_embedding(text: str, embedding_dim: int = 640) -> np.ndarray:
             f.write(f"\nFull embedding:\n{embedding[0].tolist()}\n")
         print(f"  Embedding saved to: {emb_file}")
 
-        return embedding.astype(np.float32)
+        result = embedding.astype(np.float32)
+
+        # Release Gemma model from GPU memory
+        print("[Embedding] Releasing Gemma model from GPU memory...")
+        del model, params, tokenizer, out, last_hidden
+        jax.clear_caches()
+        gc.collect()
+        print("[Embedding] GPU memory released")
+
+        return result
 
     except Exception as e:
         print(f"[Warning] Gemma failed: {e}")
@@ -460,12 +471,13 @@ def sample_rectified_flow(
 # ===========================================
 # VAE Decoding
 # ===========================================
-def decode_latent_to_image(latent: np.ndarray, output_path: str = None):
-    """Decode VAE latent to image using SDXL-VAE
+def decode_latent_to_image(latent: np.ndarray, output_path: str = None, use_gpu: bool = True):
+    """Decode VAE latent to image using SDXL-VAE on GPU
 
     Args:
         latent: (B, H, W, C) latent array (NHWC format)
         output_path: Path to save the image (optional)
+        use_gpu: Whether to use GPU for decoding
 
     Returns:
         PIL Image
@@ -474,12 +486,16 @@ def decode_latent_to_image(latent: np.ndarray, output_path: str = None):
     from diffusers import AutoencoderKL
     from PIL import Image
 
-    # Force CPU to avoid OOM when JAX is using GPU
-    device = "cpu"
-    print(f"\n[Decode] Loading SDXL-VAE on {device}...")
+    # Use GPU if available and requested
+    if use_gpu and torch.cuda.is_available():
+        device = "cuda"
+    else:
+        device = "cpu"
 
-    vae = AutoencoderKL.from_pretrained("KMK040412/sdxl-vae-flax-msgpack")
-    vae.eval().to(device)
+    print(f"\n[Decode] Loading SDXL-VAE on {device.upper()}...")
+
+    vae = AutoencoderKL.from_pretrained("stabilityai/SDXL-VAE").to(device)
+    vae.eval()
 
     # Convert NHWC to NCHW: (B, H, W, C) -> (B, C, H, W)
     latent_nchw = np.transpose(latent, (0, 3, 1, 2))
@@ -493,7 +509,7 @@ def decode_latent_to_image(latent: np.ndarray, output_path: str = None):
         decoded = vae.decode(latent_tensor).sample
 
     # Convert to image: (B, C, H, W) -> (H, W, C)
-    image = decoded[0].permute(1, 2, 0).numpy()
+    image = decoded[0].permute(1, 2, 0).cpu().numpy()
     image = np.clip((image + 1) / 2 * 255, 0, 255).astype(np.uint8)
 
     pil_image = Image.fromarray(image)
@@ -501,6 +517,14 @@ def decode_latent_to_image(latent: np.ndarray, output_path: str = None):
     if output_path:
         pil_image.save(output_path)
         print(f"  Saved to: {output_path}")
+
+    # Release VAE from GPU memory
+    print("[Decode] Releasing VAE from GPU memory...")
+    del vae, latent_tensor, decoded
+    if device == "cuda":
+        torch.cuda.empty_cache()
+    gc.collect()
+    print("[Decode] GPU memory released")
 
     return pil_image
 
@@ -516,7 +540,12 @@ def run_inference(
     cfg_scale: float = 0.0,
     seed: int = None,
 ):
-    """Run full inference pipeline
+    """Run full inference pipeline with sequential GPU memory management
+
+    Pipeline:
+    1. Load Text Encoder (Gemma-3) -> Compute embedding -> Release from GPU
+    2. Load XUT Model -> Sample latent -> Release from GPU
+    3. Load VAE Decoder -> Decode image -> Release from GPU
 
     Args:
         prompt: Text prompt for image generation
@@ -526,32 +555,49 @@ def run_inference(
         cfg_scale: CFG guidance scale
         seed: Random seed
     """
-    import jax
-
     print("=" * 60)
     print("XUT-Small Text-to-Image Inference")
+    print("(Sequential GPU Memory Management)")
     print("=" * 60)
 
     # Setup device
-    device_type, device = setup_device()
+    device_type, _ = setup_device()
 
-    # Get checkpoint
+    # Get checkpoint path (don't load yet)
     if checkpoint_path is None:
         checkpoint_path = download_latest_checkpoint()
 
-    # Load checkpoint
+    # Load checkpoint data (CPU only, small)
     ckpt_data = load_checkpoint(checkpoint_path)
     config = ckpt_data.get('config', {})
+    context_dim = config.get('context_dim', 640)
+
+    # =============================================
+    # Step 1: Text Embedding (Gemma-3 on GPU)
+    # =============================================
+    print(f"\n{'='*60}")
+    print("[Step 1/3] Text Embedding")
+    print(f"{'='*60}")
+    print(f"[Prompt] \"{prompt}\"")
+
+    text_embedding = get_text_embedding(
+        prompt,
+        embedding_dim=context_dim,
+        device_type=device_type
+    )
+    # Gemma model is released inside get_text_embedding()
+
+    # =============================================
+    # Step 2: XUT Sampling (XUT Model on GPU)
+    # =============================================
+    print(f"\n{'='*60}")
+    print("[Step 2/3] XUT Sampling")
+    print(f"{'='*60}")
 
     # Create and restore model
     model = create_model(config)
     use_bfloat16 = device_type == 'gpu'
     restore_model(model, ckpt_data, use_bfloat16=use_bfloat16)
-
-    # Get text embedding
-    print(f"\n[Prompt] \"{prompt}\"")
-    context_dim = config.get('context_dim', 640)
-    text_embedding = get_text_embedding(prompt, embedding_dim=context_dim)
 
     # Sample
     latent = sample_rectified_flow(
@@ -563,17 +609,34 @@ def run_inference(
         device_type=device_type,
     )
 
-    # Decode to image
+    # Release XUT model from GPU memory
+    print("[XUT] Releasing XUT model from GPU memory...")
+    del model, ckpt_data
+    jax.clear_caches()
+    gc.collect()
+    print("[XUT] GPU memory released")
+
+    # =============================================
+    # Step 3: VAE Decoding (SDXL-VAE on GPU)
+    # =============================================
+    print(f"\n{'='*60}")
+    print("[Step 3/3] VAE Decoding")
+    print(f"{'='*60}")
+
     output_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_path = output_dir / f"generated_{timestamp}.png"
 
     # Inverse VAE scaling: model outputs normalized latents, VAE expects raw scale
-    # See: https://huggingface.co/stabilityai/sdxl-vae/commit/e6e6fee
     SDXL_VAE_SCALE = 0.13025
     latent = latent / SDXL_VAE_SCALE
 
-    image = decode_latent_to_image(latent, str(output_path))
+    image = decode_latent_to_image(
+        latent,
+        str(output_path),
+        use_gpu=(device_type == 'gpu')
+    )
+    # VAE is released inside decode_latent_to_image()
 
     print("\n" + "=" * 60)
     print(f"Image saved to: {output_path}")
@@ -588,35 +651,34 @@ def interactive_mode(
     num_steps: int = 50,
     cfg_scale: float = 0.0,
 ):
-    """Interactive mode for continuous image generation"""
-    import jax
+    """Interactive mode with sequential GPU memory management per image
 
+    Each image generation follows the pipeline:
+    1. Text Encoder -> GPU -> embedding -> release
+    2. XUT Model -> GPU -> sample -> release
+    3. VAE Decoder -> GPU -> decode -> release
+    """
     print("=" * 60)
     print("XUT-Small Interactive Text-to-Image")
+    print("(Sequential GPU Memory Management)")
     print("=" * 60)
     print("Type 'quit' or 'exit' to stop")
     print("Type 'seed:123' to set seed, 'steps:30' to change steps")
     print("=" * 60)
 
     # Setup device
-    device_type, device = setup_device()
+    device_type, _ = setup_device()
 
     # Get checkpoint
     if checkpoint_path is None:
         checkpoint_path = download_latest_checkpoint()
 
-    # Load checkpoint
+    # Load checkpoint data (CPU only, small)
     ckpt_data = load_checkpoint(checkpoint_path)
     config = ckpt_data.get('config', {})
-
-    # Create and restore model (once)
-    model = create_model(config)
-    use_bfloat16 = device_type == 'gpu'
-    restore_model(model, ckpt_data, use_bfloat16=use_bfloat16)
-
-    # Load embedding model once
     context_dim = config.get('context_dim', 640)
-    print("\n[Ready] Model loaded. Enter your prompts:\n")
+
+    print("\n[Ready] Enter your prompts:\n")
 
     output_dir.mkdir(parents=True, exist_ok=True)
     current_seed = None
@@ -653,14 +715,24 @@ def interactive_mode(
                 print("  Invalid steps value")
             continue
 
-        # Generate image
+        # Generate image with sequential GPU memory management
         try:
             print(f"\n[Generating] \"{prompt}\"")
 
-            # Get text embedding
-            text_embedding = get_text_embedding(prompt, embedding_dim=context_dim)
+            # Step 1: Text Embedding (Gemma on GPU, then release)
+            print(f"\n[Step 1/3] Text Embedding")
+            text_embedding = get_text_embedding(
+                prompt,
+                embedding_dim=context_dim,
+                device_type=device_type
+            )
 
-            # Sample
+            # Step 2: XUT Sampling (XUT on GPU, then release)
+            print(f"\n[Step 2/3] XUT Sampling")
+            model = create_model(config)
+            use_bfloat16 = device_type == 'gpu'
+            restore_model(model, ckpt_data, use_bfloat16=use_bfloat16)
+
             latent = sample_rectified_flow(
                 model=model,
                 text_embedding=text_embedding,
@@ -670,15 +742,25 @@ def interactive_mode(
                 device_type=device_type,
             )
 
-            # Decode
+            # Release XUT model
+            print("[XUT] Releasing XUT model from GPU memory...")
+            del model
+            jax.clear_caches()
+            gc.collect()
+
+            # Step 3: VAE Decoding (VAE on GPU, then release)
+            print(f"\n[Step 3/3] VAE Decoding")
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             output_path = output_dir / f"generated_{timestamp}.png"
 
-            # Inverse VAE scaling: model outputs normalized latents, VAE expects raw scale
             SDXL_VAE_SCALE = 0.13025
             latent = latent / SDXL_VAE_SCALE
 
-            image = decode_latent_to_image(latent, str(output_path))
+            decode_latent_to_image(
+                latent,
+                str(output_path),
+                use_gpu=(device_type == 'gpu')
+            )
 
             print(f"\n[Done] Saved to: {output_path}")
 
