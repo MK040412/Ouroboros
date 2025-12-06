@@ -444,7 +444,9 @@ def sample_rectified_flow(
 
         if (step + 1) % 10 == 0 or step == 0:
             x_min, x_max = float(x.min()), float(x.max())
-            print(f"  Step {step + 1}/{num_steps}, t={t:.3f}, x_range=[{x_min:.2f}, {x_max:.2f}]")
+            v_min, v_max = float(v.min()), float(v.max())
+            v_mean, v_std = float(v.mean()), float(v.std())
+            print(f"  Step {step + 1}/{num_steps}, t={t:.3f}, x=[{x_min:.2f}, {x_max:.2f}], v=[{v_min:.2f}, {v_max:.2f}], v_mean={v_mean:.3f}")
 
     # Final stats
     x_np = np.array(x)
@@ -702,7 +704,7 @@ def main():
                         help='Output directory for generated images')
     parser.add_argument('--steps', '-s', type=int, default=50,
                         help='Number of sampling steps (default: 50)')
-    parser.add_argument('--cfg-scale', type=float, default=0.0,
+    parser.add_argument('--cfg-scale', type=float, default=1.0,
                         help='CFG guidance scale (0 = conditional only, no CFG)')
     parser.add_argument('--seed', type=int, default=None,
                         help='Random seed')
