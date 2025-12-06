@@ -566,6 +566,11 @@ def run_inference(
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_path = output_dir / f"generated_{timestamp}.png"
 
+    # Inverse VAE scaling: model outputs normalized latents, VAE expects raw scale
+    # See: https://huggingface.co/stabilityai/sdxl-vae/commit/e6e6fee
+    SDXL_VAE_SCALE = 0.13025
+    latent = latent / SDXL_VAE_SCALE
+
     image = decode_latent_to_image(latent, str(output_path))
 
     print("\n" + "=" * 60)
@@ -666,6 +671,11 @@ def interactive_mode(
             # Decode
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             output_path = output_dir / f"generated_{timestamp}.png"
+
+            # Inverse VAE scaling: model outputs normalized latents, VAE expects raw scale
+            SDXL_VAE_SCALE = 0.13025
+            latent = latent / SDXL_VAE_SCALE
+
             image = decode_latent_to_image(latent, str(output_path))
 
             print(f"\n[Done] Saved to: {output_path}")

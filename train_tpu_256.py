@@ -121,6 +121,11 @@ class TrainingConfig256:
     wandb_project: str = "xut-small-256"
     wandb_entity: str = None  # set to username
 
+    # VAE scaling (SDXL-VAE standard)
+    # Raw VAE latents need to be scaled for stable training
+    # See: https://huggingface.co/stabilityai/sdxl-vae/commit/e6e6fee
+    vae_scaling_factor: float = 0.13025
+
     # GCS Checkpoint 설정
     checkpoint_gcs_bucket: str = "rdy-tpu-data-2025"
     checkpoint_gcs_prefix: str = "checkpoints/xut-small-256"  # gs://bucket/prefix/run_YYYYMMDD_HHMMSS/
@@ -932,8 +937,9 @@ class TPUTrainer:
             compute_dtype = jnp.bfloat16 if self.config.use_bfloat16 else jnp.float32
             x_1 = jax.random.normal(subkey, batch_latents.shape, dtype=compute_dtype)
 
-            # 데이터도 동일 dtype으로 변환
-            x_0 = batch_latents.astype(compute_dtype)
+            # VAE scaling: 원본 latents에 scaling factor 적용
+            # SDXL-VAE의 raw latent 출력을 ~N(0,1) 범위로 정규화
+            x_0 = (batch_latents * self.config.vae_scaling_factor).astype(compute_dtype)
             batch_embeddings = batch_embeddings.astype(compute_dtype)
 
             # Rectified Flow forward: x_t = (1 - t) * x_0 + t * x_1
