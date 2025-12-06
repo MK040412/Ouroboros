@@ -126,8 +126,9 @@ class FlaxVAEEncoder:
                 method=self.vae.encode
             )
             latents = latent_dist.latent_dist.mode()
+            # FlaxAutoencoderKL returns NHWC, convert to NCHW
+            latents = jnp.transpose(latents, (0, 3, 1, 2))
             latents = latents * self.scaling_factor
-            # Keep NCHW format - no transpose back
             return latents
 
         self._encode_fn = encode_fn
