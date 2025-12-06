@@ -127,6 +127,14 @@ class FlaxVAEEncoder:
             dtype=self.dtype,
         )
 
+        # Move params to TPU
+        tpu_devices = jax.devices('tpu')
+        if tpu_devices:
+            print(f"[VAE] Moving params to TPU ({len(tpu_devices)} devices)...")
+            self.vae_params = jax.device_put(self.vae_params, tpu_devices[0])
+        else:
+            print(f"[VAE] Warning: No TPU found, using CPU")
+
         @jax.jit
         def encode_fn(params, images):
             """Encode images to latents (B, H, W, C) -> (B, H//8, W//8, 4) NHWC"""
