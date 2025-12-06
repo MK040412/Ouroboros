@@ -92,7 +92,7 @@ def decode_pt_latent(
     
     # Load VAE
     print(f"\n2. Loading SDXL-VAE...")
-    vae = AutoencoderKL.from_pretrained("")
+    vae = AutoencoderKL.from_pretrained("KMK040412/sdxl-vae-flax-msgpack")
     vae.eval().to(device)
     
     # Init diffusion schedule if adding noise

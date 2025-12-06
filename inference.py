@@ -478,7 +478,7 @@ def decode_latent_to_image(latent: np.ndarray, output_path: str = None):
     device = "cpu"
     print(f"\n[Decode] Loading SDXL-VAE on {device}...")
 
-    vae = AutoencoderKL.from_pretrained("")
+    vae = AutoencoderKL.from_pretrained("KMK040412/sdxl-vae-flax-msgpack")
     vae.eval().to(device)
 
     # Convert NHWC to NCHW: (B, H, W, C) -> (B, C, H, W)
