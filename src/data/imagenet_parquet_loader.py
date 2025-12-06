@@ -138,9 +138,7 @@ class FlaxVAEEncoder:
         self._load_model()
         images = images * 2.0 - 1.0  # [0,1] -> [-1,1]
         images = images.astype(self.dtype)
-        latents = self._encode_fn(self.vae_params, images)
-        print(f"[VAE DEBUG] Input shape: {images.shape}, Output shape: {latents.shape}")
-        return latents
+        return self._encode_fn(self.vae_params, images)
 
 
 class ImageNetParquetLoader:
