@@ -664,13 +664,12 @@ def main():
         epoch_time = time.time() - epoch_start
         print(f"  ✓ Epoch {epoch+1} done in {epoch_time/60:.1f}m, avg loss: {epoch_avg_loss:.6f}")
 
-        # Checkpoint
-        trainer.save_checkpoint(epoch, config.steps_per_epoch, epoch_avg_loss)
-
-        # 10 에폭마다 임베딩 디버그 출력 (Worker 0만)
-        if (epoch + 1) % 10 == 0 and jax.process_index() == 0:
-            print(f"\n[Debug Epoch {epoch+1}] Embedding verification...")
-            data_loader.debug_embeddings()
+        # 10 에폭마다 체크포인트 저장 및 임베딩 디버그 출력
+        if (epoch + 1) % 10 == 0:
+            trainer.save_checkpoint(epoch, config.steps_per_epoch, epoch_avg_loss)
+            if jax.process_index() == 0:
+                print(f"\n[Debug Epoch {epoch+1}] Embedding verification...")
+                data_loader.debug_embeddings()
 
         if _graceful_killer.kill_now:
             print("\n[SIGNAL] Training interrupted")
