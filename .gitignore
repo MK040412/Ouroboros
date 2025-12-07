@@ -39,3 +39,6 @@ captions_10.txt
 
 # Local symbolic links
 HDM_original_gpu_pytorch
+
+# Claude Code instructions (local only)
+CLAUDE.md

@@ -1,0 +1,249 @@
+================================================================================
+                    Ouroboros: XUT-Small Diffusion Transformer
+                         Model & Training Specification
+================================================================================
+
+1. MODEL ARCHITECTURE (XUT-Small / XUDiT)
+================================================================================
+
+1.1 Core Architecture
+---------------------
+- Architecture Type: XUDiT (Xpanded Universal Diffusion Transformer)
+- Base: Encoder-Decoder Transformer with Skip Connections
+- Design: TREAD (Timestep-Random Encoder Architecture Design)
+
+1.2 Model Dimensions
+--------------------
+- Model Dimension:     896
+- MLP Dimension:       3,072
+- Attention Heads:     14
+- Head Dimension:      64 (dim / heads)
+- Depth:               4 (transformer layers)
+- Encoder Blocks:      1 per layer
+- Decoder Blocks:      2 per layer
+- Total Parameters:    ~50M (estimated)
+
+1.3 Input/Output Specifications
+-------------------------------
+- Input:  VAE Latent (32 x 32 x 4) NHWC format
+          Corresponds to 256 x 256 pixel images (8x compression)
+- Output: Velocity prediction (32 x 32 x 4) for Rectified Flow
+
+1.4 Key Components
+------------------
+a) Patch Embedding: Conv-based 2D to sequence conversion
+b) Timestep Embedding: Sinusoidal + MLP projection
+c) Axial RoPE: 2D positional encoding with aspect ratio awareness
+d) AdaLN (Shared): Adaptive Layer Normalization for time-conditioning
+e) SwiGLU MLP: Gated MLP with SiLU activation
+f) RMSNorm: Root Mean Square Layer Normalization
+
+
+2. TEXT EMBEDDING (Gemma-3 270M)
+================================================================================
+
+2.1 Embedding Model
+-------------------
+- Model:        Gemma-3 270M (google/gemma)
+- Library:      Native gemma library (not transformers)
+- Dimension:    640
+- Pooling:      Mean pooling over last hidden states
+- Normalization: L2 normalized
+
+2.2 Why Gemma-3 270M?
+---------------------
+- Lightweight yet semantically rich (270M parameters)
+- Native JAX/TPU support via gemma library
+- 640-dim output balances expressiveness vs efficiency
+- Pre-computed embeddings eliminate CPU bottleneck during training
+
+2.3 Embedding Quality (Verified)
+--------------------------------
+- Same-category similarity:    0.35 (e.g., dog breeds cluster together)
+- Cross-category similarity:   0.27
+- Semantic separation ratio:   1.31x
+
+Dog Breeds Example (118 classes):
+- Within-group similarity:     0.336
+- Clear semantic clustering in t-SNE/UMAP
+- "golden retriever" neighbors: Labrador (0.97), curly-coated retriever (0.92)
+
+2.4 Correct vs Buggy Embedding Comparison
+-----------------------------------------
+                          Correct ("golden retriever")    Buggy ("class_0")
+Same group similarity:           0.35                          0.00
+Separation ratio:                1.31x                        -1.85x
+Dog breeds similarity:           0.336                         0.000
+
+Impact on Diffusion Transformer:
+- Correct: Enables visual-semantic correspondence learning
+- Buggy: Model must memorize each class independently (inefficient)
+
+
+3. TRAINING CONFIGURATION
+================================================================================
+
+3.1 Hardware
+------------
+- Platform:     Google Cloud TPU v5e-32 Pod
+- Workers:      8 hosts
+- TPU Chips:    4 per worker (32 total)
+- vCPUs:        112 per worker
+- RAM:          150GB per worker
+- Storage:      GCS (Google Cloud Storage)
+
+3.2 Data Pipeline
+-----------------
+- Dataset:      COYO-11M (256px center-cropped)
+- Format:       Pre-computed VAE latents + Gemma embeddings in PT files
+- Loading:      RAM Preload mode (all PT files loaded to memory)
+- Workers:      56 CPU workers for batch sampling
+- Latent Shape: (B, 32, 32, 4) NHWC, float32 -> bfloat16
+
+3.3 Training Hyperparameters
+----------------------------
+- Global Batch Size:    1,024 (32 per device)
+- Local Batch Size:     128 per worker (1024 / 8)
+- Learning Rate:        0.5 (base) -> 5.58e-4 (muP scaled)
+- muP Scaling:          lr * (1 / 896) = 5.58e-4
+- Warmup Steps:         1,000
+- LR Schedule:          Warmup + Cosine Decay
+- Optimizer:            AdamW (weight_decay=1e-4)
+- Gradient Clipping:    1.0 (global norm)
+- Precision:            bfloat16 (TPU optimized)
+
+3.4 Epochs & Steps
+------------------
+- Total Epochs:         20
+- Steps per Epoch:      10,000
+- Samples per Epoch:    10,000 * 1,024 = 10.24M images
+- Total Training:       ~200M image views
+
+3.5 Diffusion Schedule (Rectified Flow)
+---------------------------------------
+- Framework:    Rectified Flow (RF)
+- Interpolation: x_t = (1-t)*x_0 + t*x_1
+- Target:       Velocity v = x_1 - x_0 (noise - clean)
+- Timestep:     Logit-Normal sampling (SD3 style)
+                t = sigmoid(normal(0, 1))
+- Loss:         MSE(v_pred, v_target)
+
+3.6 VAE Configuration
+---------------------
+- Model:        SDXL VAE (FlaxAutoencoderKL)
+- Scaling:      0.13025 (SDXL standard)
+- Latent Range: ~N(0, 1) after scaling
+
+
+4. CLASSIFIER-FREE GUIDANCE (CFG)
+================================================================================
+
+4.1 Training Strategy
+---------------------
+- CFG Dropout Rate:     50% (tread_selection_rate)
+- Implementation:       Text embedding zeroed with 50% probability
+- Purpose:              Enable unconditional generation for CFG at inference
+
+4.2 TREAD Token Dropout
+-----------------------
+- Applied inside model (deterministic=False during training)
+- Additional regularization for encoder tokens
+
+
+5. CHECKPOINTING & RESUME
+================================================================================
+
+5.1 Checkpoint Strategy
+-----------------------
+- Location:     GCS (gs://rdy-tpu-data-2025/checkpoints/xut-small-256/)
+- Frequency:    Every 1,000 steps + Every epoch end
+- Format:       Pickle (model_state + optimizer_state)
+- Rotation:     Keep last 3 step checkpoints, all epoch checkpoints
+
+5.2 Preemption Handling
+-----------------------
+- SIGTERM/SIGINT handler for TPU preemption
+- Graceful shutdown with checkpoint save
+- Automatic resume from latest checkpoint
+
+
+6. DATA FORMAT
+================================================================================
+
+6.1 PT File Structure
+---------------------
+- Keys:       Image identifiers (int64)
+- Latents:    (N, 4, 32, 32) NCHW float16 VAE outputs
+- Embeddings: (N, 640) float32 Gemma-3 text embeddings
+
+6.2 ImageNet 1K Class Embeddings (for class-conditional)
+--------------------------------------------------------
+- File:       imagenet_class_embeddings.npy
+- Shape:      (1000, 640)
+- Source:     Gemma-3 270M, mean-pooled, L2 normalized
+- Classes:    OrderedDict from HuggingFace ImageNet2012
+
+Sample Classes:
+  0: "tench, Tinca tinca"
+  1: "goldfish, Carassius auratus"
+  207: "golden retriever"
+  281: "tabby, tabby cat"
+  963: "pizza, pizza pie"
+  999: "toilet tissue, toilet paper"
+
+
+7. MONITORING & LOGGING
+================================================================================
+
+7.1 Weights & Biases
+--------------------
+- Project:    xut-small-256
+- Metrics:    loss, learning_rate, epoch, step
+- Frequency:  Every step
+
+7.2 Local Logging
+-----------------
+- File:       /tmp/loss_log.csv
+- Format:     timestamp, epoch, step, global_step, loss, lr
+- Frequency:  Every 100 steps
+
+
+8. KEY DESIGN DECISIONS
+================================================================================
+
+8.1 Why Pre-computed Embeddings?
+--------------------------------
+- CPU text encoding was bottleneck (112 vCPU not enough)
+- Pre-computing eliminates runtime overhead
+- Enables full GPU/TPU utilization
+- ~3GB per PT file (latents + embeddings)
+
+8.2 Why Rectified Flow?
+-----------------------
+- Simpler than DDPM (linear interpolation)
+- Fewer sampling steps at inference
+- Stable training (velocity prediction)
+- SD3-style logit-normal timestep for better mid-range coverage
+
+8.3 Why muP Scaling?
+--------------------
+- Maximal Update Parameterization
+- Learning rate scales with model width
+- Enables hyperparameter transfer across model sizes
+- lr_effective = base_lr * (base_dim / model_dim)
+
+8.4 Why XUT (Encoder-Decoder)?
+------------------------------
+- Skip connections between encoder/decoder
+- Better gradient flow than vanilla transformer
+- First decoder block cross-attends to encoder output
+- More efficient than pure decoder-only
+
+
+================================================================================
+                              END OF SPECIFICATION
+================================================================================
+
+Generated: 2024-12-07
+Project: Ouroboros (Home-made Diffusion Model)
+Repository: /home/perelman/바탕화면/Ouroboros/
