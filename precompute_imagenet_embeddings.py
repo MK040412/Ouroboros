@@ -177,7 +177,12 @@ class ImageNetEmbeddingComputer:
         self.embedder = GemmaEmbedder(max_length=config.max_length)
 
     def load_class_labels(self) -> Dict[int, str]:
-        """GCS에서 classes.py 로드하여 클래스 라벨 추출"""
+        """GCS에서 classes.py 로드하여 클래스 라벨 추출
+
+        classes.py는 IMAGENET2012_CLASSES OrderedDict를 포함하며,
+        키는 synset ID (예: "n01440764"), 값은 클래스 이름 (예: "tench, Tinca tinca")
+        OrderedDict의 순서가 클래스 인덱스 0-999에 해당
+        """
         print(f"\n[1/3] Loading class labels from {self.config.classes_path}...")
         sys.stdout.flush()
 
@@ -204,20 +209,32 @@ class ImageNetEmbeddingComputer:
         with open(classes_path, 'r') as f:
             content = f.read()
 
-        # exec으로 IMAGENET_CLASSES 로드
+        # exec으로 IMAGENET2012_CLASSES 로드 (OrderedDict)
         local_vars = {}
         exec(content, {}, local_vars)
 
-        if 'IMAGENET_CLASSES' in local_vars:
-            labels = local_vars['IMAGENET_CLASSES']
+        synset_dict = None
+        if 'IMAGENET2012_CLASSES' in local_vars:
+            synset_dict = local_vars['IMAGENET2012_CLASSES']
+        elif 'IMAGENET_CLASSES' in local_vars:
+            synset_dict = local_vars['IMAGENET_CLASSES']
         else:
-            # 다른 형식 시도
+            # 1000개 항목의 dict 찾기
             for var_value in local_vars.values():
                 if isinstance(var_value, dict) and len(var_value) == 1000:
-                    labels = var_value
+                    synset_dict = var_value
                     break
 
-        if not labels:
+        if synset_dict:
+            # synset ID dict를 정수 인덱스 dict로 변환
+            # OrderedDict이므로 순서가 클래스 인덱스에 해당
+            for idx, (synset_id, class_name) in enumerate(synset_dict.items()):
+                labels[idx] = class_name
+            print(f"  Converted synset dict to index dict")
+            print(f"  Sample: class 0 = '{labels.get(0, 'N/A')}'")
+            print(f"  Sample: class 1 = '{labels.get(1, 'N/A')}'")
+            print(f"  Sample: class 999 = '{labels.get(999, 'N/A')}'")
+        else:
             print("  Warning: Could not parse classes.py, using fallback")
             labels = {i: f"class_{i}" for i in range(1000)}
 

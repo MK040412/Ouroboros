@@ -251,33 +251,81 @@ def restore_model(model, ckpt_data: dict, use_bfloat16: bool = False):
 
     model_state = ckpt_data['model_state']
 
+    # Extract raw numpy arrays from FlaxStateContainer/FlaxStateDict structure
+    def extract_raw_value(obj):
+        """Recursively extract raw numpy array from checkpoint structure"""
+        if isinstance(obj, FlaxStateContainer):
+            return extract_raw_value(obj.value)
+        elif isinstance(obj, dict):
+            if '_raw_value' in obj:
+                return obj['_raw_value']
+            elif 'raw_value' in obj:
+                return obj['raw_value']
+            elif 'value' in obj:
+                return extract_raw_value(obj['value'])
+            else:
+                # It's a nested dict, recurse into each key
+                return {k: extract_raw_value(v) for k, v in obj.items()}
+        elif hasattr(obj, 'shape'):  # numpy array or jax array
+            return obj
+        else:
+            return obj
+
     # Convert to JAX arrays with proper dtype handling
     def to_jax(x):
-        # Handle FlaxStateContainer objects (from our custom unpickler)
-        if isinstance(x, FlaxStateContainer):
-            x = x.value
-        # Handle nnx.Variable objects
-        elif hasattr(x, 'value') and not isinstance(x, (np.ndarray, type(None))):
-            x = x.value
-        # Handle _state attribute
-        if hasattr(x, '_state') and x is not None:
-            x = x._state if hasattr(x, '_state') else x
-
-        # Handle numpy arrays
         if isinstance(x, np.ndarray):
             arr = jnp.array(x)
             if use_bfloat16 and jnp.issubdtype(arr.dtype, jnp.floating):
                 return arr.astype(jnp.bfloat16)
             return arr
-        # Handle JAX arrays
-        if hasattr(jnp, 'ndarray') and isinstance(x, jnp.ndarray):
+        if hasattr(x, 'shape') and hasattr(jnp, 'ndarray'):
             if use_bfloat16 and jnp.issubdtype(x.dtype, jnp.floating):
                 return x.astype(jnp.bfloat16)
             return x
         return x
 
-    model_state_jax = jax.tree_util.tree_map(to_jax, model_state)
-    nnx.update(model, model_state_jax)
+    # Get the mapping from checkpoint
+    if hasattr(model_state, '__getitem__') and '_mapping' in model_state:
+        ckpt_mapping = model_state['_mapping']
+    elif hasattr(model_state, '_mapping'):
+        ckpt_mapping = model_state._mapping
+    else:
+        ckpt_mapping = model_state
+
+    # Extract raw values and convert to JAX
+    ckpt_raw = extract_raw_value(ckpt_mapping)
+    ckpt_jax = jax.tree_util.tree_map(to_jax, ckpt_raw)
+
+    # Get current model state and update it
+    current_state = nnx.state(model)
+
+    # Recursive function to update model state from checkpoint
+    def update_state(state_obj, ckpt_dict, path=""):
+        """Recursively update state object from checkpoint dict"""
+        if isinstance(ckpt_dict, dict):
+            for key, value in ckpt_dict.items():
+                # Handle integer keys (list indices)
+                if isinstance(key, int):
+                    if hasattr(state_obj, '__getitem__'):
+                        try:
+                            sub_state = state_obj[key]
+                            new_path = f"{path}[{key}]"
+                            update_state(sub_state, value, new_path)
+                        except (KeyError, IndexError, TypeError):
+                            pass
+                elif hasattr(state_obj, str(key)):
+                    sub_state = getattr(state_obj, str(key))
+                    new_path = f"{path}.{key}" if path else str(key)
+                    update_state(sub_state, value, new_path)
+        elif hasattr(ckpt_dict, 'shape'):
+            # This is an array - update the state value
+            if hasattr(state_obj, 'value'):
+                state_obj.value = ckpt_dict
+
+    update_state(current_state, ckpt_jax)
+
+    # Apply updated state back to model
+    nnx.update(model, current_state)
 
     print("  Model weights restored!")
 

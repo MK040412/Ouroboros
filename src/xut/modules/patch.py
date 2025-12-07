@@ -79,12 +79,19 @@ class UnPatch(nnx.Module):
         self.patch_size = patch_size
         self.input_dim = input_dim
         self.out_channels = out_channels
+        # Original HDM uses small normal init: normal(0, 1/in_features**2)
+        # This is NOT zero init, but very small values for stable training
+        def small_normal_init(key, shape, dtype=jnp.float32):
+            std = 1.0 / (shape[0] ** 2)  # 1/in_features^2
+            return jax.random.normal(key, shape, dtype) * std
+
         self.linear = (
             Identity()
             if not proj
             else nnx.Linear(
                 self.input_dim,
                 self.patch_size**2 * self.out_channels,
+                kernel_init=small_normal_init,
                 rngs=rngs
             )
         )
