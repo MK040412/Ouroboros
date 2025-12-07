@@ -340,6 +340,9 @@ class ImageNetParquetLoader:
 
             print(f"[ImageNet] Loaded {len(self.class_embeddings)} class embeddings (dim={self.embedding_dim})")
 
+            # 임베딩 검증: 클래스 이름과 cosine similarity 확인
+            self._verify_embeddings(embeddings)
+
         except Exception as e:
             print(f"[ImageNet] Failed to load precomputed embeddings: {e}")
             print("[ImageNet] Using random embeddings as fallback")
@@ -352,6 +355,53 @@ class ImageNetParquetLoader:
                 self.class_embeddings[class_idx] = emb
 
         return self.class_embeddings
+
+    def _verify_embeddings(self, embeddings: np.ndarray):
+        """임베딩 검증: 클래스 이름과 cosine similarity 확인"""
+        labels = load_imagenet_labels_from_gcs()
+
+        def cosine_sim(a, b):
+            return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
+
+        print(f"\n[Embedding Verification]")
+        print(f"  Class 0: {labels.get(0, 'N/A')}")
+        print(f"  Class 1: {labels.get(1, 'N/A')}")
+        print(f"  Class 207: {labels.get(207, 'N/A')}")
+        print(f"  Class 999: {labels.get(999, 'N/A')}")
+
+        # Cosine similarity 확인 (클래스 간 차이가 있어야 함)
+        sim_0_1 = cosine_sim(embeddings[0], embeddings[1])
+        sim_0_207 = cosine_sim(embeddings[0], embeddings[207])
+        sim_0_999 = cosine_sim(embeddings[0], embeddings[999])
+
+        print(f"\n  Cosine Similarity:")
+        print(f"    class 0 vs class 1: {sim_0_1:.4f}")
+        print(f"    class 0 vs class 207: {sim_0_207:.4f}")
+        print(f"    class 0 vs class 999: {sim_0_999:.4f}")
+
+        # 경고: 모든 임베딩이 동일하면 버그!
+        if sim_0_1 > 0.999 and sim_0_207 > 0.99:
+            print(f"\n  [WARNING] Embeddings appear identical! Check precompute script.")
+        else:
+            print(f"\n  [OK] Embeddings have proper variation.")
+
+    def debug_embeddings(self, sample_indices: List[int] = None):
+        """디버그용: 특정 클래스의 임베딩과 이름 출력"""
+        if sample_indices is None:
+            sample_indices = [0, 1, 207, 281, 999]  # tench, goldfish, golden retriever, cat, toilet tissue
+
+        labels = load_imagenet_labels_from_gcs()
+        embeddings = self._compute_class_embeddings()
+
+        print(f"\n[Embedding Debug - {len(sample_indices)} samples]")
+        for idx in sample_indices:
+            emb = embeddings.get(idx)
+            label = labels.get(idx, f"class_{idx}")
+            if emb is not None:
+                emb_preview = emb[:5]  # 처음 5개 값만
+                print(f"  class {idx}: '{label}'")
+                print(f"    embedding[:5] = {emb_preview}")
+                print(f"    norm = {np.linalg.norm(emb):.4f}")
 
     def _get_embeddings_batch(self, class_indices: List[int]) -> np.ndarray:
         """Get embeddings for a batch of class indices"""

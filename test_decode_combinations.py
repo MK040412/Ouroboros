@@ -112,7 +112,7 @@ def decode_with_options(
     return pil_image
 
 
-def run_all_combinations(prompt: str = "class_0", num_steps: int = 100, seed: int = 42):
+def run_all_combinations(prompt: str = "classes_57", num_steps: int = 100, seed: int = 42):
     """Run sampling once and test all decode combinations."""
 
     output_dir = Path("outputs/decode_test")
@@ -302,7 +302,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Test VAE decode combinations')
     parser.add_argument('--pt-file', type=str, default=None,
                         help='Test with PT file (ground truth)')
-    parser.add_argument('--prompt', '-p', type=str, default='class_0',
+    parser.add_argument('--prompt', '-p', type=str, default='classes_57',
                         help='Text prompt for sampling')
     parser.add_argument('--steps', '-s', type=int, default=100,
                         help='Number of sampling steps')
