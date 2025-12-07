@@ -469,10 +469,6 @@ class ImageNetTPUTrainer:
                     loss_log_file.write(f"{timestamp},{epoch+1},{step},{global_step},{avg_loss:.6f},{lr:.8f}\n")
                     loss_log_file.flush()
 
-            if step % 1000 == 0 and step > 0:
-                avg_loss_1k = np.mean(losses[-1000:]) if len(losses) >= 1000 else np.mean(losses)
-                self.save_checkpoint(epoch, step, avg_loss_1k, is_step_checkpoint=True)
-
             if step >= self.config.steps_per_epoch:
                 break
 
