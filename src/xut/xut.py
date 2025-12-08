@@ -400,7 +400,7 @@ class XUDiT(nnx.Module):
         deterministic: bool = True,
     ):
         """
-        -> (B, C, H, W)
+        -> (B, H, W, C) NHWC format
         """
         B, H, W, C = x.shape
         x_seq, pos_map_resized = self.in_patch(x, pos_map)  # x_seq: (B, N, D), pos_map_resized: (B, N, 2) or None

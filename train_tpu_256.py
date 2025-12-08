@@ -567,12 +567,10 @@ def _train_step_jit(model, optimizer, x_t, t, velocity_target, text_emb):
         text_emb: (B, 1, D) - text embeddings (CFG 드롭된 상태)
     """
     def loss_fn(model):
-        # 모델 입력: NHWC, 출력: NCHW
+        # 모델 입력: NHWC, 출력: NHWC (UnPatch returns NHWC)
         # 모델은 velocity를 예측
         # deterministic=False: TREAD 토큰 드롭아웃 활성화
-        pred_v_nchw = model(x_t, t, ctx=text_emb, deterministic=False)
-        # NCHW -> NHWC for loss computation
-        pred_v = jnp.transpose(pred_v_nchw, (0, 2, 3, 1))
+        pred_v = model(x_t, t, ctx=text_emb, deterministic=False)
         # MSE loss: ||v_pred - v_target||^2
         return jnp.mean((pred_v - velocity_target) ** 2)
 
