@@ -104,7 +104,7 @@ class TrainingConfigImageNet:
     precomputed_embeddings_path: str = "gs://rdy-tpu-data-2025/imagenet-1k/imagenet_class_embeddings.npy"
 
     # Caption embeddings (BLIP2 enriched captions from visual-layer/imagenet-1k-vl-enriched)
-    use_captions: bool = False  # True로 설정하면 per-image caption embedding 사용
+    use_captions: bool = True  # per-image caption embedding 사용
     debug_captions: bool = True  # 학습 시작 시 caption embedding 검증
 
     # Data loading

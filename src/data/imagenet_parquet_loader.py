@@ -489,6 +489,7 @@ class ImageNetParquetLoader:
             self.use_caption_embeddings = True
 
             print(f"[ImageNet] Loaded {len(self.caption_embeddings):,} caption embeddings (dim={self.embedding_dim})")
+            print(f"[Caption] Shape: {self.caption_embeddings.shape}, Memory: {self.caption_embeddings.nbytes / 1024**3:.2f} GB")
 
         except Exception as e:
             print(f"[ImageNet] Caption embeddings not found: {e}")
@@ -675,6 +676,7 @@ class ImageNetParquetRAMLoader(ImageNetParquetLoader):
         # RAM storage for precomputed latents
         self.all_latents: Optional[np.ndarray] = None  # (N, 32, 32, 4) float16
         self.all_labels: List[int] = []
+        self.all_global_indices: List[int] = []  # Global index for caption embedding lookup
 
         # Preload and precompute
         self._preload_and_encode()
@@ -690,6 +692,11 @@ class ImageNetParquetRAMLoader(ImageNetParquetLoader):
         all_image_bytes: List[bytes] = []
         start_time = time.time()
 
+        # Track global index for caption embedding lookup
+        # When sharding, each worker loads subset of files. We need to map
+        # local sample index -> global caption embedding index
+        global_sample_idx = 0
+
         for i, parquet_path in enumerate(self.parquet_files):
             if (i + 1) % 10 == 0:
                 print(f"  Loading file {i+1}/{len(self.parquet_files)}...")
@@ -702,6 +709,8 @@ class ImageNetParquetRAMLoader(ImageNetParquetLoader):
             for img, label in zip(data['image'], data['label']):
                 all_image_bytes.append(img['bytes'])
                 self.all_labels.append(label)
+                self.all_global_indices.append(global_sample_idx)
+                global_sample_idx += 1
 
         load_time = time.time() - start_time
         total_samples = len(all_image_bytes)
@@ -792,9 +801,12 @@ class ImageNetParquetRAMLoader(ImageNetParquetLoader):
         # Get precomputed latents (no decode, no VAE!)
         latents = self.all_latents[indices].astype(np.float32)
 
-        # Get class embeddings
+        # Get class labels and global indices for caption embedding lookup
         class_indices = [self.all_labels[i] for i in indices]
-        embeddings = self._get_embeddings_batch(class_indices)
+        global_indices = [self.all_global_indices[i] for i in indices]
+
+        # FIX: Pass global_indices for caption embedding lookup
+        embeddings = self._get_embeddings_batch(class_indices, global_indices=global_indices)
 
         return jnp.array(latents), jnp.array(embeddings, dtype=jnp.bfloat16)
 
