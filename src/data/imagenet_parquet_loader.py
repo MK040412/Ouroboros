@@ -173,7 +173,8 @@ class ImageNetParquetLoader:
                  embedding_dim: int = 640,
                  num_workers: int = 8,
                  shard_data: bool = True,
-                 use_vae: bool = True):
+                 use_vae: bool = True,
+                 use_captions: bool = False):
         """
         Args:
             gcs_bucket: GCS path to parquet files (e.g., gs://bucket/imagenet-1k/data/)
@@ -184,6 +185,7 @@ class ImageNetParquetLoader:
             num_workers: Number of image decoding workers
             shard_data: Whether to shard parquet files across workers
             use_vae: Whether to encode with VAE (set False for testing without VAE)
+            use_captions: Whether to use per-image caption embeddings (vs class embeddings)
         """
         import sys
 
@@ -238,8 +240,16 @@ class ImageNetParquetLoader:
         else:
             self.vae = None
 
-        # Class embeddings cache
+        # Class embeddings cache (for class-conditional training)
         self.class_embeddings: Optional[Dict[int, np.ndarray]] = None
+
+        # Per-image caption embeddings (for caption-conditional training)
+        self.caption_embeddings: Optional[np.ndarray] = None
+        self.use_caption_embeddings: bool = use_captions
+
+        # Pre-load caption embeddings if requested
+        if use_captions:
+            self._load_caption_embeddings()
 
         # Prefetch queue
         self.prefetch_queue: Optional[queue.Queue] = None
@@ -403,8 +413,104 @@ class ImageNetParquetLoader:
                 print(f"    embedding[:5] = {emb_preview}")
                 print(f"    norm = {np.linalg.norm(emb):.4f}")
 
-    def _get_embeddings_batch(self, class_indices: List[int]) -> np.ndarray:
-        """Get embeddings for a batch of class indices"""
+    def debug_caption_embeddings(self, sample_indices: List[int] = None):
+        """디버그용: caption 임베딩 확인"""
+        if not self.use_caption_embeddings:
+            print("\n[Caption Debug] Caption embeddings not enabled")
+            return
+
+        if self.caption_embeddings is None:
+            self._load_caption_embeddings()
+
+        if self.caption_embeddings is None:
+            print("\n[Caption Debug] Caption embeddings not loaded")
+            return
+
+        if sample_indices is None:
+            # 다양한 위치에서 샘플링
+            n = len(self.caption_embeddings)
+            sample_indices = [0, 100, 1000, 10000, n // 2, n - 1]
+            sample_indices = [i for i in sample_indices if i < n]
+
+        # caption 텍스트 로드 시도
+        captions = None
+        try:
+            import json
+            local_captions_path = "/tmp/imagenet_captions.json"
+            blob = self.bucket.blob("imagenet-1k/imagenet_captions.json")
+            blob.download_to_filename(local_captions_path)
+            with open(local_captions_path, 'r') as f:
+                captions = json.load(f)
+        except Exception as e:
+            print(f"  (Could not load captions text: {e})")
+
+        print(f"\n[Caption Embedding Debug - {len(sample_indices)} samples]")
+        print(f"  Total embeddings: {len(self.caption_embeddings):,}")
+        print(f"  Embedding dim: {self.caption_embeddings.shape[1]}")
+
+        for idx in sample_indices:
+            emb = self.caption_embeddings[idx]
+            caption = captions[idx][:80] + "..." if captions and idx < len(captions) and len(captions[idx]) > 80 else (captions[idx] if captions and idx < len(captions) else "N/A")
+            print(f"\n  [{idx}] '{caption}'")
+            print(f"    embedding[:5] = {emb[:5]}")
+            print(f"    norm = {np.linalg.norm(emb):.4f}")
+
+        # 임베딩 다양성 확인
+        print(f"\n  [Diversity Check]")
+        if len(sample_indices) >= 2:
+            emb1 = self.caption_embeddings[sample_indices[0]]
+            emb2 = self.caption_embeddings[sample_indices[1]]
+            cos_sim = np.dot(emb1, emb2) / (np.linalg.norm(emb1) * np.linalg.norm(emb2))
+            print(f"    Cosine sim [{sample_indices[0]}] vs [{sample_indices[1]}]: {cos_sim:.4f}")
+
+        # 랜덤 샘플 평균 similarity
+        rng = np.random.default_rng(42)
+        rand_indices = rng.choice(len(self.caption_embeddings), size=min(100, len(self.caption_embeddings)), replace=False)
+        rand_embs = self.caption_embeddings[rand_indices]
+        mean_norm = np.mean(np.linalg.norm(rand_embs, axis=1))
+        print(f"    Mean norm (100 random): {mean_norm:.4f}")
+
+    def _load_caption_embeddings(self) -> np.ndarray:
+        """Load per-image caption embeddings from GCS"""
+        if self.caption_embeddings is not None:
+            return self.caption_embeddings
+
+        embeddings_blob_path = "imagenet-1k/imagenet_caption_embeddings.npy"
+        embeddings_gcs_path = f"gs://{self.bucket_name}/{embeddings_blob_path}"
+        print(f"[ImageNet] Loading caption embeddings from {embeddings_gcs_path}...")
+
+        local_path = "/tmp/imagenet_caption_embeddings.npy"
+
+        try:
+            blob = self.bucket.blob(embeddings_blob_path)
+            blob.download_to_filename(local_path)
+            self.caption_embeddings = np.load(local_path)  # (N, 640) where N = total samples
+            self.embedding_dim = self.caption_embeddings.shape[1]
+            self.use_caption_embeddings = True
+
+            print(f"[ImageNet] Loaded {len(self.caption_embeddings):,} caption embeddings (dim={self.embedding_dim})")
+
+        except Exception as e:
+            print(f"[ImageNet] Caption embeddings not found: {e}")
+            print("[ImageNet] Falling back to class embeddings")
+            self.use_caption_embeddings = False
+
+        return self.caption_embeddings
+
+    def _get_embeddings_batch(self, class_indices: List[int], global_indices: List[int] = None) -> np.ndarray:
+        """Get embeddings for a batch.
+
+        Args:
+            class_indices: List of class labels (for class-conditional)
+            global_indices: List of global sample indices (for caption-conditional)
+        """
+        # Try caption embeddings first if available
+        if self.use_caption_embeddings and global_indices is not None:
+            caption_embs = self._load_caption_embeddings()
+            if caption_embs is not None:
+                return np.stack([caption_embs[idx % len(caption_embs)] for idx in global_indices], axis=0)
+
+        # Fallback to class embeddings
         embeddings = self._compute_class_embeddings()
         return np.stack([embeddings[idx] for idx in class_indices], axis=0)
 

@@ -103,6 +103,10 @@ class TrainingConfigImageNet:
     # Precomputed embeddings (사전 계산된 클래스 임베딩)
     precomputed_embeddings_path: str = "gs://rdy-tpu-data-2025/imagenet-1k/imagenet_class_embeddings.npy"
 
+    # Caption embeddings (BLIP2 enriched captions from visual-layer/imagenet-1k-vl-enriched)
+    use_captions: bool = False  # True로 설정하면 per-image caption embedding 사용
+    debug_captions: bool = True  # 학습 시작 시 caption embedding 검증
+
     # Data loading
     num_data_workers: int = 8
     prefetch_batches: int = 4
@@ -568,6 +572,7 @@ def main():
         num_workers=config.num_data_workers,
         shard_data=True,
         use_vae=True,
+        use_captions=config.use_captions,  # per-image caption embedding
     )
 
     # RAMLoader uses larger batch for VAE precomputation (single device, larger batch = faster)
@@ -582,6 +587,11 @@ def main():
 
     print(f"  Samples: {data_loader.total_samples:,}")
     print(f"  Steps/epoch: {config.steps_per_epoch}")
+
+    # Debug caption embeddings if enabled
+    if config.use_captions and config.debug_captions:
+        print(f"\n[Debug] Verifying caption embeddings...")
+        data_loader.debug_caption_embeddings()
 
     # Model
     print(f"\n[Model] Creating XUT-Small...")

@@ -112,15 +112,23 @@ def decode_with_options(
     return pil_image
 
 
-def run_all_combinations(prompt: str = "classes_57", num_steps: int = 100, seed: int = 42):
-    """Run sampling once and test all decode combinations."""
+def run_all_combinations(prompt: str = "wine bottle", num_steps: int = 100, seed: int = 42):
+    """Run CFG sweep from 0 to 9 with 0.5 step."""
+    import gc
+    from datetime import datetime
 
-    output_dir = Path("outputs/decode_test")
+    output_dir = Path("outputs/cfg_sweep")
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # CFG values: 0, 0.5, 1.0, ..., 9.0
+    cfg_values = [x * 0.5 for x in range(19)]  # 0 to 9 in 0.5 steps
+
     print("=" * 60)
-    print("VAE Decode Combination Test")
+    print("CFG Sweep Test (0 to 9, step 0.5)")
     print("=" * 60)
+    print(f"Prompt: {prompt}")
+    print(f"CFG values: {cfg_values}")
+    print(f"Total: {len(cfg_values)} images")
 
     # Setup
     device_type, _ = setup_device()
@@ -129,92 +137,116 @@ def run_all_combinations(prompt: str = "classes_57", num_steps: int = 100, seed:
     config = ckpt_data.get('config', {})
     context_dim = config.get('context_dim', 640)
 
-    # Get text embedding
+    # Get text embedding (once)
     print(f"\n[Embedding] '{prompt}'")
     text_embedding = get_text_embedding(prompt, embedding_dim=context_dim, device_type=device_type)
 
-    # Create and restore model
+    # Create and restore model (once)
     print(f"\n[Model] Creating and restoring...")
     model = create_model(config)
     use_bfloat16 = device_type == 'gpu'
     restore_model(model, ckpt_data, use_bfloat16=use_bfloat16)
 
-    # Sample once
-    print(f"\n[Sampling] {num_steps} steps, seed={seed}")
-    latent = sample_rectified_flow(
-        model=model,
-        text_embedding=text_embedding,
-        num_steps=num_steps,
-        cfg_scale=3.0,
-        seed=seed,
-        device_type=device_type,
-    )
+    # Sample for each CFG value
+    print(f"\n{'=' * 60}")
+    print(f"Sampling with {num_steps} steps, seed={seed}")
+    print(f"{'=' * 60}")
 
-    # Save raw latent for debugging
-    np.save(output_dir / "raw_latent.npy", latent)
-    print(f"\n[Latent] Saved raw latent to {output_dir / 'raw_latent.npy'}")
-    print(f"  Shape: {latent.shape}")
-    print(f"  Range: [{latent.min():.4f}, {latent.max():.4f}]")
-    print(f"  Mean: {latent.mean():.4f}, Std: {latent.std():.4f}")
+    latents = {}
+    for cfg in cfg_values:
+        print(f"\n--- CFG {cfg:.1f} ---")
+        latent = sample_rectified_flow(
+            model=model,
+            text_embedding=text_embedding,
+            num_steps=num_steps,
+            cfg_scale=cfg,
+            seed=seed,
+            device_type=device_type,
+        )
+        latents[cfg] = np.array(latent)  # Convert to numpy immediately
 
     # Release JAX model from GPU memory BEFORE loading PyTorch VAE
     print(f"\n[Memory] Releasing JAX model from GPU...")
     del model, ckpt_data, text_embedding
     jax.clear_caches()
-    import gc
     gc.collect()
+
+    # Clear JAX backend buffers
+    try:
+        backend = jax.extend.backend.get_backend()
+        for buf in backend.live_buffers():
+            buf.delete()
+    except Exception as e:
+        print(f"  Warning: {e}")
+    gc.collect()
+
+    import time
+    time.sleep(1)
     print("[Memory] JAX model released")
 
-    # Test all combinations
-    scale_modes = ["divide", "multiply", "none"]
-    transpose_modes = ["nhwc_to_nchw", "none"]
-    output_modes = ["standard", "direct"]
-
+    # Decode all latents with VAE (CPU to avoid OOM)
     print(f"\n{'=' * 60}")
-    print("Testing all decode combinations...")
+    print("Decoding with VAE (CPU)...")
     print(f"{'=' * 60}")
 
-    results = []
+    device = "cpu"
+    vae = AutoencoderKL.from_pretrained("stabilityai/SDXL-VAE").to(device)
+    vae.eval()
 
-    for scale_mode in scale_modes:
-        for transpose_mode in transpose_modes:
-            for output_mode in output_modes:
-                combo_name = f"scale_{scale_mode}_trans_{transpose_mode}_out_{output_mode}"
-                output_path = output_dir / f"{combo_name}.png"
+    images = {}
+    for cfg, latent in latents.items():
+        print(f"  Decoding CFG {cfg:.1f}...")
 
-                print(f"\n[Test] {combo_name}")
-                print(f"  Scale: {scale_mode}, Transpose: {transpose_mode}, Output: {output_mode}")
+        # Scale and transpose
+        latent_scaled = latent / SDXL_VAE_SCALE
+        latent_nchw = np.transpose(latent_scaled, (0, 3, 1, 2))
+        latent_tensor = torch.from_numpy(latent_nchw).float().to(device)
 
-                try:
-                    # Make a copy of latent
-                    latent_copy = latent.copy()
+        with torch.no_grad():
+            decoded = vae.decode(latent_tensor).sample
 
-                    img = decode_with_options(
-                        latent_copy,
-                        str(output_path),
-                        scale_mode=scale_mode,
-                        transpose_mode=transpose_mode,
-                        output_mode=output_mode,
-                    )
+        image = decoded[0].permute(1, 2, 0).cpu().numpy()
+        image = np.clip((image + 1) / 2 * 255, 0, 255).astype(np.uint8)
+        pil_image = Image.fromarray(image)
 
-                    if img is not None:
-                        results.append((combo_name, "SUCCESS"))
-                    else:
-                        results.append((combo_name, "FAILED"))
+        output_path = output_dir / f"cfg_{cfg:.1f}.png"
+        pil_image.save(output_path)
+        images[cfg] = pil_image
+        print(f"    Saved: {output_path}")
 
-                except Exception as e:
-                    print(f"    ERROR: {e}")
-                    results.append((combo_name, f"ERROR: {e}"))
+    del vae
+    gc.collect()
 
-    # Summary
+    # Create comparison grid
+    print(f"\n[Grid] Creating comparison grid...")
+    try:
+        cols = 5
+        rows = (len(images) + cols - 1) // cols
+        first_img = list(images.values())[0]
+        img_w, img_h = first_img.size
+        label_height = 30
+
+        grid = Image.new('RGB', (cols * img_w, rows * (img_h + label_height)), color='white')
+        from PIL import ImageDraw
+        draw = ImageDraw.Draw(grid)
+
+        for idx, (cfg, img) in enumerate(sorted(images.items())):
+            row = idx // cols
+            col = idx % cols
+            x = col * img_w
+            y = row * (img_h + label_height)
+            draw.text((x + 10, y + 5), f"CFG {cfg:.1f}", fill='black')
+            grid.paste(img, (x, y + label_height))
+
+        grid_path = output_dir / "comparison_grid.png"
+        grid.save(grid_path)
+        print(f"  Grid saved: {grid_path}")
+    except Exception as e:
+        print(f"  Warning: Could not create grid: {e}")
+
     print(f"\n{'=' * 60}")
-    print("Summary")
+    print(f"Done! {len(images)} images saved to {output_dir}/")
     print(f"{'=' * 60}")
-    for name, status in results:
-        print(f"  {name}: {status}")
-
-    print(f"\n[Done] Results saved to {output_dir}/")
-    print("Please check the images to find the correct combination.")
 
 
 def test_with_pt_file(pt_file: str = None):
@@ -302,7 +334,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Test VAE decode combinations')
     parser.add_argument('--pt-file', type=str, default=None,
                         help='Test with PT file (ground truth)')
-    parser.add_argument('--prompt', '-p', type=str, default='classes_57',
+    parser.add_argument('--prompt', '-p', type=str, default='wine bottle',
                         help='Text prompt for sampling')
     parser.add_argument('--steps', '-s', type=int, default=100,
                         help='Number of sampling steps')

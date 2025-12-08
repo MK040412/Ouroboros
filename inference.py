@@ -819,6 +819,239 @@ def interactive_mode(
 
 
 # ===========================================
+# CFG Sweep Mode
+# ===========================================
+def run_cfg_sweep(
+    prompt: str,
+    checkpoint_path: Path = None,
+    output_dir: Path = Path("./outputs"),
+    num_steps: int = 50,
+    seed: int = None,
+    cfg_min: float = 0.0,
+    cfg_max: float = 9.0,
+    cfg_step: float = 0.5,
+):
+    """Run inference with multiple CFG scales
+
+    Generates images for CFG values from cfg_min to cfg_max with cfg_step increments.
+    Efficiently reuses text embedding and model across all CFG values.
+
+    Args:
+        prompt: Text prompt for image generation
+        checkpoint_path: Path to checkpoint (downloads if None)
+        output_dir: Output directory for generated images
+        num_steps: Number of sampling steps
+        seed: Random seed (same seed used for all CFG values for fair comparison)
+        cfg_min: Minimum CFG scale
+        cfg_max: Maximum CFG scale
+        cfg_step: CFG scale increment
+    """
+    import numpy as np
+
+    # Generate CFG values
+    cfg_values = np.arange(cfg_min, cfg_max + cfg_step/2, cfg_step).tolist()
+
+    print("=" * 60)
+    print("XUT-Small CFG Sweep Mode")
+    print("=" * 60)
+    print(f"Prompt: \"{prompt}\"")
+    print(f"CFG values: {[f'{v:.1f}' for v in cfg_values]}")
+    print(f"Total images: {len(cfg_values)}")
+    print("=" * 60)
+
+    # Setup device
+    device_type, _ = setup_device()
+
+    # Get checkpoint
+    if checkpoint_path is None:
+        checkpoint_path = download_latest_checkpoint()
+
+    # Load checkpoint data
+    ckpt_data = load_checkpoint(checkpoint_path)
+    config = ckpt_data.get('config', {})
+    context_dim = config.get('context_dim', 640)
+
+    # =============================================
+    # Step 1: Text Embedding (once)
+    # =============================================
+    print(f"\n{'='*60}")
+    print("[Step 1/3] Text Embedding (once for all CFG values)")
+    print(f"{'='*60}")
+
+    text_embedding = get_text_embedding(
+        prompt,
+        embedding_dim=context_dim,
+        device_type=device_type
+    )
+
+    # =============================================
+    # Step 2: XUT Sampling (all CFG values)
+    # =============================================
+    print(f"\n{'='*60}")
+    print("[Step 2/3] XUT Sampling for all CFG values")
+    print(f"{'='*60}")
+
+    # Create and restore model (once)
+    model = create_model(config)
+    use_bfloat16 = device_type == 'gpu'
+    restore_model(model, ckpt_data, use_bfloat16=use_bfloat16)
+
+    # Use fixed seed for fair comparison
+    if seed is None:
+        seed = int(datetime.now().timestamp()) % (2**31)
+    print(f"Using fixed seed: {seed} for all CFG values")
+
+    # Sample for each CFG value
+    latents = {}
+    for cfg_scale in cfg_values:
+        print(f"\n--- CFG {cfg_scale:.1f} ---")
+        latent = sample_rectified_flow(
+            model=model,
+            text_embedding=text_embedding,
+            num_steps=num_steps,
+            cfg_scale=cfg_scale,
+            seed=seed,  # Same seed for fair comparison
+            device_type=device_type,
+        )
+        # Convert to numpy immediately to free JAX memory
+        latents[cfg_scale] = np.array(latent)
+
+    # Release XUT model and JAX GPU memory completely
+    print("\n[XUT] Releasing XUT model and JAX GPU memory...")
+    del model, ckpt_data, text_embedding
+
+    # Force JAX to release all GPU memory
+    jax.clear_caches()
+    gc.collect()
+
+    # Clear JAX backend memory
+    try:
+        backend = jax.lib.xla_bridge.get_backend()
+        for buf in backend.live_buffers():
+            buf.delete()
+    except Exception as e:
+        print(f"  Warning: Could not clear JAX buffers: {e}")
+
+    gc.collect()
+
+    # Small delay to ensure memory is released
+    import time
+    time.sleep(1)
+    print("[XUT] JAX GPU memory released")
+
+    # =============================================
+    # Step 3: VAE Decoding (all latents)
+    # =============================================
+    print(f"\n{'='*60}")
+    print("[Step 3/3] VAE Decoding for all CFG values")
+    print(f"{'='*60}")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    # Create subdirectory for this sweep
+    sweep_dir = output_dir / f"cfg_sweep_{timestamp}"
+    sweep_dir.mkdir(parents=True, exist_ok=True)
+
+    SDXL_VAE_SCALE = 0.13025
+
+    # Load VAE once
+    import torch
+    from diffusers import AutoencoderKL
+    from PIL import Image
+
+    # Force CPU for VAE to avoid JAX/PyTorch GPU memory conflicts
+    # JAX doesn't fully release GPU memory, causing OOM when loading PyTorch models
+    device = "cpu"
+    print(f"[Decode] Loading SDXL-VAE on {device.upper()} (avoiding JAX memory conflict)...")
+    vae = AutoencoderKL.from_pretrained("stabilityai/SDXL-VAE").to(device)
+    vae.eval()
+
+    # Decode all latents
+    images = {}
+    for cfg_scale, latent in latents.items():
+        print(f"  Decoding CFG {cfg_scale:.1f}...")
+
+        # Scale latent
+        latent_scaled = latent / SDXL_VAE_SCALE
+
+        # Convert NHWC to NCHW
+        latent_nchw = np.transpose(latent_scaled, (0, 3, 1, 2))
+        latent_tensor = torch.from_numpy(latent_nchw).float().to(device)
+
+        # Decode
+        with torch.no_grad():
+            decoded = vae.decode(latent_tensor).sample
+
+        # Convert to image
+        image = decoded[0].permute(1, 2, 0).cpu().numpy()
+        image = np.clip((image + 1) / 2 * 255, 0, 255).astype(np.uint8)
+        pil_image = Image.fromarray(image)
+
+        # Save
+        output_path = sweep_dir / f"cfg_{cfg_scale:.1f}.png"
+        pil_image.save(output_path)
+        images[cfg_scale] = pil_image
+        print(f"    Saved: {output_path}")
+
+    # Release VAE
+    print("\n[Decode] Releasing VAE memory...")
+    del vae
+    gc.collect()
+
+    # Create comparison grid
+    print("\n[Grid] Creating comparison grid...")
+    try:
+        from PIL import Image
+
+        # Calculate grid size
+        n_images = len(images)
+        cols = min(5, n_images)
+        rows = (n_images + cols - 1) // cols
+
+        # Get image size from first image
+        first_img = list(images.values())[0]
+        img_w, img_h = first_img.size
+
+        # Add space for labels
+        label_height = 30
+
+        # Create grid
+        grid_w = cols * img_w
+        grid_h = rows * (img_h + label_height)
+        grid = Image.new('RGB', (grid_w, grid_h), color='white')
+
+        # Paste images with labels
+        from PIL import ImageDraw, ImageFont
+        draw = ImageDraw.Draw(grid)
+
+        for idx, (cfg_scale, img) in enumerate(sorted(images.items())):
+            row = idx // cols
+            col = idx % cols
+            x = col * img_w
+            y = row * (img_h + label_height)
+
+            # Draw label
+            label = f"CFG {cfg_scale:.1f}"
+            draw.text((x + 10, y + 5), label, fill='black')
+
+            # Paste image
+            grid.paste(img, (x, y + label_height))
+
+        grid_path = sweep_dir / "comparison_grid.png"
+        grid.save(grid_path)
+        print(f"  Grid saved: {grid_path}")
+    except Exception as e:
+        print(f"  Warning: Could not create grid: {e}")
+
+    print("\n" + "=" * 60)
+    print(f"CFG Sweep complete! {len(images)} images saved to: {sweep_dir}")
+    print("=" * 60)
+
+    return images
+
+
+# ===========================================
 # CLI
 # ===========================================
 def main():
@@ -828,6 +1061,8 @@ def main():
                         help='Text prompt for image generation')
     parser.add_argument('--interactive', '-i', action='store_true',
                         help='Run in interactive mode')
+    parser.add_argument('--cfg-sweep', action='store_true',
+                        help='Run CFG sweep mode (generates images for CFG 0-9 with 0.5 step)')
     parser.add_argument('--checkpoint', '-c', type=str, default=None,
                         help='Path to checkpoint file (downloads from GCS if not specified)')
     parser.add_argument('--output-dir', '-o', type=str, default='./outputs',
@@ -851,6 +1086,25 @@ def main():
             num_steps=args.steps,
             cfg_scale=args.cfg_scale,
         )
+    elif args.cfg_sweep:
+        # CFG sweep mode
+        if args.prompt:
+            prompt = args.prompt
+        else:
+            prompt = input("Enter your prompt for CFG sweep: ").strip()
+        if prompt:
+            run_cfg_sweep(
+                prompt=prompt,
+                checkpoint_path=checkpoint_path,
+                output_dir=output_dir,
+                num_steps=args.steps,
+                seed=args.seed,
+                cfg_min=0.0,
+                cfg_max=9.0,
+                cfg_step=0.5,
+            )
+        else:
+            print("No prompt provided.")
     elif args.prompt:
         run_inference(
             prompt=args.prompt,

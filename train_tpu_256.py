@@ -1010,11 +1010,6 @@ class TPUTrainer:
                     loss_log_file.write(f"{timestamp},{epoch+1},{step},{global_step},{avg_loss:.6f},{lr:.8f}\n")
                     loss_log_file.flush()
 
-            # 1000 step마다 체크포인트 저장 (Preemption 대비)
-            if step % 1000 == 0 and step > 0:
-                avg_loss_1k = np.mean(losses[-1000:]) if len(losses) >= 1000 else np.mean(losses)
-                self.save_checkpoint(epoch, step, avg_loss_1k, is_step_checkpoint=True)
-
             if step >= self.config.steps_per_epoch:
                 break
 
@@ -1563,10 +1558,11 @@ def main():
                 "epoch": epoch + 1,
             }, step=epoch)
 
-        # 매 에포크 끝에 체크포인트 저장
-        trainer.save_checkpoint(epoch, config.steps_per_epoch, epoch_avg_loss)
-        if process_index == 0 and wandb_enabled:
-            wandb.log({"checkpoint_saved": epoch + 1})
+        # 10 에폭마다 체크포인트 저장
+        if (epoch + 1) % 10 == 0:
+            trainer.save_checkpoint(epoch, config.steps_per_epoch, epoch_avg_loss)
+            if process_index == 0 and wandb_enabled:
+                wandb.log({"checkpoint_saved": epoch + 1})
 
         # Preemption 감지 시 루프 종료
         if _graceful_killer.kill_now:
