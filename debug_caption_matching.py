@@ -29,7 +29,6 @@ def extract_image_id_from_path(path: str) -> str:
 
 def main():
     from datasets import load_dataset
-    from google.cloud import storage
     import pyarrow.parquet as pq
 
     output_dir = Path("outputs/caption_debug")
@@ -64,14 +63,19 @@ def main():
 
     print(f"  Loaded {len(hf_samples)} HuggingFace samples")
 
-    # Step 2: Load first parquet file from GCS
+    # Step 2: Load first parquet file from GCS (using gsutil for auth)
     print("\n[Step 2] Loading first GCS Parquet file...")
-    client = storage.Client()
-    bucket = client.bucket("rdy-tpu-data-2025")
-
-    blob = bucket.blob("imagenet-1k/data/train-00000-of-00294.parquet")
     local_path = "/tmp/debug_parquet.parquet"
-    blob.download_to_filename(local_path)
+    gcs_path = "gs://rdy-tpu-data-2025/imagenet-1k/data/train-00000-of-00294.parquet"
+
+    import subprocess
+    result = subprocess.run(
+        ["gsutil", "cp", gcs_path, local_path],
+        capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        print(f"  Error downloading: {result.stderr}")
+        return
 
     table = pq.read_table(local_path)
     data = table.to_pydict()

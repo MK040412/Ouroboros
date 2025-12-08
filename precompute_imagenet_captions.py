@@ -1,30 +1,49 @@
 #!/usr/bin/env python3
 """
-Pre-compute Gemma-3 embeddings for ImageNet enriched captions.
+ImageNet Enriched Caption Embeddings Pre-computation (TPU Optimized)
+
+Computes Gemma-3 270M embeddings for BLIP2-generated captions from
+visual-layer/imagenet-1k-vl-enriched dataset.
 
 IMPORTANT: Captions are extracted in PARQUET FILE ORDER to match training data.
 This ensures caption embedding index matches image index during training.
 
-Workflow:
-1. Load HuggingFace dataset → create image_id → caption mapping
-2. Load GCS parquet files in sorted order (same as training)
-3. For each image, extract path → image_id → caption
-4. Compute embeddings in parquet order
-5. Result: embeddings[i] = caption for parquet image i
-
 Usage:
-    python precompute_imagenet_captions.py --upload
+    # Run on TPU worker 0
+    TPU_WORKER_ID=0 python precompute_imagenet_captions.py
+
+    # With upload to GCS
+    TPU_WORKER_ID=0 python precompute_imagenet_captions.py --upload
 """
 
 import os
+
+# TPU 단일 호스트 모드 (분산 동기화 방지)
+os.environ["TPU_CHIPS_PER_HOST_BOUNDS"] = "2,2,1"
+os.environ["TPU_HOST_BOUNDS"] = "1,1,1"
+
 import gc
+import sys
 import json
+import subprocess
 import argparse
 import numpy as np
 from pathlib import Path
-from typing import List, Dict, Optional
-from tqdm import tqdm
+from typing import Dict, List, Optional
 from dataclasses import dataclass
+from tqdm import tqdm
+
+# JAX 초기화
+import jax
+import jax.numpy as jnp
+
+print(f"[JAX] Devices: {jax.devices()}")
+print(f"[JAX] Backend: {jax.default_backend()}")
+print(f"[JAX] Local device count: {jax.local_device_count()}")
+sys.stdout.flush()
+
+# Gemma
+from gemma import gm
 
 
 @dataclass
@@ -37,45 +56,152 @@ class Config:
     # GCS Parquet (training data source - defines order)
     gcs_bucket: str = "rdy-tpu-data-2025"
     gcs_data_prefix: str = "imagenet-1k/data"
-    parquet_pattern: str = "train-*.parquet"
 
     # Output
-    output_dir: str = "data/imagenet_captions"
+    output_dir: str = "/tmp/imagenet_captions"
     embeddings_file: str = "imagenet_caption_embeddings.npy"
     captions_file: str = "imagenet_captions.json"
     gcs_output_prefix: str = "imagenet-1k"
 
     # Gemma-3 settings
     embedding_dim: int = 640
-    batch_size: int = 64
     max_length: int = 128
+    batch_size: int = 64
+
+    # Checkpoint (resume support)
+    checkpoint_every: int = 50000  # Save every N captions
+    checkpoint_file: str = "caption_checkpoint.npz"
+
+
+class GemmaEmbedder:
+    """Gemma-3 270M Embedder with TPU pmap optimization"""
+
+    def __init__(self, max_length: int = 128):
+        self.max_length = max_length
+        self.embedding_dim = 640
+        self.model = None
+        self.tokenizer = None
+        self.params = None
+        self.num_devices = jax.local_device_count()
+        self._encode_pmap = None
+
+    def load(self):
+        """Load model and create pmap function"""
+        if self.model is not None:
+            return
+
+        print(f"[Gemma] Loading Gemma-3 270M ({self.num_devices} local devices)...")
+        sys.stdout.flush()
+
+        self.model = gm.nn.Gemma3_270M()
+        self.params = gm.ckpts.load_params(gm.ckpts.CheckpointPath.GEMMA3_270M_PT)
+        self.tokenizer = gm.text.Gemma3Tokenizer()
+
+        print(f"[Gemma] Model loaded (embedding_dim={self.embedding_dim})")
+
+        # Create pmap function
+        model = self.model
+        params = self.params
+
+        def encode_fn(tokens):
+            """Extract last hidden state and mean pool"""
+            out = model.apply(
+                {'params': params},
+                tokens=tokens,
+                return_last_only=False,
+                return_hidden_states=True,
+            )
+            last_hidden = out.hidden_states[-1]
+
+            # Attention mask (non-zero tokens)
+            mask = (tokens != 0).astype(jnp.float32)
+            mask_expanded = mask[:, :, None]
+
+            # Mean pooling
+            sum_embeddings = jnp.sum(last_hidden * mask_expanded, axis=1)
+            sum_mask = jnp.clip(mask.sum(axis=1, keepdims=True), a_min=1e-9)
+            embeddings = sum_embeddings / sum_mask
+
+            # L2 normalize
+            norms = jnp.linalg.norm(embeddings, axis=1, keepdims=True)
+            embeddings = embeddings / jnp.maximum(norms, 1e-8)
+            return embeddings
+
+        self._encode_pmap = jax.pmap(encode_fn)
+        print(f"[Gemma] pmap ready for {self.num_devices} devices")
+        sys.stdout.flush()
+
+    def encode_batch(self, texts: List[str]) -> np.ndarray:
+        """Encode batch of texts using pmap"""
+        self.load()
+
+        # Tokenize
+        all_tokens = []
+        for text in texts:
+            tokens = self.tokenizer.encode(text, add_bos=True)
+            if len(tokens) > self.max_length:
+                tokens = tokens[:self.max_length]
+            else:
+                tokens = tokens + [0] * (self.max_length - len(tokens))
+            all_tokens.append(tokens)
+
+        tokens_array = np.array(all_tokens, dtype=np.int32)
+        batch_size = tokens_array.shape[0]
+        original_batch_size = batch_size
+
+        # Pad to be divisible by num_devices
+        if batch_size % self.num_devices != 0:
+            pad_size = self.num_devices - (batch_size % self.num_devices)
+            tokens_array = np.pad(tokens_array, ((0, pad_size), (0, 0)), mode='constant')
+            batch_size = tokens_array.shape[0]
+
+        per_device = batch_size // self.num_devices
+
+        # Reshape for pmap: (num_devices, per_device_batch, seq_len)
+        tokens_array = tokens_array.reshape(self.num_devices, per_device, -1)
+
+        # Run on all devices in parallel
+        embeddings = self._encode_pmap(tokens_array)
+
+        # Reshape back
+        embeddings = np.array(embeddings).reshape(-1, embeddings.shape[-1])
+
+        # Remove padding
+        embeddings = embeddings[:original_batch_size]
+
+        return embeddings.astype(np.float32)
+
+
+def extract_image_id_from_path(path: str) -> str:
+    """Extract image_id from parquet path field.
+
+    Parquet path: n03954731_53652_n03954731.JPEG
+    image_id:     n03954731_53652
+    """
+    name = path.rsplit('.', 1)[0] if '.' in path else path
+    image_id = name.rsplit('_', 1)[0]
+    return image_id
 
 
 def build_caption_mapping(config: Config) -> Dict[str, str]:
-    """Build image_id → caption mapping from HuggingFace dataset.
-
-    Uses streaming mode to avoid downloading entire dataset to disk.
-    Only downloads caption/label columns, not images.
-    """
+    """Build image_id → caption mapping from HuggingFace dataset (streaming)"""
     from datasets import load_dataset
 
     print(f"\n[Step 1] Building caption mapping from HuggingFace...")
     print(f"  Dataset: {config.hf_dataset_name}")
     print(f"  Using STREAMING mode (memory efficient)")
+    sys.stdout.flush()
 
-    # Streaming mode - no full download required
     ds = load_dataset(
         config.hf_dataset_name,
         split=config.hf_split,
-        streaming=True  # Stream without downloading everything
+        streaming=True
     )
-    print(f"  Columns: {ds.column_names}")
 
     caption_map = {}
     missing = 0
     count = 0
 
-    # Stream through dataset - only fetches needed data
     for sample in tqdm(ds, desc="  Building mapping", total=1281167):
         image_id = sample.get('image_id', '')
         caption = sample.get('caption_enriched', '')
@@ -94,33 +220,20 @@ def build_caption_mapping(config: Config) -> Dict[str, str]:
 
     print(f"  Processed: {count:,} samples")
     print(f"  Mapping size: {len(caption_map):,}")
-    print(f"  Missing captions (fallback to label): {missing:,}")
+    print(f"  Missing captions: {missing:,}")
+    sys.stdout.flush()
 
     return caption_map
 
 
-def extract_image_id_from_path(path: str) -> str:
-    """Extract image_id from parquet path field.
-
-    Parquet path format: n03954731_53652_n03954731.JPEG
-    HuggingFace image_id: n03954731_53652
-
-    Extract by removing the last underscore and everything after.
-    """
-    # Remove extension first
-    name = path.rsplit('.', 1)[0] if '.' in path else path
-    # Split at last underscore to remove synset suffix
-    image_id = name.rsplit('_', 1)[0]
-    return image_id
-
-
 def extract_captions_in_parquet_order(caption_map: Dict[str, str], config: Config) -> List[str]:
-    """Extract captions in the exact order of parquet files (same as training)."""
+    """Extract captions in parquet file order (same as training)"""
     from google.cloud import storage
     import pyarrow.parquet as pq
 
     print(f"\n[Step 2] Extracting captions in parquet order...")
     print(f"  GCS: gs://{config.gcs_bucket}/{config.gcs_data_prefix}/")
+    sys.stdout.flush()
 
     client = storage.Client()
     bucket = client.bucket(config.gcs_bucket)
@@ -129,14 +242,15 @@ def extract_captions_in_parquet_order(caption_map: Dict[str, str], config: Confi
     blobs = list(bucket.list_blobs(prefix=f"{config.gcs_data_prefix}/train-"))
     parquet_files = sorted([b.name for b in blobs if b.name.endswith('.parquet')])
     print(f"  Found {len(parquet_files)} parquet files")
+    sys.stdout.flush()
 
     captions_ordered = []
     matched = 0
     unmatched = 0
 
-    for pq_file in tqdm(parquet_files, desc="  Processing parquet files"):
+    for pq_idx, pq_file in enumerate(tqdm(parquet_files, desc="  Processing parquet")):
         # Download parquet file
-        local_path = f"/tmp/{Path(pq_file).name}"
+        local_path = f"/tmp/parquet_{pq_idx % 2}.parquet"
         blob = bucket.blob(pq_file)
         blob.download_to_filename(local_path)
 
@@ -158,282 +272,198 @@ def extract_captions_in_parquet_order(caption_map: Dict[str, str], config: Confi
 
             captions_ordered.append(caption)
 
-        # Cleanup
-        os.remove(local_path)
-
     print(f"\n  Total captions: {len(captions_ordered):,}")
     print(f"  Matched: {matched:,} ({100*matched/len(captions_ordered):.1f}%)")
-    print(f"  Unmatched (fallback to class): {unmatched:,}")
+    print(f"  Unmatched: {unmatched:,}")
+    sys.stdout.flush()
 
     return captions_ordered
 
 
-def save_captions(captions: List[str], config: Config):
-    """Save captions to JSON file."""
-    output_dir = Path(config.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    captions_path = output_dir / config.captions_file
-    with open(captions_path, 'w', encoding='utf-8') as f:
-        json.dump(captions, f, ensure_ascii=False, indent=2)
-    print(f"\n[Save] Captions saved to: {captions_path}")
-
-
-def compute_gemma_embeddings(captions: List[str], config: Config) -> np.ndarray:
-    """Compute Gemma-3 270M embeddings for all captions."""
+def compute_embeddings_with_checkpoint(
+    captions: List[str],
+    embedder: GemmaEmbedder,
+    config: Config,
+    start_idx: int = 0,
+    existing_embeddings: Optional[np.ndarray] = None
+) -> np.ndarray:
+    """Compute embeddings with checkpoint support"""
     print(f"\n[Step 3] Computing Gemma-3 embeddings...")
+    print(f"  Total captions: {len(captions):,}")
+    print(f"  Starting from: {start_idx:,}")
+    print(f"  Batch size: {config.batch_size}")
+    print(f"  Checkpoint every: {config.checkpoint_every:,}")
+    sys.stdout.flush()
 
-    try:
-        from gemma import gm
-        import jax.numpy as jnp
-
-        print("  Loading Gemma-3 270M...")
-        model = gm.nn.Gemma3_270M()
-        params = gm.ckpts.load_params(gm.ckpts.CheckpointPath.GEMMA3_270M_PT)
-        tokenizer = gm.text.Gemma3Tokenizer()
-        print("  Model loaded!")
-
+    # Initialize or continue from existing
+    if existing_embeddings is not None:
+        all_embeddings = list(existing_embeddings)
+    else:
         all_embeddings = []
 
-        for i in tqdm(range(0, len(captions), config.batch_size), desc="  Encoding"):
-            batch_captions = captions[i:i + config.batch_size]
-            batch_embeddings = []
+    # Warmup
+    if start_idx == 0:
+        print("  Warming up pmap...")
+        _ = embedder.encode_batch(["warmup"] * max(4, embedder.num_devices))
+        print("  pmap ready!")
+        sys.stdout.flush()
 
-            for caption in batch_captions:
-                tokens = tokenizer.encode(caption, add_bos=True)
-                if len(tokens) > config.max_length:
-                    tokens = tokens[:config.max_length]
-                else:
-                    tokens = tokens + [0] * (config.max_length - len(tokens))
+    # Process in batches
+    checkpoint_dir = Path(config.output_dir)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-                tokens_array = np.array([tokens], dtype=np.int32)
+    num_batches = (len(captions) - start_idx + config.batch_size - 1) // config.batch_size
 
-                out = model.apply(
-                    {'params': params},
-                    tokens=tokens_array,
-                    return_last_only=False,
-                    return_hidden_states=True,
-                )
-                last_hidden = out.hidden_states[-1]
+    for batch_idx in tqdm(range(num_batches), desc="  Encoding"):
+        start = start_idx + batch_idx * config.batch_size
+        end = min(start + config.batch_size, len(captions))
+        batch_captions = captions[start:end]
 
-                # Mean pooling
-                mask = (tokens_array != 0).astype(np.float32)
-                mask_expanded = mask[:, :, None]
-                sum_embeddings = np.sum(np.array(last_hidden) * mask_expanded, axis=1)
-                sum_mask = np.clip(mask.sum(axis=1, keepdims=True), a_min=1e-9, a_max=None)
-                embedding = sum_embeddings / sum_mask
+        embeddings = embedder.encode_batch(batch_captions)
+        all_embeddings.extend(embeddings)
 
-                # L2 normalize
-                norm = np.linalg.norm(embedding, axis=1, keepdims=True)
-                embedding = embedding / np.maximum(norm, 1e-8)
+        # Checkpoint
+        current_count = start_idx + len(all_embeddings) - (len(existing_embeddings) if existing_embeddings is not None else 0)
+        processed_total = start + len(batch_captions)
 
-                batch_embeddings.append(embedding[0])
+        if processed_total % config.checkpoint_every == 0:
+            checkpoint_path = checkpoint_dir / config.checkpoint_file
+            np.savez(
+                checkpoint_path,
+                embeddings=np.array(all_embeddings, dtype=np.float32),
+                processed=processed_total
+            )
+            print(f"\n  Checkpoint saved: {processed_total:,}/{len(captions):,}")
+            sys.stdout.flush()
 
-            all_embeddings.extend(batch_embeddings)
+        # Memory cleanup
+        if batch_idx % 100 == 0:
+            gc.collect()
 
-            if (i // config.batch_size) % 100 == 0:
-                gc.collect()
+    result = np.array(all_embeddings, dtype=np.float32)
+    print(f"  Final embeddings shape: {result.shape}")
+    sys.stdout.flush()
 
-        embeddings = np.array(all_embeddings, dtype=np.float32)
-        print(f"  Embeddings shape: {embeddings.shape}")
-
-        del model, params, tokenizer
-        gc.collect()
-
-        return embeddings
-
-    except ImportError as e:
-        print(f"  Warning: Gemma not available ({e})")
-        print("  Using fallback: sentence-transformers")
-        return compute_fallback_embeddings(captions, config)
+    return result
 
 
-def compute_fallback_embeddings(captions: List[str], config: Config) -> np.ndarray:
-    """Fallback: Use sentence-transformers if Gemma not available."""
-    from sentence_transformers import SentenceTransformer
-
-    print("  Loading sentence-transformers model...")
-    model = SentenceTransformer('all-MiniLM-L6-v2')
-
-    embeddings = model.encode(
-        captions,
-        batch_size=config.batch_size,
-        show_progress_bar=True,
-        normalize_embeddings=True
-    )
-
-    if embeddings.shape[1] != config.embedding_dim:
-        print(f"  Warning: Embedding dim {embeddings.shape[1]} != target {config.embedding_dim}")
-        if embeddings.shape[1] < config.embedding_dim:
-            pad = np.zeros((embeddings.shape[0], config.embedding_dim - embeddings.shape[1]))
-            embeddings = np.concatenate([embeddings, pad], axis=1)
-        else:
-            embeddings = embeddings[:, :config.embedding_dim]
-
-    return embeddings.astype(np.float32)
-
-
-def save_embeddings(embeddings: np.ndarray, config: Config):
-    """Save embeddings to file."""
+def save_results(captions: List[str], embeddings: np.ndarray, config: Config):
+    """Save captions and embeddings locally"""
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Save captions
+    captions_path = output_dir / config.captions_file
+    with open(captions_path, 'w', encoding='utf-8') as f:
+        json.dump(captions, f, ensure_ascii=False)
+    print(f"\n[Save] Captions: {captions_path}")
+
+    # Save embeddings
     embeddings_path = output_dir / config.embeddings_file
     np.save(embeddings_path, embeddings)
-    print(f"\n[Save] Embeddings saved to: {embeddings_path}")
+    print(f"[Save] Embeddings: {embeddings_path}")
     print(f"  Shape: {embeddings.shape}")
     print(f"  Size: {embeddings.nbytes / 1024 / 1024:.1f} MB")
-
-
-def debug_embeddings(captions: List[str], embeddings: np.ndarray, sample_indices: List[int] = None):
-    """Debug: Show sample captions and embeddings."""
-    if sample_indices is None:
-        n = len(captions)
-        sample_indices = [0, 100, 1000, 10000, n // 2, n - 1]
-        sample_indices = [i for i in sample_indices if i < n]
-
-    print(f"\n{'=' * 60}")
-    print("[Debug] Caption Embeddings Verification")
-    print(f"{'=' * 60}")
-    print(f"Total samples: {len(captions):,}")
-    print(f"Embedding shape: {embeddings.shape}")
-
-    for idx in sample_indices:
-        caption = captions[idx][:100] + "..." if len(captions[idx]) > 100 else captions[idx]
-        emb = embeddings[idx]
-        print(f"\n[{idx}] '{caption}'")
-        print(f"  embedding[:5] = {emb[:5]}")
-        print(f"  norm = {np.linalg.norm(emb):.4f}")
-
-    # Diversity check
-    print(f"\n[Diversity Check]")
-    if len(sample_indices) >= 2:
-        for i in range(min(3, len(sample_indices) - 1)):
-            emb1 = embeddings[sample_indices[i]]
-            emb2 = embeddings[sample_indices[i + 1]]
-            cos_sim = np.dot(emb1, emb2) / (np.linalg.norm(emb1) * np.linalg.norm(emb2))
-            print(f"  Cosine sim [{sample_indices[i]}] vs [{sample_indices[i+1]}]: {cos_sim:.4f}")
-
-    rng = np.random.default_rng(42)
-    rand_pairs = rng.choice(len(embeddings), size=(10, 2), replace=False)
-    sims = []
-    for i, j in rand_pairs:
-        e1, e2 = embeddings[i], embeddings[j]
-        sim = np.dot(e1, e2) / (np.linalg.norm(e1) * np.linalg.norm(e2))
-        sims.append(sim)
-    mean_sim = np.mean(sims)
-    print(f"  Mean cosine sim (10 random pairs): {mean_sim:.4f}")
-
-    if mean_sim > 0.99:
-        print(f"  [WARNING] Embeddings may be identical! Check encoding.")
-    else:
-        print(f"  [OK] Embeddings have proper diversity.")
+    sys.stdout.flush()
 
 
 def upload_to_gcs(config: Config):
-    """Upload embeddings to GCS."""
-    from google.cloud import storage
-
-    print("\n[GCS] Uploading to GCS...")
-
-    client = storage.Client()
-    bucket = client.bucket(config.gcs_bucket)
+    """Upload to GCS using gsutil"""
+    print(f"\n[Upload] Uploading to GCS...")
+    sys.stdout.flush()
 
     output_dir = Path(config.output_dir)
 
-    files_to_upload = [
-        config.embeddings_file,
-        config.captions_file,
-    ]
+    files = [config.embeddings_file, config.captions_file]
 
-    for filename in files_to_upload:
+    for filename in files:
         local_path = output_dir / filename
         if local_path.exists():
-            gcs_path = f"{config.gcs_output_prefix}/{filename}"
-            blob = bucket.blob(gcs_path)
-            blob.upload_from_filename(str(local_path))
-            print(f"  Uploaded: gs://{config.gcs_bucket}/{gcs_path}")
-        else:
-            print(f"  Skip (not found): {local_path}")
+            gcs_path = f"gs://{config.gcs_bucket}/{config.gcs_output_prefix}/{filename}"
+            print(f"  {filename} -> {gcs_path}")
+            sys.stdout.flush()
+
+            result = subprocess.run(
+                ["gsutil", "cp", str(local_path), gcs_path],
+                capture_output=True, text=True
+            )
+            if result.returncode == 0:
+                print(f"    OK")
+            else:
+                print(f"    FAILED: {result.stderr}")
+            sys.stdout.flush()
 
 
-def create_verification_mapping(captions: List[str], config: Config):
-    """Create a verification mapping file."""
-    output_dir = Path(config.output_dir)
-
-    mapping = {
-        'num_samples': len(captions),
-        'order': 'parquet_file_sorted_order',
-        'sample_captions': {
-            0: captions[0] if len(captions) > 0 else '',
-            100: captions[100] if len(captions) > 100 else '',
-            1000: captions[1000] if len(captions) > 1000 else '',
-            10000: captions[10000] if len(captions) > 10000 else '',
-        }
-    }
-
-    mapping_path = output_dir / "embedding_mapping.json"
-    with open(mapping_path, 'w') as f:
-        json.dump(mapping, f, indent=2)
-    print(f"  Saved mapping to: {mapping_path}")
+def load_checkpoint(config: Config):
+    """Load checkpoint if exists"""
+    checkpoint_path = Path(config.output_dir) / config.checkpoint_file
+    if checkpoint_path.exists():
+        data = np.load(checkpoint_path)
+        embeddings = data['embeddings']
+        processed = int(data['processed'])
+        print(f"[Checkpoint] Loaded: {processed:,} processed, {len(embeddings):,} embeddings")
+        return embeddings, processed
+    return None, 0
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Pre-compute ImageNet caption embeddings (parquet order)')
-    parser.add_argument('--upload', action='store_true', help='Upload to GCS after computation')
-    parser.add_argument('--batch-size', type=int, default=64, help='Batch size for embedding')
-    parser.add_argument('--output-dir', type=str, default='data/imagenet_captions', help='Output directory')
-    parser.add_argument('--no-debug', action='store_true', help='Skip debug verification')
+    parser = argparse.ArgumentParser(description='Pre-compute ImageNet caption embeddings (TPU)')
+    parser.add_argument('--upload', action='store_true', help='Upload to GCS')
+    parser.add_argument('--batch-size', type=int, default=64, help='Batch size')
+    parser.add_argument('--resume', action='store_true', help='Resume from checkpoint')
     args = parser.parse_args()
 
-    config = Config(
-        output_dir=args.output_dir,
-        batch_size=args.batch_size,
-    )
+    worker_id = int(os.environ.get('TPU_WORKER_ID', '0'))
+
+    config = Config(batch_size=args.batch_size)
 
     print("=" * 60)
-    print("ImageNet Caption Embedding Pre-computation")
-    print("(Parquet Order - matches training data)")
+    print("ImageNet Caption Embedding Pre-computation (TPU)")
     print("=" * 60)
+    print(f"Worker ID: {worker_id}")
     print(f"HuggingFace: {config.hf_dataset_name}")
     print(f"GCS Parquet: gs://{config.gcs_bucket}/{config.gcs_data_prefix}/")
     print(f"Output: {config.output_dir}")
+    print(f"Batch size: {config.batch_size}")
     print("=" * 60)
+    sys.stdout.flush()
 
-    # Step 1: Build caption mapping from HuggingFace
+    # Check for checkpoint
+    existing_embeddings, start_idx = None, 0
+    if args.resume:
+        existing_embeddings, start_idx = load_checkpoint(config)
+
+    # Step 1: Build caption mapping
     caption_map = build_caption_mapping(config)
 
     # Step 2: Extract captions in parquet order
     captions = extract_captions_in_parquet_order(caption_map, config)
 
-    # Step 2.5: Save captions
-    save_captions(captions, config)
+    # Free memory
+    del caption_map
+    gc.collect()
 
     # Step 3: Compute embeddings
-    embeddings = compute_gemma_embeddings(captions, config)
+    embedder = GemmaEmbedder(max_length=config.max_length)
+    embeddings = compute_embeddings_with_checkpoint(
+        captions, embedder, config,
+        start_idx=start_idx,
+        existing_embeddings=existing_embeddings
+    )
 
-    # Step 3.5: Debug verification
-    if not args.no_debug:
-        debug_embeddings(captions, embeddings)
+    # Step 4: Save
+    save_results(captions, embeddings, config)
 
-    # Step 4: Save embeddings
-    save_embeddings(embeddings, config)
-
-    # Step 5: Create verification mapping
-    create_verification_mapping(captions, config)
-
-    # Step 6: Upload to GCS (optional)
+    # Step 5: Upload (optional)
     if args.upload:
         upload_to_gcs(config)
 
     print("\n" + "=" * 60)
     print("Done!")
     print("=" * 60)
-    print(f"\nEmbeddings are in PARQUET ORDER (same as training).")
-    print(f"embeddings[i] = caption embedding for parquet image i")
-    print(f"\nTo use in training:")
-    print(f"  1. Set use_captions=True in train_imagenet_tpu.py")
-    print(f"  2. Embeddings path: gs://{config.gcs_bucket}/{config.gcs_output_prefix}/{config.embeddings_file}")
+    print(f"Embeddings in PARQUET ORDER (matches training)")
+    print(f"To use: set use_captions=True in train_imagenet_tpu.py")
+    sys.stdout.flush()
 
 
 if __name__ == "__main__":
