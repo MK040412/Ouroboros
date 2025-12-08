@@ -52,24 +52,36 @@ class Config:
 
 
 def build_caption_mapping(config: Config) -> Dict[str, str]:
-    """Build image_id → caption mapping from HuggingFace dataset."""
+    """Build image_id → caption mapping from HuggingFace dataset.
+
+    Uses streaming mode to avoid downloading entire dataset to disk.
+    Only downloads caption/label columns, not images.
+    """
     from datasets import load_dataset
 
     print(f"\n[Step 1] Building caption mapping from HuggingFace...")
     print(f"  Dataset: {config.hf_dataset_name}")
+    print(f"  Using STREAMING mode (memory efficient)")
 
-    ds = load_dataset(config.hf_dataset_name, split=config.hf_split)
-    print(f"  Loaded {len(ds):,} samples")
+    # Streaming mode - no full download required
+    ds = load_dataset(
+        config.hf_dataset_name,
+        split=config.hf_split,
+        streaming=True  # Stream without downloading everything
+    )
     print(f"  Columns: {ds.column_names}")
 
     caption_map = {}
     missing = 0
+    count = 0
 
-    for sample in tqdm(ds, desc="  Building mapping"):
+    # Stream through dataset - only fetches needed data
+    for sample in tqdm(ds, desc="  Building mapping", total=1281167):
         image_id = sample.get('image_id', '')
         caption = sample.get('caption_enriched', '')
 
         if not image_id:
+            count += 1
             continue
 
         if not caption or caption.strip() == '':
@@ -78,7 +90,9 @@ def build_caption_mapping(config: Config) -> Dict[str, str]:
             missing += 1
 
         caption_map[image_id] = caption.strip()
+        count += 1
 
+    print(f"  Processed: {count:,} samples")
     print(f"  Mapping size: {len(caption_map):,}")
     print(f"  Missing captions (fallback to label): {missing:,}")
 

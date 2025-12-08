@@ -66,10 +66,19 @@ run_precompute() {
   REMOTE_URL="$(git -C "$SCRIPT_DIR" remote get-url origin)"
   BRANCH="$(git -C "$SCRIPT_DIR" rev-parse --abbrev-ref HEAD)"
 
-  # 2. TPU worker 0에서 코드 동기화
-  log "Step 2: Syncing code on TPU worker 0..."
+  # 2. TPU worker 0에서 이전 프로세스 정리 및 코드 동기화
+  log "Step 2: Cleaning up and syncing code on TPU worker 0..."
   read -r -d '' SYNC_CMD <<EOF || true
 set -e
+
+# 이전 프로세스 정리
+pkill -f precompute_imagenet_captions.py 2>/dev/null || true
+echo "Previous process killed (if any)"
+
+# HuggingFace 캐시 정리 (디스크 절약)
+rm -rf ~/.cache/huggingface/datasets/visual-layer* 2>/dev/null || true
+echo "HuggingFace cache cleared"
+
 DEST_DIR=~/ouroboros
 REMOTE_URL="$REMOTE_URL"
 
