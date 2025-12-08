@@ -239,11 +239,3 @@ Sample Classes:
 - First decoder block cross-attends to encoder output
 - More efficient than pure decoder-only
 
-
-================================================================================
-                              END OF SPECIFICATION
-================================================================================
-
-Generated: 2024-12-07
-Project: Ouroboros (Home-made Diffusion Model)
-Repository: /home/perelman/바탕화면/Ouroboros/
