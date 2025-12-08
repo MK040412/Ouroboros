@@ -86,9 +86,11 @@ def load_captions_from_gcs(parquet_gcs_path: str) -> Dict[int, str]:
     client = storage.Client()
     bucket = client.bucket(bucket_name)
     blob = bucket.blob(blob_path)
+    blob.reload()  # Get metadata including size
 
     local_path = "/tmp/coyo_meta.parquet"
-    print(f"[Parquet] Downloading ({blob.size / 1024 / 1024:.1f} MB)...")
+    size_mb = blob.size / 1024 / 1024 if blob.size else 0
+    print(f"[Parquet] Downloading ({size_mb:.1f} MB)...")
     blob.download_to_filename(local_path)
 
     # Read parquet
