@@ -84,14 +84,14 @@ class TrainingConfig256:
     mup_base_dim: int = 1                # muP base dimension for scaling
     warmup_steps: int = 1000
     
-    # 모델 (XUT-Small)
-    model_dim: int = 896
+    # 모델 (XUT-Base with Gemma3-270M embeddings)
+    model_dim: int = 1024               # 896 → 1024 (XUT-base)
     context_dim: int = 640              # Gemma-3 270M dimension (precomputed)
     mlp_dim: int = 3072
-    heads: int = 14
+    heads: int = 16                     # 14 → 16 (XUT-base)
     depth: int = 4
     enc_blocks: int = 1
-    dec_blocks: int = 2
+    dec_blocks: int = 3                 # 2 → 3 (XUT-base)
     
     # Text embedding
     embedding_model: str = "gemma-3-270m"  # 640d, precomputed
@@ -118,7 +118,7 @@ class TrainingConfig256:
     use_gradient_checkpointing: bool = True
 
     # Wandb
-    wandb_project: str = "xut-small-256"
+    wandb_project: str = "xut-base-256"
     wandb_entity: str = None  # set to username
 
     # VAE scaling (SDXL-VAE standard)
@@ -128,7 +128,7 @@ class TrainingConfig256:
 
     # GCS Checkpoint 설정
     checkpoint_gcs_bucket: str = "rdy-tpu-data-2025"
-    checkpoint_gcs_prefix: str = "checkpoints/xut-small-256"  # gs://bucket/prefix/run_YYYYMMDD_HHMMSS/
+    checkpoint_gcs_prefix: str = "checkpoints/xut-base-256"  # gs://bucket/prefix/run_YYYYMMDD_HHMMSS/
     checkpoint_keep_last_n: int = 3  # 최근 N개 체크포인트만 유지
 
 
