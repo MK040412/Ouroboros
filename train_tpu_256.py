@@ -88,7 +88,8 @@ class TrainingConfig256:
     model_dim: int = 1280               # XUT-large
     context_dim: int = 640              # Gemma-3 270M (PT file = 640 dim)
     mlp_dim: int = 4096                 # XUT-large
-    heads: int = 10                     # XUT-large (head_dim=128)
+    heads: int = 10                     # XUT-large
+    dim_head: int = 128                 # XUT-large (1280 / 10 = 128)
     depth: int = 4
     enc_blocks: int = 1
     dec_blocks: int = 3                 # XUT-large
@@ -1296,13 +1297,14 @@ def main():
     print("="*60)
     
     try:
-        print(f"  Creating XUT-Small model...")
+        print(f"  Creating XUT model (dim={config.model_dim}, heads={config.heads}, dim_head={config.dim_head})...")
         sys.stdout.flush()
         model = create_xut_small(
             dim=config.model_dim,
             ctx_dim=config.context_dim,
             mlp_dim=config.mlp_dim,
             heads=config.heads,
+            dim_head=config.dim_head,
             depth=config.depth,
             enc_blocks=config.enc_blocks,
             dec_blocks=config.dec_blocks,
