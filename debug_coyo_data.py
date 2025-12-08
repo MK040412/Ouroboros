@@ -71,30 +71,22 @@ def load_pt_file(path: str) -> dict:
     return result
 
 
-def load_captions_from_gcs(parquet_gcs_path: str) -> Dict[int, str]:
-    """Load captions from GCS parquet"""
-    from google.cloud import storage
+def load_captions_from_gcs(parquet_gcs_path: str, target_keys: Optional[List[int]] = None) -> Dict[int, str]:
+    """Load captions from GCS parquet (streaming mode to save disk space)"""
     import pyarrow.parquet as pq
+    import pyarrow.fs as pafs
 
     print(f"[Parquet] Loading captions from {parquet_gcs_path}")
 
-    # Download parquet
-    parts = parquet_gcs_path.replace("gs://", "").split("/", 1)
-    bucket_name = parts[0]
-    blob_path = parts[1]
+    # Use pyarrow GCS filesystem for streaming
+    gcs = pafs.GcsFileSystem()
 
-    client = storage.Client()
-    bucket = client.bucket(bucket_name)
-    blob = bucket.blob(blob_path)
-    blob.reload()  # Get metadata including size
+    # Remove gs:// prefix for pyarrow
+    gcs_path = parquet_gcs_path.replace("gs://", "")
 
-    local_path = "/tmp/coyo_meta.parquet"
-    size_mb = blob.size / 1024 / 1024 if blob.size else 0
-    print(f"[Parquet] Downloading ({size_mb:.1f} MB)...")
-    blob.download_to_filename(local_path)
-
-    # Read parquet
-    table = pq.read_table(local_path, columns=['key', 'caption_llava'])
+    # Read parquet directly from GCS (streaming, no local download)
+    print(f"[Parquet] Reading directly from GCS (streaming mode)...")
+    table = pq.read_table(gcs_path, filesystem=gcs, columns=['key', 'caption_llava'])
 
     key_to_caption = {}
     for batch in table.to_batches():
