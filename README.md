@@ -1,6 +1,6 @@
 # Ouroboros: XUT Diffusion Transformer
 
-A JAX/Flax implementation of **XUDiT (Xpanded Universal Diffusion Transformer)** - a novel encoder-decoder transformer architecture for image generation using Rectified Flow.
+A JAX/Flax implementation of **XUDiT (Cross UDiT)** - a novel encoder-decoder transformer architecture for image generation using Rectified Flow.
 
 ## Key Features
 
@@ -39,7 +39,7 @@ Input Latent (32×32×4)
 | Attention Heads | 14 |
 | Depth | 4 |
 | Text Embedding | 640 (Gemma-3) |
-| Parameters | ~50M |
+| Parameters | ~273M |
 
 ## Directory Structure
 
